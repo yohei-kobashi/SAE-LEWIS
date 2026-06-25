@@ -31,6 +31,14 @@
 #   NUM_WORKERS             data loader workers (default: 1)
 #   EVAL_TEXT               text for stage-6 inference (default: a single sentence)
 #   EVAL_SPEC               intervention spec for stage-6 (default: "+1234")
+#   LLM                     causal LLM HF id        (default: google/gemma-2-2b)
+#   SAE_REPO                Gemma Scope HF repo     (default: google/gemma-scope-2b-pt-res)
+#   SAE_PATH                file inside SAE_REPO    (default: layer_12/width_16k/average_l0_82/params.npz)
+#                            For 2b-pt-res layer_12/width_16k the available L0 values
+#                            are {22, 41, 82, 176, 445}; pick a different file by
+#                            overriding this var.
+#   SAE_LAYER               (default: 12)
+#   MLM_MODEL               corruption MLM preset   (default: modernbert-base)
 #
 # Each stage's stdout/stderr is captured under $RUN_DIR/logs/<stage>.log.
 # Per-stage wall time and status land in $RUN_DIR/timing.tsv.
@@ -65,6 +73,12 @@ NUM_WORKERS=${NUM_WORKERS:-1}
 
 EVAL_TEXT=${EVAL_TEXT:-"The quick brown fox jumps over the lazy dog."}
 EVAL_SPEC=${EVAL_SPEC:-"+1234"}
+
+LLM=${LLM:-"google/gemma-2-2b"}
+SAE_REPO=${SAE_REPO:-"google/gemma-scope-2b-pt-res"}
+SAE_PATH=${SAE_PATH:-"layer_12/width_16k/average_l0_82/params.npz"}
+SAE_LAYER=${SAE_LAYER:-12}
+MLM_MODEL=${MLM_MODEL:-"modernbert-base"}
 
 # Production-scale defaults baked into the training scripts' argparses.
 # These are used only for the extrapolation table at the end.
@@ -126,10 +140,14 @@ run_stage() {
     echo "[smoke] cmd: $*" | tee "$log"
     local start
     start=$(date +%s)
-    local rc=0
-    # Tee through a process substitution so we can detect failure via PIPESTATUS.
-    "$@" 2>&1 | tee -a "$log" || true
-    rc=${PIPESTATUS[0]}
+    # Run the python command, capturing stdout/stderr to both terminal and log.
+    # Temporarily disable `set -e` so the script doesn't exit before we read
+    # PIPESTATUS. We must NOT chain "|| true" here — that would replace
+    # PIPESTATUS with `true`'s status (0) and we'd record every failure as ok.
+    set +e
+    "$@" 2>&1 | tee -a "$log"
+    local rc=${PIPESTATUS[0]}
+    set -e
     local end
     end=$(date +%s)
     local elapsed=$((end - start))
@@ -167,6 +185,11 @@ BATCH_SIZE           = $BATCH_SIZE
 NUM_WORKERS          = $NUM_WORKERS
 EVAL_TEXT            = $EVAL_TEXT
 EVAL_SPEC            = $EVAL_SPEC
+LLM                  = $LLM
+SAE_REPO             = $SAE_REPO
+SAE_PATH             = $SAE_PATH
+SAE_LAYER            = $SAE_LAYER
+MLM_MODEL            = $MLM_MODEL
 EOF
 
 # --------------------------------------------------------------------------- #
@@ -182,6 +205,10 @@ else
             --out-dir "$SAE_CACHE" \
             --max-sentences "$SAE_MAX_SENTS" \
             --batch-size 16 \
+            --llm "$LLM" \
+            --sae-repo "$SAE_REPO" \
+            --sae-path "$SAE_PATH" \
+            --sae-layer "$SAE_LAYER" \
             --device "$DEVICE" \
             --seed "$SEED"
 fi
@@ -194,6 +221,7 @@ if [[ -f "$LLM2VEC_DIR/llm2vec_meta.json" ]]; then
 else
     run_stage "01_train_llm2vec" \
         python train_llm2vec.py \
+            --llm "$LLM" \
             --data-cache-dir "$DOLMA_CACHE" \
             --max-files "$DOLMA_MAX_FILES" \
             --output-dir "$LLM2VEC_DIR" \
@@ -219,6 +247,11 @@ else
             --max-files "$DOLMA_MAX_FILES" \
             --out-dir "$CORRUPTION_DIR" \
             --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm "$LLM" \
+            --sae-repo "$SAE_REPO" \
+            --sae-path "$SAE_PATH" \
+            --sae-layer "$SAE_LAYER" \
+            --mlm-model "$MLM_MODEL" \
             --target-samples "$CORRUPTION_SAMPLES" \
             --samples-per-shard "$CORRUPTION_SHARD" \
             --device "$DEVICE" \
@@ -301,6 +334,10 @@ run_stage "06_evaluate" \
         --tagger-ckpt "$TAGGER_CKPT" \
         --editor-ckpt "$EDITOR_CKPT" \
         --mu "$SAE_CACHE/mu.npy" \
+        --llm "$LLM" \
+        --sae-repo "$SAE_REPO" \
+        --sae-path "$SAE_PATH" \
+        --sae-layer "$SAE_LAYER" \
         --text "$EVAL_TEXT" \
         --spec $EVAL_SPEC \
         --l-max 5 \

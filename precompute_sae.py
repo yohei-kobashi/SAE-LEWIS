@@ -45,7 +45,10 @@ def parse_args():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--llm", default="google/gemma-2-2b")
     p.add_argument("--sae-repo", default="google/gemma-scope-2b-pt-res")
-    p.add_argument("--sae-path", default="layer_12/width_16k/average_l0_71/params.npz")
+    p.add_argument("--sae-path", default="layer_12/width_16k/average_l0_82/params.npz",
+                   help="Path inside --sae-repo. Available L0 values for "
+                        "google/gemma-scope-2b-pt-res layer_12/width_16k are "
+                        "{22, 41, 82, 176, 445}.")
     p.add_argument("--sae-layer", type=int, default=12)
     p.add_argument("--sae-type", choices=["jumprelu", "topk"], default="jumprelu")
     p.add_argument("--sae-k", type=int, default=None)

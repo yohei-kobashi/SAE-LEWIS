@@ -311,6 +311,11 @@ def main():
         dataloader_num_workers=args.num_workers,
         remove_unused_columns=False,
         seed=args.seed,
+        # Gemma ties lm_head.weight to embed_tokens.weight. safetensors
+        # refuses to serialize tied tensors via the Trainer's default save
+        # path, so switch to the legacy pytorch_model.bin format for both
+        # mid-run and final saves.
+        save_safetensors=False,
     )
 
     Trainer(
@@ -318,7 +323,7 @@ def main():
     ).train()
 
     out_dir = Path(args.output_dir)
-    model.save_pretrained(out_dir)
+    model.save_pretrained(out_dir, safe_serialization=False)
     tokenizer.save_pretrained(out_dir)
     (out_dir / "llm2vec_meta.json").write_text(json.dumps({
         "base_llm": args.llm,
