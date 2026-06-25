@@ -1,0 +1,117 @@
+# --- Python build / cache artifacts ------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- Virtual environments ----------------------------------------------------
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# --- Notebooks ---------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- Editor / IDE / OS noise -------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Local config / secrets --------------------------------------------------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Claude / agent-local state ----------------------------------------------
+.claude/
+
+# --- SAE-LEWIS pipeline outputs ----------------------------------------------
+# The smoke pipeline (scripts/smoke_pipeline.sh) defaults to ./runs/, and
+# every production-style command in this repo takes its own --out-dir /
+# --output-dir / --data-cache-dir. The patterns below cover the common
+# choices so a user who follows the README won't accidentally commit
+# multi-GB caches or checkpoints.
+
+# All pipeline runs (smoke_pipeline.sh default root, plus a few common
+# alternative roots people use locally).
+runs/
+outputs/
+checkpoints/
+models/
+artifacts/
+
+# Stage 0: SAE cache + raw Dolma downloads.
+dolma_cache/
+sae_cache/
+
+# Stage 1: MNTP'd Gemma checkpoints (HF-format dirs).
+llm2vec/
+llm2vec_out/
+
+# Stage 2: corruption shards + meta.
+corruption/
+corruption_*/
+
+# Stages 3-5: trained .pt checkpoints (tagger / editor / length head).
+tagger/
+tagger_out/
+editor/
+editor_out/
+length_head/
+length_head_out/
+
+# Loose checkpoint files anywhere (catch users who save to repo root).
+*.pt
+*.safetensors
+*.bin
+*.ckpt
+
+# Large binary data artifacts produced by stage 0 / stage 2.
+*.npy
+*.npz
+*.jsonl
+*.jsonl.gz
+*.json.gz
+*.parquet
+*.arrow
+
+# meta.json files written by stages 0 / 2 / 3 / 4 / 5. These sit inside the
+# ignored run dirs above, but listing the name keeps stray copies out too.
+meta.json
+
+# Per-stage logs and timing TSV emitted by the smoke pipeline.
+logs/
+*.log
+timing.tsv
+
+# Hugging Face local cache (set HF_HOME=./hf_cache locally and it lands here).
+hf_cache/
+.cache/
+
+# --- Project-specific exceptions ---------------------------------------------
+# Files we DO want to track despite the patterns above. Order matters: these
+# unignores must come after the broader patterns that would otherwise hide
+# them.
+!requirements.txt
+!references.bib
+!.gitignore
+!scripts/**/*.sh

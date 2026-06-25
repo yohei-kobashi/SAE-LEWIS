@@ -1,0 +1,248 @@
+% SAE-MASKER 論文用 参考文献
+%
+% Bottleneck MLP の設計選択を正当化する主要文献に加え、関連トピック
+% (PEFT, disentanglement, style code, NLP probing) を網羅します。
+%
+% 凡例:
+%   - 検索で書誌情報を確認済みのものはそのまま採用
+%   - 仮の項目には `% TODO: verify` コメントを付けています
+%
+% 構成:
+%   1. Information Bottleneck (理論的基盤)
+%   2. Bottleneck Adapters / PEFT (アーキテクチャ類似)
+%   3. β-VAE / Disentanglement (容量制限と因子分離)
+%   4. Style code in generative models (AdaIN / StyleGAN)
+%   5. NLP probing with bounded capacity
+%   6. SAE / Padded MLM 関連 (主結果文脈; verify 必要)
+
+
+% =============================================================================
+% 1. Information Bottleneck (理論的基盤)
+% =============================================================================
+
+@inproceedings{tishby2015deep,
+  title     = {Deep Learning and the Information Bottleneck Principle},
+  author    = {Tishby, Naftali and Zaslavsky, Noga},
+  booktitle = {2015 IEEE Information Theory Workshop (ITW)},
+  year      = {2015},
+  pages     = {1--5},
+  publisher = {IEEE},
+  note      = {arXiv:1503.02406}
+}
+
+@inproceedings{alemi2017deep,
+  title     = {Deep Variational Information Bottleneck},
+  author    = {Alemi, Alexander A. and Fischer, Ian and Dillon, Joshua V.
+               and Murphy, Kevin},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2017},
+  note      = {arXiv:1612.00410}
+}
+
+@inproceedings{tishby1999information,
+  title     = {The Information Bottleneck Method},
+  author    = {Tishby, Naftali and Pereira, Fernando C. and Bialek, William},
+  booktitle = {Proceedings of the 37th Allerton Conference on Communication,
+               Control and Computing},
+  year      = {1999},
+  pages     = {368--377},
+  note      = {arXiv:physics/0004057}
+}
+
+
+% =============================================================================
+% 2. Bottleneck Adapters / Parameter-Efficient Transfer
+% =============================================================================
+
+@inproceedings{houlsby2019parameter,
+  title     = {Parameter-Efficient Transfer Learning for {NLP}},
+  author    = {Houlsby, Neil and Giurgiu, Andrei and
+               Jastrz{\k{e}}bski, Stanislaw and Morrone, Bruna and
+               de Laroussilhe, Quentin and Gesmundo, Andrea and
+               Attariyan, Mona and Gelly, Sylvain},
+  booktitle = {International Conference on Machine Learning (ICML)},
+  year      = {2019},
+  volume    = {97},
+  pages     = {2790--2799},
+  publisher = {PMLR},
+  note      = {arXiv:1902.00751}
+}
+
+@inproceedings{hu2022lora,
+  title     = {{LoRA}: Low-Rank Adaptation of Large Language Models},
+  author    = {Hu, Edward J. and Shen, Yelong and Wallis, Phillip and
+               Allen-Zhu, Zeyuan and Li, Yuanzhi and Wang, Shean and
+               Wang, Lu and Chen, Weizhu},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2022},
+  note      = {arXiv:2106.09685}
+}
+
+
+% =============================================================================
+% 3. β-VAE / Disentanglement (容量制限と因子分離)
+% =============================================================================
+
+@inproceedings{higgins2017beta,
+  title     = {{$\beta$-VAE}: Learning Basic Visual Concepts with a
+               Constrained Variational Framework},
+  author    = {Higgins, Irina and Matthey, Loic and Pal, Arka and
+               Burgess, Christopher and Glorot, Xavier and
+               Botvinick, Matthew and Mohamed, Shakir and
+               Lerchner, Alexander},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2017}
+}
+
+@article{burgess2018understanding,
+  title   = {Understanding disentangling in {$\beta$-VAE}},
+  author  = {Burgess, Christopher P. and Higgins, Irina and Pal, Arka and
+             Matthey, Loic and Watters, Nick and Desjardins, Guillaume and
+             Lerchner, Alexander},
+  journal = {arXiv preprint arXiv:1804.03599},
+  year    = {2018},
+  note    = {Also presented at NeurIPS 2017 Workshop on Learning
+             Disentangled Representations}
+}
+
+
+% =============================================================================
+% 4. Style code in generative models
+% =============================================================================
+
+@inproceedings{huang2017arbitrary,
+  title     = {Arbitrary Style Transfer in Real-time with Adaptive Instance
+               Normalization},
+  author    = {Huang, Xun and Belongie, Serge},
+  booktitle = {Proceedings of the IEEE International Conference on Computer
+               Vision (ICCV)},
+  year      = {2017},
+  pages     = {1501--1510},
+  note      = {arXiv:1703.06868}
+}
+
+@inproceedings{karras2019style,
+  title     = {A Style-Based Generator Architecture for Generative
+               Adversarial Networks},
+  author    = {Karras, Tero and Laine, Samuli and Aila, Timo},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision
+               and Pattern Recognition (CVPR)},
+  year      = {2019},
+  pages     = {4401--4410},
+  note      = {arXiv:1812.04948}
+}
+
+
+% =============================================================================
+% 5. NLP Probing with Bounded Capacity
+% =============================================================================
+
+@inproceedings{pimentel2020information,
+  title     = {Information-Theoretic Probing for Linguistic Structure},
+  author    = {Pimentel, Tiago and Valvoda, Josef and
+               Hall Maudslay, Rowan and Zmigrod, Ran and
+               Williams, Adina and Cotterell, Ryan},
+  booktitle = {Proceedings of the 58th Annual Meeting of the Association
+               for Computational Linguistics (ACL)},
+  year      = {2020},
+  pages     = {4609--4622}
+}
+
+@inproceedings{voita2020information,
+  title     = {Information-Theoretic Probing with Minimum Description Length},
+  author    = {Voita, Elena and Titov, Ivan},
+  booktitle = {Proceedings of the 2020 Conference on Empirical Methods in
+               Natural Language Processing (EMNLP)},
+  year      = {2020},
+  pages     = {183--196},
+  note      = {arXiv:2003.12298}
+}
+
+@inproceedings{hewitt2019designing,
+  title     = {Designing and Interpreting Probes with Control Tasks},
+  author    = {Hewitt, John and Liang, Percy},
+  booktitle = {Proceedings of the 2019 Conference on Empirical Methods in
+               Natural Language Processing and the 9th International Joint
+               Conference on Natural Language Processing (EMNLP-IJCNLP)},
+  year      = {2019},
+  pages     = {2733--2743}
+}
+
+
+% =============================================================================
+% 6. SAE / Padded MLM 関連 (主結果文脈; verify 必要)
+% =============================================================================
+% 以下は SAE-MASKER の主結果セクションで引用が必要になる可能性が高い文献
+% です。書誌情報は最終投稿前に再確認してください。
+
+@article{rajamanoharan2024jumprelu,
+  title   = {{JumpReLU} Sparse Autoencoders},
+  author  = {Rajamanoharan, Senthooran and Lieberum, Tom and
+             Sonnerat, Nicolas and Conmy, Arthur and Varma, Vikrant and
+             Kram{\'a}r, J{\'a}nos and Nanda, Neel},
+  journal = {arXiv preprint arXiv:2407.14435},
+  year    = {2024},
+  note    = {% TODO: verify exact title and author list before final use}
+}
+
+@article{lieberum2024gemmascope,
+  title   = {Gemma Scope: Open Sparse Autoencoders Everywhere All At Once
+             on {Gemma 2}},
+  author  = {Lieberum, Tom and Rajamanoharan, Senthooran and
+             Conmy, Arthur and Smith, Lewis and Sonnerat, Nicolas and
+             Varma, Vikrant and Kram{\'a}r, J{\'a}nos and
+             Dragan, Anca and Shah, Rohin and Nanda, Neel},
+  journal = {arXiv preprint arXiv:2408.05147},
+  year    = {2024},
+  note    = {% TODO: verify exact title and author list before final use}
+}
+
+@article{gao2024scaling,
+  title   = {Scaling and Evaluating Sparse Autoencoders},
+  author  = {Gao, Leo and la Tour, Tom Dupr{\'e} and Tillman, Henk and
+             Goh, Gabriel and Troll, Rajan and Radford, Alec and
+             Sutskever, Ilya and Leike, Jan and Wu, Jeffrey},
+  journal = {arXiv preprint arXiv:2406.04093},
+  year    = {2024},
+  note    = {% TODO: verify exact title and author list before final use;
+             TopK SAE の基礎文献}
+}
+
+@inproceedings{malmi2020unsupervised,
+  title     = {Unsupervised Text Style Transfer with Padded Masked Language
+               Models},
+  author    = {Malmi, Eric and Severyn, Aliaksei and Rothe, Sascha},
+  booktitle = {Proceedings of the 2020 Conference on Empirical Methods in
+               Natural Language Processing (EMNLP)},
+  year      = {2020},
+  pages     = {8671--8680},
+  note      = {% TODO: verify exact pages and title before final use;
+             Padded MLM の元論文}
+}
+
+
+% =============================================================================
+% 7. (オプション) Sparse Autoencoder interpretability の代表文献
+% =============================================================================
+% 必要なら Related Work で参照。書誌情報は要確認。
+
+@article{bricken2023monosemanticity,
+  title   = {Towards Monosemanticity: Decomposing Language Models with
+             Dictionary Learning},
+  author  = {Bricken, Trenton and Templeton, Adly and Batson, Joshua and
+             Chen, Brian and Jermyn, Adam and Conerly, Tom and Turner, Nick
+             and others},
+  journal = {Transformer Circuits Thread},
+  year    = {2023},
+  note    = {% TODO: verify; Anthropic SAE 初期の代表文献}
+}
+
+@inproceedings{cunningham2024sparse,
+  title     = {Sparse Autoencoders Find Highly Interpretable Features in
+               Language Models},
+  author    = {Cunningham, Hoagy and Ewart, Aidan and Riggs, Logan and
+               Huben, Robert and Sharkey, Lee},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+  note      = {arXiv:2309.08600; % TODO: verify venue/year}
+}
