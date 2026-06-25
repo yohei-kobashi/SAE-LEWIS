@@ -370,7 +370,25 @@ class MLMProvider(nn.Module):
         resolved = self.PRESETS.get(model_key_or_name, model_key_or_name)
         self.resolved_name = resolved
         self.tokenizer = AutoTokenizer.from_pretrained(resolved)
-        self.model = AutoModelForMaskedLM.from_pretrained(resolved, torch_dtype=dtype)
+        # ModernBERT defaults `reference_compile=True`, which JIT-compiles a
+        # CUDA helper through Triton. On systems without Python development
+        # headers (typical of HPC nodes) this crashes with a gcc error on
+        # `Python.h`. Inference-only here, so disable torch.compile across all
+        # MLM backends. The flag is silently ignored by other architectures.
+        from_pretrained_kwargs = {
+            "torch_dtype": dtype,
+            "reference_compile": False,
+        }
+        try:
+            self.model = AutoModelForMaskedLM.from_pretrained(
+                resolved, **from_pretrained_kwargs,
+            )
+        except TypeError:
+            # Backend doesn't know `reference_compile` — retry without it.
+            from_pretrained_kwargs.pop("reference_compile", None)
+            self.model = AutoModelForMaskedLM.from_pretrained(
+                resolved, **from_pretrained_kwargs,
+            )
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
