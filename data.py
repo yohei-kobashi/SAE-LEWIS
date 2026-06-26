@@ -344,14 +344,45 @@ class CorruptionDataset(IterableDataset):
         worker = get_worker_info()
         epoch_seed = self.seed
         shards = list(self.shards)
+        worker_label = (
+            f"{worker.id}/{worker.num_workers}" if worker is not None else "main"
+        )
+        if worker is not None:
+            my_shard_ids = list(range(worker.id, len(shards), worker.num_workers))
+            if not my_shard_ids:
+                # More workers than shards — this worker has nothing to read.
+                # Return cleanly so the DataLoader marks the worker as done
+                # rather than spinning the infinite loop with no yields and
+                # blocking the round-robin fetch on this worker forever.
+                print(
+                    f"[CorruptionDataset] worker {worker_label} "
+                    f"has 0 of {len(shards)} shards — exiting (raise num_workers "
+                    f"only up to the shard count, or shard the cache finer)."
+                )
+                return
+        else:
+            my_shard_ids = list(range(len(shards)))
         while True:
-            order = list(range(len(shards)))
+            order = list(my_shard_ids)
             if self.shuffle:
                 random.Random(epoch_seed).shuffle(order)
-            if worker is not None:
-                order = order[worker.id::worker.num_workers]
+            n_yielded = 0
             for i in order:
-                yield from self._iter_shard(shards[i])
+                for rec in self._iter_shard(shards[i]):
+                    n_yielded += 1
+                    yield rec
+            if n_yielded == 0:
+                # All assigned shards exist but contain no records (e.g. the
+                # trailing empty shard corruption.py opens just before exit).
+                # Without this guard, infinite=True would spin reading empty
+                # files forever and the DataLoader's round-robin fetch would
+                # block on this worker.
+                print(
+                    f"[CorruptionDataset] worker {worker_label} read 0 records "
+                    f"across {len(my_shard_ids)} assigned shards "
+                    f"({[shards[i].name for i in my_shard_ids]}) — exiting."
+                )
+                return
             if not self.infinite:
                 break
             epoch_seed += 1

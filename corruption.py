@@ -775,7 +775,7 @@ def main():
             cur_shard_file.write(json.dumps(final, ensure_ascii=False) + "\n")
             written += 1
             bucket_accepts[bucket] += 1
-            if written % args.samples_per_shard == 0:
+            if written % args.samples_per_shard == 0 and written < args.target_samples:
                 cur_shard_file.close()
                 open_shard()
                 yield_ = written / max(1, attempted)
