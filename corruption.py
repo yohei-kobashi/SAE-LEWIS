@@ -323,11 +323,16 @@ def make_repl_sample(
 
 
 INS_REJECT_REASONS = (
+    # Structural rejections, raised inside make_ins_sample:
     "too_short_words",     # too few words to fit `word_span_max` with margin
     "too_short_xprime",    # corrupted text would be < 8 non-whitespace chars
     "ins_span_nonpos",     # token-count diff is <= 0 (STRUCTURAL)
     "suffix_mismatch",     # prefix matched but suffix did not (STRUCTURAL)
     "length_mismatch",     # final editor_input vs target length mismatch (STRUCTURAL)
+    # Post-corruption rejections, raised inside finalize_sample:
+    "ppl_inf",             # PPL not finite for clean or corrupted text
+    "ppl_too_high",        # corrupted PPL > ppl_max_ratio * clean PPL
+    "sae_shift_too_small", # SAE pool-max L2 diff < sae_shift_threshold
 )
 
 
@@ -514,22 +519,37 @@ def make_identity_sample(stage: Stage, text: str) -> Optional[Dict]:
 # ---------------------------------------------------------------------------
 # Finalisation (PPL + SAE-shift filters + conditioning precompute)
 # ---------------------------------------------------------------------------
+FINALIZE_REJECT_REASONS = (
+    "empty_xprime_text",   # sample had no x_prime_text (programmer error; shouldn't happen)
+    "ppl_inf",             # PPL not finite for clean or corrupted text
+    "ppl_too_high",        # ppl_corr > ppl_max_ratio * ppl_clean
+    "sae_shift_too_small", # ||SAE(clean) - SAE(corrupted)|| < threshold
+)
+
+
 def finalize_sample(
     stage: Stage, sample: Dict, source_id: str,
     ppl_max_ratio: float, sae_shift_threshold: float,
-) -> Optional[Dict]:
+) -> Tuple[Optional[Dict], str]:
+    """Return (sample, "") on success, (None, reason) on rejection.
+
+    Rejection reasons are listed in `FINALIZE_REJECT_REASONS` and are used
+    by the main loop to populate per-bucket reject counters (e.g. so the
+    INS bucket's reject breakdown includes PPL / SAE-shift failures, not
+    only the structural failures from `make_ins_sample`).
+    """
     x_text = sample.get("x_text", "")
     xp_text = sample.get("x_prime_text", "")
     if not xp_text:
-        return None
+        return None, "empty_xprime_text"
 
     if sample["corruption_type"] != "identity":
         ppl_clean = causal_perplexity_text(stage, x_text)
         ppl_corr = causal_perplexity_text(stage, xp_text)
         if not (math.isfinite(ppl_clean) and math.isfinite(ppl_corr)):
-            return None
+            return None, "ppl_inf"
         if ppl_corr > ppl_max_ratio * ppl_clean:
-            return None
+            return None, "ppl_too_high"
     else:
         ppl_clean = ppl_corr = float("nan")
 
@@ -537,7 +557,7 @@ def finalize_sample(
     fXp, vXp = sae_pool_max_topk_from_text(stage, xp_text)
     shift = sae_l2_shift(fX, vX, fXp, vXp)
     if sample["corruption_type"] != "identity" and shift < sae_shift_threshold:
-        return None
+        return None, "sae_shift_too_small"
 
     sample.pop("x_text", None)
     sample.pop("x_prime_text", None)
@@ -551,7 +571,7 @@ def finalize_sample(
             "sae_shift_l2": shift,
         },
     })
-    return sample
+    return sample, ""
 
 
 # ---------------------------------------------------------------------------
@@ -716,12 +736,16 @@ def main():
 
             if sample is None:
                 continue
-            final = finalize_sample(
+            final, finalize_reason = finalize_sample(
                 stage, sample, source_id=f"dolma:s{sent_idx}",
                 ppl_max_ratio=args.ppl_max_ratio,
                 sae_shift_threshold=args.sae_shift_threshold,
             )
             if final is None:
+                # Track post-finalize rejections in the INS counter so the
+                # INS reject breakdown reflects PPL / SAE-shift losses too.
+                if bucket in ("ins", "mixed_repl_ins") and finalize_reason:
+                    ins_reject_counter[finalize_reason] += 1
                 continue
             cur_shard_file.write(json.dumps(final, ensure_ascii=False) + "\n")
             written += 1
