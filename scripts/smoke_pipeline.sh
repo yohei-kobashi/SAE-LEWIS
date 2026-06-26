@@ -28,7 +28,7 @@
 #   EDITOR_STEPS            (default: 200)
 #   LENGTH_STEPS            (default: 200)
 #   BATCH_SIZE              tagger / editor / length head batch (default: 4)
-#   NUM_WORKERS             data loader workers (default: 1)
+#   NUM_WORKERS             data loader workers (default: 4)
 #   EVAL_TEXT               text for stage-6 inference (default: a single sentence)
 #   EVAL_SPEC               intervention spec for stage-6 (default: "+1234")
 #   LLM                     causal LLM HF id        (default: google/gemma-2-2b)
@@ -72,7 +72,7 @@ TAGGER_STEPS=${TAGGER_STEPS:-200}
 EDITOR_STEPS=${EDITOR_STEPS:-200}
 LENGTH_STEPS=${LENGTH_STEPS:-200}
 BATCH_SIZE=${BATCH_SIZE:-4}
-NUM_WORKERS=${NUM_WORKERS:-1}
+NUM_WORKERS=${NUM_WORKERS:-4}
 
 EVAL_TEXT=${EVAL_TEXT:-"The quick brown fox jumps over the lazy dog."}
 EVAL_SPEC=${EVAL_SPEC:-"+1234"}

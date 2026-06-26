@@ -360,15 +360,38 @@ def make_repl_sample(
     }
 
 
+INS_REJECT_REASONS = (
+    "too_short_words",     # input has fewer than 8 words (trivial-filter)
+    "too_short_xprime",    # corrupted text would be < 8 non-whitespace chars
+    "mlm_short",           # MLM returned fewer mask predictions than expected
+    "recovery_fail",       # MLM can't recover the deleted words (RECOVERY)
+    "ins_span_nonpos",     # token-count diff is <= 0 (STRUCTURAL)
+    "suffix_mismatch",     # prefix matched but suffix did not (STRUCTURAL)
+    "length_mismatch",     # final editor_input vs target length mismatch (STRUCTURAL)
+)
+
+
 def make_ins_sample(
     stage: Stage, text: str, rng: random.Random,
     word_span_max: int, mlm_topk: int,
     recover_mode: str, recover_min_fraction: float,
+    *,
+    reject_counter: Optional[Dict[str, int]] = None,
 ) -> Optional[Dict]:
-    """Delete a span of consecutive words whose context can recover them."""
+    """Delete a span of consecutive words whose context can recover them.
+
+    When `reject_counter` is provided, increments the matching reason key on
+    every early return so the caller can see which gate is dominating the
+    yield. Reasons are listed in `INS_REJECT_REASONS`.
+    """
+    def _rej(reason: str):
+        if reject_counter is not None:
+            reject_counter[reason] = reject_counter.get(reason, 0) + 1
+        return None
+
     words = words_with_offsets(text)
     if len(words) < 8:
-        return None
+        return _rej("too_short_words")
     n_words = rng.randint(1, max(1, min(word_span_max, len(words) - 6)))
     start_wi = rng.randint(1, len(words) - n_words - 2)
     end_wi = start_wi + n_words
@@ -381,14 +404,14 @@ def make_ins_sample(
 
     xprime_text = text[:delete_start] + text[delete_end:]
     if len(xprime_text.strip()) < 8:
-        return None
+        return _rej("too_short_xprime")
 
     # Recovery check: mask all n words in one MLM forward
     masked_block = " ".join([stage.mlm.mask_token] * n_words)
     masked_text = text[:delete_start] + masked_block + text[delete_end:]
     preds_per_mask = stage.mlm.predict_at_masks(masked_text, top_k=mlm_topk)
     if len(preds_per_mask) < n_words:
-        return None
+        return _rej("mlm_short")
     hits = 0
     for i in range(n_words):
         orig_word, _, _ = words[start_wi + i]
@@ -397,10 +420,10 @@ def make_ins_sample(
             hits += 1
     if recover_mode == "strict":
         if hits != n_words:
-            return None
+            return _rej("recovery_fail")
     else:
         if hits / n_words < recover_min_fraction:
-            return None
+            return _rej("recovery_fail")
 
     x_ids, _ = gemma_tokenize(stage.gemma_tok, text)
     xp_ids, _ = gemma_tokenize(stage.gemma_tok, xprime_text)
@@ -413,7 +436,7 @@ def make_ins_sample(
     # break `len(editor_input) == len(editor_target)` for every INS sample).
     ins_span_length = len(x_ids) - len(xp_ids)
     if ins_span_length <= 0:
-        return None
+        return _rej("ins_span_nonpos")
 
     # Find the gap position in xp_ids by walking the matching prefix
     # between x_ids and xp_ids; the first divergence is where the deletion
@@ -426,7 +449,7 @@ def make_ins_sample(
     # the deletion did not produce a clean token-level transposition (rare;
     # punctuation-adjacent deletions or SentencePiece boundary shifts).
     if list(xp_ids[gap_xp:]) != list(x_ids[gap_xp + ins_span_length:]):
-        return None
+        return _rej("suffix_mismatch")
 
     # Construct training tuple
     tagger_gold = [OP_KEEP] * len(xp_ids)
@@ -438,7 +461,7 @@ def make_ins_sample(
     editor_input = list(xp_ids[:gap_xp]) + [stage.ins_id] * ins_span_length + list(xp_ids[gap_xp:])
     editor_target = list(x_ids)
     if len(editor_input) != len(editor_target):
-        return None
+        return _rej("length_mismatch")
 
     return {
         "corruption_type": "ins",
@@ -673,6 +696,7 @@ def main():
     attempted = 0
     bucket_attempts: Dict[str, int] = defaultdict(int)
     bucket_accepts: Dict[str, int] = defaultdict(int)
+    ins_reject_counter: Dict[str, int] = defaultdict(int)
     cur_shard_file = None
 
     def open_shard():
@@ -706,6 +730,7 @@ def main():
                     stage, sent, rng,
                     args.ins_word_span_max, args.ins_mlm_topk,
                     args.ins_recover_mode, args.ins_recover_min_fraction,
+                    reject_counter=ins_reject_counter,
                 )
             elif bucket == "del":
                 sample = make_del_sample(
@@ -722,6 +747,7 @@ def main():
                     stage, mid["x_prime_text"], rng,
                     args.ins_word_span_max, args.ins_mlm_topk,
                     args.ins_recover_mode, args.ins_recover_min_fraction,
+                    reject_counter=ins_reject_counter,
                 )
                 if sample is not None:
                     sample["corruption_type"] = "mixed_repl_ins"
@@ -763,6 +789,15 @@ def main():
                     f"[corruption] written={written} sents={sent_idx} "
                     f"attempts={attempted} yield={yield_:.3f}  ({per_bucket})"
                 )
+                ins_total = sum(ins_reject_counter.values())
+                if ins_total:
+                    ins_breakdown = ", ".join(
+                        f"{r}={ins_reject_counter[r]}"
+                        f"({100.0 * ins_reject_counter[r] / ins_total:.0f}%)"
+                        for r in INS_REJECT_REASONS
+                        if ins_reject_counter[r] > 0
+                    )
+                    print(f"[corruption] INS reject reasons: {ins_breakdown}")
             break
 
     if cur_shard_file is not None:
@@ -779,6 +814,7 @@ def main():
             k: float(bucket_accepts[k] / max(1, bucket_attempts[k]))
             for k in bucket_attempts
         },
+        "ins_reject_reasons": {k: int(ins_reject_counter[k]) for k in INS_REJECT_REASONS},
         "d_sae": int(extractor.d_sae),
         "k_train": int(args.k_train),
         "mask_id": int(stage.mask_id),
