@@ -778,6 +778,31 @@ def main():
     if cur_shard_file is not None:
         cur_shard_file.close()
 
+    # Final summary — print regardless of whether the last shard was a
+    # samples_per_shard cut (the per-shard log is gated on
+    # `written < target_samples`, so the very last completed batch never
+    # surfaces its breakdown otherwise).
+    yield_ = written / max(1, attempted)
+    per_bucket = ", ".join(
+        f"{name}={bucket_accepts[name]}/"
+        f"{bucket_attempts[name]}="
+        f"{bucket_accepts[name] / max(1, bucket_attempts[name]):.2f}"
+        for name, _ in buckets
+    )
+    print(
+        f"[corruption] FINAL written={written} sents={sent_idx} "
+        f"attempts={attempted} yield={yield_:.3f}  ({per_bucket})"
+    )
+    ins_total = sum(ins_reject_counter.values())
+    if ins_total:
+        ins_breakdown = ", ".join(
+            f"{r}={ins_reject_counter[r]}"
+            f"({100.0 * ins_reject_counter[r] / ins_total:.0f}%)"
+            for r in INS_REJECT_REASONS
+            if ins_reject_counter[r] > 0
+        )
+        print(f"[corruption] FINAL INS reject reasons: {ins_breakdown}")
+
     meta = {
         "samples_written": int(written),
         "sentences_seen": int(sent_idx),
