@@ -263,6 +263,35 @@ def _norm(w: str) -> str:
     return w.strip().lower()
 
 
+def _word_recovery_hit(candidates: List[str], original: str,
+                       min_prefix_len: int = 3) -> bool:
+    """Decide whether MLM `candidates` recover `original` at a masked slot.
+
+    A candidate counts as a hit iff (after lowercasing / stripping) it is
+    either:
+      - exactly equal to the original word, OR
+      - a prefix of the original word with length >= `min_prefix_len`.
+
+    The prefix rule handles the common case where the original word
+    tokenises to multiple subwords under the MLM's BPE (e.g. ModernBERT
+    splits "scientists" into "Ġscient" + "ists"). With single-token
+    [MASK]s the MLM can only emit one subword, so the strongest signal
+    of correct recovery is a word-initial prefix match.
+    """
+    o = _norm(original)
+    if not o:
+        return False
+    for c in candidates:
+        c = _norm(c)
+        if not c:
+            continue
+        if c == o:
+            return True
+        if len(c) >= min_prefix_len and o.startswith(c):
+            return True
+    return False
+
+
 def make_repl_sample(
     stage: Stage, text: str, rng: random.Random,
     repl_words_max: int, mlm_topk: int,
@@ -380,7 +409,7 @@ def make_ins_sample(
     for i in range(n_words):
         orig_word, _, _ = words[start_wi + i]
         cands = preds_per_mask[i]
-        if any(_norm(c) == _norm(orig_word) for c in cands):
+        if _word_recovery_hit(cands, orig_word):
             hits += 1
     if recover_mode == "strict":
         if hits != n_words:
