@@ -418,25 +418,31 @@ def make_ins_sample(
         if hits / n_words < recover_min_fraction:
             return None
 
-    x_ids, x_offsets = gemma_tokenize(stage.gemma_tok, text)
-    xp_ids, xp_offsets = gemma_tokenize(stage.gemma_tok, xprime_text)
+    x_ids, _ = gemma_tokenize(stage.gemma_tok, text)
+    xp_ids, _ = gemma_tokenize(stage.gemma_tok, xprime_text)
 
-    # Original Gemma token range of the deleted words
-    os, oe = find_token_range(x_offsets, delete_start, delete_end)
-    if os is None or oe is None or oe == os:
+    # ins_span_length is the number of Gemma tokens removed by the deletion.
+    # Derive it directly from the token-count diff — this is robust to the
+    # SentencePiece-style leading-space encoding (▁cat's char range starts
+    # at the space BEFORE "cat", so an offset-based scan over the eaten
+    # delete_end character range would over-reach into the next token and
+    # break `len(editor_input) == len(editor_target)` for every INS sample).
+    ins_span_length = len(x_ids) - len(xp_ids)
+    if ins_span_length <= 0:
         return None
-    ins_span_length = oe - os
 
-    # The gap in xp lives at the character position `delete_start` of xp
-    gap_xp = None
-    for i, (s, e) in enumerate(xp_offsets):
-        if s == 0 and e == 0:
-            continue
-        if s >= delete_start:
-            gap_xp = i
-            break
-    if gap_xp is None:
-        gap_xp = len(xp_ids)
+    # Find the gap position in xp_ids by walking the matching prefix
+    # between x_ids and xp_ids; the first divergence is where the deletion
+    # happened. This is token-level — no offset arithmetic involved.
+    gap_xp = 0
+    upper = min(len(x_ids), len(xp_ids))
+    while gap_xp < upper and x_ids[gap_xp] == xp_ids[gap_xp]:
+        gap_xp += 1
+    # Verify the suffix matches after skipping the deleted span — otherwise
+    # the deletion did not produce a clean token-level transposition (rare;
+    # punctuation-adjacent deletions or SentencePiece boundary shifts).
+    if list(xp_ids[gap_xp:]) != list(x_ids[gap_xp + ins_span_length:]):
+        return None
 
     # Construct training tuple
     tagger_gold = [OP_KEEP] * len(xp_ids)
