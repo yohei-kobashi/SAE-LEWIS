@@ -165,6 +165,12 @@ def parse_args():
     p.add_argument("--sae-per-op-max", type=float, default=2.50,
                    help="sae_max(N) = sae_per_op_max * sqrt(N) (minimality "
                         "upper bound).")
+    p.add_argument("--force-n", type=int, default=None,
+                   help="Override bucket sampling and force every attempt to "
+                        "use this N. Useful for measuring per-N yield / "
+                        "distribution shifts without bucket-sample noise. "
+                        "When set, --p-identity / --p-single-op / "
+                        "--p-compound-* and --n-distribution-p are ignored.")
     p.add_argument("--calibration-mode", action="store_true",
                    help="Skip the PPL/SAE-shift gate; record every attempt's "
                         "(N, ppl_ratio, sae_shift) to a JSONL file for "
@@ -1274,11 +1280,16 @@ def main():
             continue
         sent_idx += 1
 
-        bucket = pick_bucket(bucket_probs, rng)
+        if args.force_n is not None:
+            N_forced = max(0, min(int(args.force_n), int(args.n_max)))
+            bucket = bucket_for_N(N_forced)
+        else:
+            N_forced = None
+            bucket = pick_bucket(bucket_probs, rng)
         for _attempt in range(args.k_budget):
             attempted += 1
             bucket_attempts[bucket] += 1
-            N = sample_N_for_bucket(bucket, rng, args)
+            N = N_forced if N_forced is not None else sample_N_for_bucket(bucket, rng, args)
             n_attempts[N] += 1
             sample: Optional[Dict] = None
             reason = ""
