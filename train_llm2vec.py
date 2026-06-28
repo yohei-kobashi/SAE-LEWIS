@@ -2,12 +2,25 @@
 Stage 1: LLM2Vec-style MNTP training.
 
 Turn causal Gemma into a bidirectional encoder via:
-  (1) monkey-patching the attention mask to be bidirectional,
-  (2) MNTP-style training with span corruption on sentence-segmented Dolma.
+  (1) bidirectional attention patch from `model._patch_attention_bidirectional`,
+  (2) MNTP (Masked Next Token Prediction) on sentence-segmented Dolma.
 
-Before training we add the SAE-LEWIS-specific special tokens [INS] and [DEL]
-to the tokenizer. Their embedding rows are jointly learned during MNTP. The
-[MASK] token is the standard tokenizer mask.
+This file mirrors the canonical LLM2Vec recipe
+(https://github.com/McGill-NLP/llm2vec, `experiments/run_mntp.py`):
+
+  * Tokens are masked with BERT-style 15% probability + 80/10/10 split
+    (MASK / random / original), via HF's `DataCollatorForLanguageModeling`.
+  * The forward pass goes through `GemmaForCausalLM.forward(labels=...)`
+    which internally applies the standard causal-LM +1 shift:
+        loss = CE(logits[..., :-1, :], labels[..., 1:])
+    Combined with mask-at-i / label-at-i this means the masked token at
+    position i is predicted from the hidden state at position i-1 — i.e.,
+    the LLM2Vec MNTP objective (the LM head's "predict next token" mapping
+    is preserved, attention is bidirectional via `_update_causal_mask`).
+
+We also add the SAE-LEWIS-specific special tokens [INS] and [DEL] to the
+tokenizer before training. Their embedding rows are jointly learned during
+MNTP. [MASK] is added if missing (Gemma has no native mask token).
 
 Output: a HF-format checkpoint at --output-dir, loaded later by
 `BidirectionalLLM(<output-dir>)` from `model.py`.
@@ -17,18 +30,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import IterableDataset, get_worker_info
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
     set_seed,
@@ -46,9 +57,12 @@ def parse_args():
     p.add_argument("--output-dir", required=True)
 
     p.add_argument("--max-seq-length", type=int, default=256)
-    p.add_argument("--span-lambda", type=float, default=3.0)
-    p.add_argument("--span-max", type=int, default=10)
-    p.add_argument("--mask-coverage", type=float, default=0.15)
+    # Canonical LLM2Vec MNTP uses BERT-style 15% / 80-10-10 masking via
+    # `DataCollatorForLanguageModeling`. Probability is configurable; the
+    # 80/10/10 split is baked into the HF collator and not exposed.
+    p.add_argument("--mlm-probability", type=float, default=0.15,
+                   help="Fraction of non-special tokens to mask per sequence "
+                        "(canonical LLM2Vec default: 0.15).")
     p.add_argument("--sentence-splitter", choices=["pysbd", "nltk"], default="pysbd")
     p.add_argument("--sent-min-chars", type=int, default=16)
     p.add_argument("--sent-max-chars", type=int, default=2000)
@@ -75,7 +89,11 @@ def parse_args():
 
 
 class DolmaSentenceTokenStream(IterableDataset):
-    """Stream Dolma → sentences → token ids."""
+    """Stream Dolma → sentences → tokenized examples.
+
+    Each yielded example is a dict with `input_ids` and `special_tokens_mask`
+    — the keys expected by `DataCollatorForLanguageModeling`.
+    """
 
     def __init__(
         self,
@@ -121,120 +139,19 @@ class DolmaSentenceTokenStream(IterableDataset):
         )
         for sent in sent_iter:
             enc = self.tokenizer(
-                sent, truncation=True, max_length=self.max_seq_length,
+                sent,
+                truncation=True,
+                max_length=self.max_seq_length,
                 add_special_tokens=True,
+                return_special_tokens_mask=True,
             )
             ids = enc["input_ids"]
             if len(ids) < 4:
                 continue
-            yield {"input_ids": np.asarray(ids, dtype=np.int32)}
-
-
-def sample_corruption_mask(
-    T: int,
-    coverage: float,
-    span_lambda: float,
-    span_max: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    target = max(1, int(coverage * T))
-    mask = np.zeros(T, dtype=bool)
-    n_masked = 0
-    for _ in range(8 * target):
-        if n_masked >= target:
-            break
-        L = int(rng.poisson(span_lambda))
-        L = max(1, min(L, span_max, T))
-        s = int(rng.integers(0, max(1, T - L + 1)))
-        s = min(max(0, s), T - L)
-        added = 0
-        for i in range(s, s + L):
-            if not mask[i]:
-                mask[i] = True
-                added += 1
-        n_masked += added
-        if added == 0:
-            break
-    return mask
-
-
-class SpanCorruptionCollator:
-    def __init__(
-        self, mask_token_id, pad_token_id, max_seq_length,
-        mask_coverage=0.15, span_lambda=3.0, span_max=10, seed=42,
-    ):
-        self.mask_token_id = int(mask_token_id)
-        self.pad_token_id = int(pad_token_id)
-        self.max_seq_length = int(max_seq_length)
-        self.mask_coverage = float(mask_coverage)
-        self.span_lambda = float(span_lambda)
-        self.span_max = int(span_max)
-        self._base_seed = int(seed)
-
-    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
-        rng = np.random.default_rng(self._base_seed + random.randint(0, 1 << 30))
-        items = []
-        for ex in batch:
-            ids = np.asarray(ex["input_ids"], dtype=np.int64)
-            T = int(min(len(ids), self.max_seq_length))
-            if T < 4:
-                continue
-            ids = ids[:T]
-            mask = sample_corruption_mask(
-                T, self.mask_coverage, self.span_lambda, self.span_max, rng,
-            )
-            masked = np.where(mask, self.mask_token_id, ids)
-            labels = np.where(mask, ids, -100)
-            items.append((masked, labels, T))
-        if not items:
-            raise RuntimeError("empty batch")
-
-        T_max = max(t for _, _, t in items)
-        B = len(items)
-        ids_arr = np.full((B, T_max), self.pad_token_id, dtype=np.int64)
-        attn_arr = np.zeros((B, T_max), dtype=np.int64)
-        lbl_arr = np.full((B, T_max), -100, dtype=np.int64)
-        for b, (m, l, T) in enumerate(items):
-            ids_arr[b, :T] = m
-            attn_arr[b, :T] = 1
-            lbl_arr[b, :T] = l
-        return {
-            "input_ids": torch.from_numpy(ids_arr),
-            "attention_mask": torch.from_numpy(attn_arr),
-            "labels": torch.from_numpy(lbl_arr),
-        }
-
-
-class BidirMNTPWrapper(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def gradient_checkpointing_enable(self, **kwargs):
-        return self.model.gradient_checkpointing_enable(**kwargs)
-
-    def gradient_checkpointing_disable(self):
-        return self.model.gradient_checkpointing_disable()
-
-    @property
-    def config(self):
-        return self.model.config
-
-    def forward(self, input_ids, attention_mask=None, labels=None):
-        out = self.model(
-            input_ids=input_ids, attention_mask=attention_mask,
-            labels=None, use_cache=False,
-        )
-        loss = None
-        if labels is not None:
-            loss = F.cross_entropy(
-                out.logits.reshape(-1, out.logits.size(-1)),
-                labels.reshape(-1), ignore_index=-100,
-            )
-        return {"loss": loss, "logits": out.logits}
-
-    def save_pretrained(self, save_directory, **kwargs):
-        return self.model.save_pretrained(save_directory, **kwargs)
+            yield {
+                "input_ids": ids,
+                "special_tokens_mask": enc["special_tokens_mask"],
+            }
 
 
 def main():
@@ -242,8 +159,8 @@ def main():
     set_seed(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.llm)
-    # Special tokens for the SAE-LEWIS pipeline. [MASK] is the standard one
-    # (added if missing). [INS] / [DEL] are new and learned during MNTP.
+    # Special tokens for the SAE-LEWIS pipeline. [MASK] is added if missing
+    # (Gemma has no native mask). [INS] / [DEL] are new and learned during MNTP.
     added = 0
     if tokenizer.mask_token is None:
         added += tokenizer.add_special_tokens({"mask_token": "[MASK]"})
@@ -263,9 +180,23 @@ def main():
         "float16": torch.float16,
         "float32": torch.float32,
     }[args.llm_dtype]
-    model = AutoModelForCausalLM.from_pretrained(args.llm, torch_dtype=dtype)
+    # `attn_implementation="eager"` matches canonical LLM2Vec
+    # (`run_mntp.py` registers only eager attention). Eager attention
+    # consumes the explicit 4D mask we provide via the patched
+    # `_update_causal_mask`, so the bidirectional patch is guaranteed to
+    # take effect.
+    model = AutoModelForCausalLM.from_pretrained(
+        args.llm,
+        torch_dtype=dtype,
+        attn_implementation="eager",
+    )
     if added > 0 or model.config.vocab_size != len(tokenizer):
         model.resize_token_embeddings(len(tokenizer))
+    # Make the inner Gemma backbone bidirectional. The outer
+    # GemmaForCausalLM.forward still applies the standard causal-LM +1
+    # shift (loss = CE(logits[:-1], labels[1:])), which is exactly the
+    # LLM2Vec MNTP objective: predict the masked token at position i from
+    # the bidirectional hidden state at position i-1.
     _patch_attention_bidirectional(model.model)
     model.config.use_cache = False
 
@@ -282,17 +213,16 @@ def main():
         quality_filter=not args.no_quality_filter,
     )
 
-    collator = SpanCorruptionCollator(
-        mask_token_id=tokenizer.mask_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        max_seq_length=args.max_seq_length,
-        mask_coverage=args.mask_coverage,
-        span_lambda=args.span_lambda,
-        span_max=args.span_max,
-        seed=args.seed,
+    # Canonical LLM2Vec collator: 15% / 80-10-10 / token-level masking.
+    # Labels are at the SAME positions as masked tokens (-100 elsewhere);
+    # the +1 shift that turns this into MNTP is applied inside the model's
+    # CausalLM forward pass.
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=True,
+        mlm_probability=args.mlm_probability,
+        pad_to_multiple_of=None,
     )
-
-    wrapper = BidirMNTPWrapper(model)
 
     targs = TrainingArguments(
         output_dir=args.output_dir,
@@ -313,13 +243,17 @@ def main():
         seed=args.seed,
         # Gemma ties lm_head.weight to embed_tokens.weight. safetensors
         # refuses to serialize tied tensors via the Trainer's default save
-        # path, so switch to the legacy pytorch_model.bin format for both
-        # mid-run and final saves.
+        # path, so switch to the legacy pytorch_model.bin format.
         save_safetensors=False,
     )
 
+    # Pass the raw GemmaForCausalLM model directly: its built-in
+    # `forward(input_ids, labels=labels)` returns the +1-shifted CE loss,
+    # which is the MNTP objective. No wrapper that would re-compute the
+    # loss in a non-shifted way.
     Trainer(
-        model=wrapper, args=targs, train_dataset=dataset, data_collator=collator,
+        model=model, args=targs,
+        train_dataset=dataset, data_collator=collator,
     ).train()
 
     out_dir = Path(args.output_dir)
@@ -328,9 +262,8 @@ def main():
     (out_dir / "llm2vec_meta.json").write_text(json.dumps({
         "base_llm": args.llm,
         "max_seq_length": args.max_seq_length,
-        "mask_coverage": args.mask_coverage,
-        "span_lambda": args.span_lambda,
-        "span_max": args.span_max,
+        "mlm_probability": args.mlm_probability,
+        "mntp_objective": "predict-i-from-h(i-1) (canonical LLM2Vec)",
         "vocab_size": len(tokenizer),
         "mask_token_id": tokenizer.mask_token_id,
         "ins_token_id": tokenizer.convert_tokens_to_ids("[INS]"),

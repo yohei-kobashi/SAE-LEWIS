@@ -261,6 +261,25 @@ class SAEFeatureExtractor(nn.Module):
 # Bidirectional LLM (LLM2Vec encoder runtime)
 # ---------------------------------------------------------------------------
 def _patch_attention_bidirectional(model):
+    """Make a HF decoder-only LM behave bidirectionally — the LLM2Vec recipe.
+
+    Mirrors the class-level patch from the canonical LLM2Vec repo
+    (`llm2vec/models/bidirectional_gemma.py`):
+
+      1. Override `_update_causal_mask` so the returned 4D mask has NO
+         triangular (causal) component — only padding positions are masked
+         to `-inf`. This matches `GemmaBiModel._update_causal_mask` which
+         comments out the `torch.triu(..., diagonal=1)` line.
+      2. Set `is_causal=False` on every self-attention module so SDPA /
+         eager kernels do NOT apply causal masking via the `is_causal`
+         override path. (Canonical: `ModifiedGemmaAttention.is_causal=False`.)
+      3. Tag `config.is_decoder = False` so any downstream HF logic that
+         branches on it treats this as an encoder.
+
+    Step (1) alone is sufficient on transformers ≥ 4.41 when SDPA receives
+    a non-None attn_mask (it ignores `is_causal` in that case), but step
+    (2) makes the patch robust across attention implementations.
+    """
     def _padding_mask_only(self, attention_mask, input_tensor, *args, **kwargs):
         if attention_mask is None:
             return None
@@ -273,6 +292,14 @@ def _patch_attention_bidirectional(model):
         return mask
 
     model._update_causal_mask = types.MethodType(_padding_mask_only, model)
+    # Force `is_causal=False` on every self-attention module. Equivalent to
+    # subclassing GemmaAttention with `self.is_causal = False`.
+    for module in model.modules():
+        if hasattr(module, "is_causal"):
+            try:
+                module.is_causal = False
+            except Exception:
+                pass
     if hasattr(model, "config"):
         model.config.is_decoder = False
 
@@ -281,11 +308,21 @@ class BidirectionalLLM(nn.Module):
     """Bidirectional Gemma backbone. Used both during LLM2Vec MNTP training
     and at editor / tagger inference. Tokenizer is shared with the causal
     Gemma so [INS] / [DEL] embeddings added before MNTP are also valid here.
+
+    We force `attn_implementation="eager"` to match the canonical LLM2Vec
+    setup (`run_mntp.py` only registers eager attention). Eager attention
+    consumes the explicit 4D attn_mask from `_update_causal_mask`, so the
+    bidirectional patch is guaranteed to take effect regardless of the
+    transformers / PyTorch SDPA dispatch path.
     """
 
     def __init__(self, model_name_or_path: str, dtype: torch.dtype = torch.bfloat16):
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name_or_path, torch_dtype=dtype)
+        self.backbone = AutoModel.from_pretrained(
+            model_name_or_path,
+            torch_dtype=dtype,
+            attn_implementation="eager",
+        )
         _patch_attention_bidirectional(self.backbone)
 
     @property
