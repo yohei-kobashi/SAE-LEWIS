@@ -221,7 +221,7 @@ The **main** inference path enumerates all slot configurations under `L_MAX` and
 
 ## 5. Vocabulary
 
-Three special tokens are used; the latter two are added to the tokenizer **before** Stage 1 (LLM2Vec MNTP) so their embeddings are jointly learned during MNTP. `[MASK]` is already present from MNTP training and is reused.
+Three special tokens are used. `train_llm2vec.py` adds all three to the tokenizer at the start of Stage 1 (Gemma has no native `[MASK]`), so their embedding rows participate in MNTP from step 0 and are jointly learned with the rest of the model.
 
 | Token | Role | Appears in editor input | Appears in editor output |
 | --- | --- | --- | --- |
@@ -239,7 +239,14 @@ Sparse top-L SAE features per LLM token over the sentence-segmented Dolma sample
 
 ### 6.1 LLM2Vec Encoder — `train_llm2vec.py`
 
-MNTP training to turn causal Gemma into a bidirectional encoder. The `[INS]` and `[DEL]` tokens are added before this stage and trained as ordinary tokens during MNTP. The MNTP'd Gemma is the **encoder backbone** of both the editor and the tagger. It is not used as the corruption MLM (§6.2) — corruption operates at the text level and uses a separate, swappable MLM.
+MNTP training to turn causal Gemma into a bidirectional encoder. Follows the canonical LLM2Vec recipe (McGill-NLP), with two ingredients:
+
+1. **Bidirectional attention patch.** The inner `GemmaModel`'s `_update_causal_mask` is overridden to return a padding-only 4D mask (no triangular `-inf`), and every self-attention module's `is_causal` flag is set to `False`. The model is loaded with `attn_implementation="eager"` so the explicit mask is consumed directly by the kernel (no SDPA `is_causal` override). Lives in `model._patch_attention_bidirectional` and is reused at inference by `BidirectionalLLM`.
+2. **MNTP objective (predict-at-i-1).** Token-level masking via HF's `DataCollatorForLanguageModeling` (15% / 80-10-10), then `GemmaForCausalLM.forward(labels=labels)` whose built-in `+1` shift gives `loss = CE(logits[..., :-1, :], labels[..., 1:])`. Combined with the bidirectional attention, the masked token at position `i` is predicted from the bidirectionally-contextualized hidden state at position `i-1` — exactly the LLM2Vec objective. The LM head's pretrained "next-token" mapping is reused without retraining.
+
+`train_llm2vec.py` adds `[MASK]` (if absent), `[INS]`, and `[DEL]` to the tokenizer before any training step, then resizes the LLM's embedding table so MNTP trains the new rows jointly with the rest of the model (§5). The MNTP'd Gemma is the **encoder backbone** of both the editor and the tagger, and is also the **causal PPL scorer** in `corruption.py` (re-loaded with the causal mask intact, no bidir patch). It is not used as the corruption MLM (§6.2) — corruption operates at the text level and uses a separate, swappable MLM.
+
+A standalone evaluation script `eval_llm2vec.py` (§13.3) measures (i) MNTP held-out loss, (ii) causal-PPL drift vs base LLM, (iii) bidir-vs-causal hidden-state divergence, (iv) `[MASK]` / `[INS]` / `[DEL]` embedding sanity, and (v) MTEB STS-style sentence embedding quality with pooling-strategy ablation.
 
 ### 6.2 Corruption Data Generation — `corruption.py`
 
@@ -647,9 +654,13 @@ A sharded JSON-lines (or binary) file with one record per training sample:
 | `train_length_head.py` | length predictor training on INS data (ablation) |
 | `ranker.py` | SAE align + fluency + content + length penalty |
 | `evaluate_intervention.py` | end-to-end inference + metrics |
-| `model.py` | shared model classes |
+| `eval_llm2vec.py` | standalone evaluation of an MNTP'd checkpoint along 5 axes (§13.3); writes `eval_report.md` + `eval_metrics.json` |
+| `model.py` | shared model classes (incl. `_patch_attention_bidirectional`, `BidirectionalLLM`, `MLMProvider`, `SAEFeatureExtractor`) |
 | `intervene.py` | intervention spec helpers |
 | `data.py` | data loading utilities |
+| `scripts/smoke_pipeline.sh` | end-to-end smoke driver; with `MEASURE_COMPOUND_N=1` also runs per-N corruption sweep + `scripts/analyze_compound_n.py` to produce a per-N report (§13.4) |
+| `scripts/eval_llm2vec.sh` | thin shell wrapper around `eval_llm2vec.py` (§13.3) |
+| `scripts/analyze_compound_n.py` | reads per-N calibration JSONLs and writes `report.tsv` / `report.md` over PPL/SAE-shift percentiles and gate-yield sweeps |
 
 ## 10. Hyperparameters
 
@@ -659,8 +670,14 @@ sae_layer: 12
 sae_top_l: 128
 k_train: 64                       # top-K for SAE pool max in conditioning
 
-# stage 1
-mntp_mask_prob: 0.15
+# stage 1 — LLM2Vec MNTP (canonical recipe)
+mntp:
+  mlm_probability:    0.15          # 15% / 80-10-10 (DataCollatorForLanguageModeling)
+  objective:          predict_i_from_h_im1   # +1 shift via GemmaForCausalLM.forward(labels=...)
+  bidir_patch:
+    attn_implementation: eager
+    is_causal:        false         # set on every self-attention module
+    update_causal_mask: padding_only  # patched _update_causal_mask (no triu)
 
 # sentence segmentation
 sentence_splitter: pysbd          # or nltk_punkt
@@ -774,7 +791,7 @@ ranker_weights:
 ## 12. Implementation Order
 
 1. `lewis_ops.py`: op application (REPL → `[MASK]`, DEL → in-place, INS → `[INS]`), gap detection
-2. Vocabulary expansion: add `[INS]` and `[DEL]` (`[MASK]` from MNTP); resize tokenizer + LLM2Vec checkpoint
+2. Vocabulary expansion: add `[MASK]` (if missing), `[INS]`, `[DEL]` at the start of `train_llm2vec.py`; resize tokenizer + LLM2Vec checkpoint embedding table
 3. Sentence segmentation utility
 4. `corruption.py`:
    a. Single-op building blocks: REPL substitution, INS priority-biased deletion (POS tagger integration), DEL MLM-plausible insertion
@@ -821,6 +838,29 @@ ranker_weights:
 | `uniform-ins-position` | Disable priority-biased INS position selection; use uniform random word positions. Tests whether the priority bias is needed to keep the compound distribution close to natural sentence variation. |
 | `fixed-thresholds` | Replace N-dependent gates with constant `ppl_max_ratio` and `sae_shift_threshold` (no `sqrt(N)` scaling). Tests whether N-dependent calibration is required, and whether the resulting distribution shift in compound N actually hurts the editor. |
 | `length-predictor` | Replace enumeration with length-head + `±1`. Quantifies the efficiency / quality trade-off. |
+
+### 13.3 LLM2Vec checkpoint evaluation
+
+Run `python eval_llm2vec.py --llm2vec-dir <ckpt> --output-dir <out>` (or `scripts/eval_llm2vec.sh`) to evaluate an MNTP'd checkpoint along five orthogonal axes. The first four are pipeline-specific sanity checks; the fifth mirrors the LLM2Vec paper.
+
+| Axis | What it measures | Failure mode it catches |
+| --- | --- | --- |
+| **(1) MNTP held-out loss / ppl** | Canonical 15% / 80-10-10 token-level masking + `GemmaForCausalLM.forward(labels=...)` (with its `+1` shift) on held-out Dolma. Loss averaged over non-ignored labels. | MNTP training never converged. Random init ≈ `log(V) ≈ 12`; healthy MNTP lands in the 2-6 range on Dolma. |
+| **(2) Causal PPL drift** | Standard next-token PPL of LLM2Vec ckpt vs base LLM, both in **causal** mode, on the same held-out sentences. | The PPL scorer used by `corruption.py` has drifted far from base Gemma's, which would silently shift per-N ratio calibrations. |
+| **(3) Bidir-vs-causal divergence** | Same weights forwarded twice — with and without the bidirectional patch. Per-position cosine of final hidden states. Last position should be ≈ 1.0 (no right context to gain); first position should drop materially. | Bidirectional patch silently failed (e.g., SDPA path overrode it). Flagged automatically when mean cosine > 0.999. |
+| **(4) Special-token embedding sanity** | Row norm and nearest-neighbour cosine for `[MASK]`, `[INS]`, `[DEL]`. | Pipeline-critical special tokens are under/over-trained. Flagged when norm ratio falls outside `[0.5, 2.0] × median`. |
+| **(5) MTEB sentence-embedding eval** | Wraps the bidir model with a chosen `--pooling {mean, last, weighted_mean}` strategy and runs `--mteb-tasks` (default `STSBenchmark`, Spearman correlation). Pooling is the LLM2Vec paper's key ablation axis (§4.3). | General-purpose embedding quality is degraded relative to the paper's expectations. Requires `pip install mteb`; auto-skipped when missing or `--skip-mteb`. |
+
+Outputs: `eval_metrics.json` (machine-readable) + `eval_report.md` (human-readable). MTEB per-task JSONs land under `$OUTPUT_DIR/mteb/`.
+
+### 13.4 Per-N corruption measurement
+
+The compound-N gate's `sqrt(N)`-scaled thresholds (§6.2.6) are calibrated against the empirical Dolma + MLM distribution. To resample this distribution after a corruption / MLM / encoder change, set `MEASURE_COMPOUND_N=1` on `scripts/smoke_pipeline.sh` (stages 7+8 of the smoke). For each N in `MEASURE_N_VALUES`, the smoke runs `corruption.py --force-n $N --calibration-mode` (overriding bucket sampling so every attempt records `(N, ppl_ratio, sae_shift)` regardless of the gate) and then calls `scripts/analyze_compound_n.py` to compute percentiles and simulate gate yield under both the default constants and a grid sweep over `ppl_per_op_factor` / `sae_per_op_min` / `sae_per_op_max`.
+
+Artifacts (`$RUN_DIR/measure_n/`):
+- `n{N}/calibration.jsonl` per-attempt records
+- `report.tsv` per-N percentile + per-grid yield summary
+- `report.md` human-readable version
 
 ## 14. References
 
