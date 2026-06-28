@@ -88,6 +88,7 @@ def load_calibration(path: Path) -> List[Dict]:
 # Per-N summary
 # --------------------------------------------------------------------------- #
 def summarise_one_N(records: List[Dict]) -> Dict:
+    slor_drops = [r.get("slor_drop") for r in records]
     ppl_ratios = [r.get("ppl_ratio") for r in records]
     sae_shifts = [r.get("sae_shift") for r in records]
     op_counter: Counter = Counter()
@@ -95,10 +96,18 @@ def summarise_one_N(records: List[Dict]) -> Dict:
         for t in r.get("op_types", []):
             op_counter[t] += 1
     n_total = len(records)
+    slor_pcts = percentiles(slor_drops, [0.05, 0.25, 0.50, 0.75, 0.95])
     ppl_pcts = percentiles(ppl_ratios, [0.25, 0.50, 0.75, 0.95])
     sae_pcts = percentiles(sae_shifts, [0.05, 0.25, 0.50, 0.75, 0.95])
     return {
         "n_records": n_total,
+        "slor_mean": mean(slor_drops),
+        "slor_p05": slor_pcts[0],
+        "slor_p25": slor_pcts[1],
+        "slor_p50": slor_pcts[2],
+        "slor_p75": slor_pcts[3],
+        "slor_p95": slor_pcts[4],
+        # Legacy PPL ratio kept for cross-checking against older runs.
         "ppl_mean": mean(ppl_ratios),
         "ppl_p25": ppl_pcts[0],
         "ppl_p50": ppl_pcts[1],
@@ -119,33 +128,38 @@ def summarise_one_N(records: List[Dict]) -> Dict:
 # --------------------------------------------------------------------------- #
 def simulate_gate_yield(
     records: List[Dict], N: int,
-    ppl_per_op_factor: float,
+    slor_drop_per_op: float,
     sae_per_op_min: float,
     sae_per_op_max: float,
 ) -> Dict:
     """Compute the fraction of `records` that would pass the gate at the
     given scale constants.
 
+    Fluency: linear N scaling on SLOR drop.
+        slor_drop_max(N) = slor_drop_per_op * N
+        reject if (SLOR(X) - SLOR(X')) > slor_drop_max(N)
+    SAE-shift: sqrt(N) scaling (unchanged).
+
     For N=0 (identity) the gate is no-op and yield is 100% by definition.
     """
     if N <= 0 or not records:
         return {"n": len(records), "pass_frac": 1.0,
-                "rej_ppl_inf": 0, "rej_ppl_high": 0,
+                "rej_slor_inf": 0, "rej_slor_drop": 0,
                 "rej_sae_low": 0, "rej_sae_high": 0}
+    slor_drop_max = slor_drop_per_op * N
     s = math.sqrt(N)
-    ppl_max = ppl_per_op_factor ** s
     sae_min = sae_per_op_min * s
     sae_max = sae_per_op_max * s
     passed = 0
-    r_ppl_inf = r_ppl_high = r_sae_low = r_sae_high = 0
+    r_slor_inf = r_slor_drop = r_sae_low = r_sae_high = 0
     for r in records:
-        ppl_ratio = r.get("ppl_ratio")
+        slor_drop = r.get("slor_drop")
         shift = r.get("sae_shift")
-        if ppl_ratio is None or not math.isfinite(ppl_ratio):
-            r_ppl_inf += 1
+        if slor_drop is None or not math.isfinite(slor_drop):
+            r_slor_inf += 1
             continue
-        if ppl_ratio > ppl_max:
-            r_ppl_high += 1
+        if slor_drop > slor_drop_max:
+            r_slor_drop += 1
             continue
         if shift is None or not math.isfinite(shift):
             r_sae_low += 1
@@ -161,8 +175,8 @@ def simulate_gate_yield(
     return {
         "n": total,
         "pass_frac": passed / total,
-        "rej_ppl_inf": r_ppl_inf,
-        "rej_ppl_high": r_ppl_high,
+        "rej_slor_inf": r_slor_inf,
+        "rej_slor_drop": r_slor_drop,
         "rej_sae_low": r_sae_low,
         "rej_sae_high": r_sae_high,
     }
@@ -173,20 +187,28 @@ def simulate_gate_yield(
 # --------------------------------------------------------------------------- #
 TSV_COLUMNS = [
     "N", "records",
+    "slor_mean", "slor_p05", "slor_p25", "slor_p50", "slor_p75", "slor_p95",
     "ppl_mean", "ppl_p25", "ppl_p50", "ppl_p75", "ppl_p95",
     "sae_mean", "sae_p05", "sae_p25", "sae_p50", "sae_p75", "sae_p95",
     "op_REPL", "op_INS", "op_DEL",
-    "yield_default", "ppl_max_default", "sae_min_default", "sae_max_default",
+    "yield_default", "slor_drop_max_default",
+    "sae_min_default", "sae_max_default",
 ]
 
 
 def format_tsv_row(N: int, summary: Dict, gate: Dict,
-                   ppl_per_op_factor: float,
+                   slor_drop_per_op: float,
                    sae_per_op_min: float, sae_per_op_max: float) -> List[str]:
     s = math.sqrt(N) if N > 0 else 0.0
     return [
         str(N),
         str(summary["n_records"]),
+        f"{summary['slor_mean']:.3f}",
+        f"{summary['slor_p05']:.3f}",
+        f"{summary['slor_p25']:.3f}",
+        f"{summary['slor_p50']:.3f}",
+        f"{summary['slor_p75']:.3f}",
+        f"{summary['slor_p95']:.3f}",
         f"{summary['ppl_mean']:.3f}",
         f"{summary['ppl_p25']:.3f}",
         f"{summary['ppl_p50']:.3f}",
@@ -202,7 +224,7 @@ def format_tsv_row(N: int, summary: Dict, gate: Dict,
         str(summary["op_counts"].get("INS", 0)),
         str(summary["op_counts"].get("DEL", 0)),
         f"{gate['pass_frac']:.3f}",
-        f"{ppl_per_op_factor ** s:.3f}" if N > 0 else "inf",
+        f"{slor_drop_per_op * N:.3f}" if N > 0 else "inf",
         f"{sae_per_op_min * s:.3f}",
         f"{sae_per_op_max * s:.3f}",
     ]
@@ -211,44 +233,46 @@ def format_tsv_row(N: int, summary: Dict, gate: Dict,
 def render_md(
     rows: List[Dict],
     sweeps: List[Dict],
-    ppl_per_op_factor: float,
+    slor_drop_per_op: float,
     sae_per_op_min: float,
     sae_per_op_max: float,
 ) -> str:
     out: List[str] = []
     out.append("# Compound-N corruption measurement\n")
     out.append("Default gates (calibrated knobs at the corruption.py defaults):")
-    out.append(f"  * `ppl_per_op_factor` = {ppl_per_op_factor}  →  ppl_max(N) = factor^√N")
-    out.append(f"  * `sae_per_op_min`    = {sae_per_op_min}  →  sae_min(N) = min · √N")
-    out.append(f"  * `sae_per_op_max`    = {sae_per_op_max}  →  sae_max(N) = max · √N\n")
+    out.append(f"  * `slor_drop_per_op` = {slor_drop_per_op}  →  slor_drop_max(N) = c · N  (linear)")
+    out.append(f"  * `sae_per_op_min`   = {sae_per_op_min}  →  sae_min(N) = min · √N")
+    out.append(f"  * `sae_per_op_max`   = {sae_per_op_max}  →  sae_max(N) = max · √N\n")
 
-    # Main table — distributions per N
-    out.append("## Per-N distributions\n")
-    out.append("| N | records | PPL p25 | PPL p50 | PPL p75 | PPL p95 | shift p25 | shift p50 | shift p75 | shift p95 |")
-    out.append("|---|---------|---------|---------|---------|---------|-----------|-----------|-----------|-----------|")
+    # Main table — distributions per N. SLOR is the primary fluency signal;
+    # PPL ratio is kept for sanity-check against legacy runs.
+    out.append("## Per-N distributions (SLOR drop primary, PPL ratio for cross-check)\n")
+    out.append("| N | records | SLOR p25 | SLOR p50 | SLOR p75 | SLOR p95 | PPL p50 | PPL p95 | shift p50 | shift p95 |")
+    out.append("|---|---------|----------|----------|----------|----------|---------|---------|-----------|-----------|")
     for row in rows:
         s = row["summary"]
         out.append(
             f"| {row['N']} | {s['n_records']} | "
-            f"{s['ppl_p25']:.2f} | {s['ppl_p50']:.2f} | {s['ppl_p75']:.2f} | {s['ppl_p95']:.2f} | "
-            f"{s['sae_p25']:.2f} | {s['sae_p50']:.2f} | {s['sae_p75']:.2f} | {s['sae_p95']:.2f} |"
+            f"{s['slor_p25']:.3f} | {s['slor_p50']:.3f} | {s['slor_p75']:.3f} | {s['slor_p95']:.3f} | "
+            f"{s['ppl_p50']:.2f} | {s['ppl_p95']:.2f} | "
+            f"{s['sae_p50']:.2f} | {s['sae_p95']:.2f} |"
         )
 
     # Default gate yields
     out.append("\n## Yield under the default gate\n")
-    out.append("| N | ppl_max(N) | sae_min(N) | sae_max(N) | yield | rej PPL inf | rej PPL high | rej SAE low | rej SAE high |")
-    out.append("|---|-----------|------------|------------|-------|-------------|--------------|-------------|--------------|")
+    out.append("| N | slor_drop_max(N) | sae_min(N) | sae_max(N) | yield | rej SLOR inf | rej SLOR drop | rej SAE low | rej SAE high |")
+    out.append("|---|------------------|------------|------------|-------|--------------|---------------|-------------|--------------|")
     for row in rows:
         N = row["N"]
         s = math.sqrt(N) if N > 0 else 0.0
-        ppl_max = ppl_per_op_factor ** s if N > 0 else float("inf")
+        slor_drop_max = slor_drop_per_op * N if N > 0 else float("inf")
         sae_min = sae_per_op_min * s
         sae_max = sae_per_op_max * s
         g = row["gate_default"]
-        ppl_max_str = "∞" if not math.isfinite(ppl_max) else f"{ppl_max:.2f}"
+        slor_max_str = "∞" if not math.isfinite(slor_drop_max) else f"{slor_drop_max:.3f}"
         out.append(
-            f"| {N} | {ppl_max_str} | {sae_min:.2f} | {sae_max:.2f} | "
-            f"{g['pass_frac']*100:.1f}% | {g['rej_ppl_inf']} | {g['rej_ppl_high']} | "
+            f"| {N} | {slor_max_str} | {sae_min:.2f} | {sae_max:.2f} | "
+            f"{g['pass_frac']*100:.1f}% | {g['rej_slor_inf']} | {g['rej_slor_drop']} | "
             f"{g['rej_sae_low']} | {g['rej_sae_high']} |"
         )
 
@@ -300,7 +324,8 @@ def main():
     ap.add_argument("--n-values", nargs="*", type=int, default=None,
                     help="N values to look for. Default = autodetect from "
                          "directories named nK under run_dir.")
-    ap.add_argument("--ppl-per-op-factor", type=float, default=1.8)
+    ap.add_argument("--slor-drop-per-op", type=float, default=0.10,
+                    help="Per-op SLOR drop budget (linear N scaling).")
     ap.add_argument("--sae-per-op-min", type=float, default=0.30)
     ap.add_argument("--sae-per-op-max", type=float, default=2.50)
     ap.add_argument("--report-tsv", help="Path to write TSV summary "
@@ -339,31 +364,32 @@ def main():
         summary = summarise_one_N(records)
         gate = simulate_gate_yield(
             records, N,
-            args.ppl_per_op_factor, args.sae_per_op_min, args.sae_per_op_max,
+            args.slor_drop_per_op, args.sae_per_op_min, args.sae_per_op_max,
         )
         rows.append({"N": N, "records": records, "summary": summary,
                      "gate_default": gate})
 
-    # Gate sweep — vary each scale knob independently.
+    # Gate sweep — vary each scale knob independently. Both `slor_drop_per_op`
+    # and `sae_per_op_max` are the high-leverage knobs.
     sweeps: List[Dict] = []
-    ppl_factor_grid = [1.4, 1.6, 1.8, 2.0, 2.4]
+    slor_grid = [0.05, 0.10, 0.15, 0.20, 0.30]
     sae_min_grid = [0.15, 0.30, 0.50]
-    sae_max_grid = [1.50, 2.50, 4.00]
-    for fac in ppl_factor_grid:
+    sae_max_grid = [1.50, 2.50, 4.00, 6.00]
+    for sl in slor_grid:
         per_n_pass = {}
         for row in rows:
             g = simulate_gate_yield(
                 row["records"], row["N"],
-                fac, args.sae_per_op_min, args.sae_per_op_max,
+                sl, args.sae_per_op_min, args.sae_per_op_max,
             )
             per_n_pass[row["N"]] = g["pass_frac"]
-        sweeps.append({"label": f"ppl_factor={fac}", "per_n_pass": per_n_pass})
+        sweeps.append({"label": f"slor_drop_per_op={sl}", "per_n_pass": per_n_pass})
     for smin in sae_min_grid:
         per_n_pass = {}
         for row in rows:
             g = simulate_gate_yield(
                 row["records"], row["N"],
-                args.ppl_per_op_factor, smin, args.sae_per_op_max,
+                args.slor_drop_per_op, smin, args.sae_per_op_max,
             )
             per_n_pass[row["N"]] = g["pass_frac"]
         sweeps.append({"label": f"sae_min={smin}", "per_n_pass": per_n_pass})
@@ -372,7 +398,7 @@ def main():
         for row in rows:
             g = simulate_gate_yield(
                 row["records"], row["N"],
-                args.ppl_per_op_factor, args.sae_per_op_min, smax,
+                args.slor_drop_per_op, args.sae_per_op_min, smax,
             )
             per_n_pass[row["N"]] = g["pass_frac"]
         sweeps.append({"label": f"sae_max={smax}", "per_n_pass": per_n_pass})
@@ -385,7 +411,7 @@ def main():
         for row in rows:
             cells = format_tsv_row(
                 row["N"], row["summary"], row["gate_default"],
-                args.ppl_per_op_factor, args.sae_per_op_min, args.sae_per_op_max,
+                args.slor_drop_per_op, args.sae_per_op_min, args.sae_per_op_max,
             )
             f.write("\t".join(cells) + "\n")
     print(f"[analyze-N] wrote {tsv_path}")
@@ -395,21 +421,21 @@ def main():
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(render_md(
         rows, sweeps,
-        args.ppl_per_op_factor, args.sae_per_op_min, args.sae_per_op_max,
+        args.slor_drop_per_op, args.sae_per_op_min, args.sae_per_op_max,
     ))
     print(f"[analyze-N] wrote {md_path}")
 
     # Console summary
     print()
     print("Per-N summary:")
-    print(f"  {'N':>3} | {'records':>7} | {'PPL p50':>8} | {'PPL p95':>8} | "
-          f"{'shift p50':>9} | {'shift p95':>9} | {'yield':>7}")
+    print(f"  {'N':>3} | {'records':>7} | {'SLOR p50':>9} | {'SLOR p95':>9} | "
+          f"{'PPL p50':>8} | {'shift p50':>9} | {'yield':>7}")
     for row in rows:
         s = row["summary"]
         g = row["gate_default"]
         print(f"  {row['N']:>3} | {s['n_records']:>7} | "
-              f"{s['ppl_p50']:>8.3f} | {s['ppl_p95']:>8.3f} | "
-              f"{s['sae_p50']:>9.3f} | {s['sae_p95']:>9.3f} | "
+              f"{s['slor_p50']:>9.3f} | {s['slor_p95']:>9.3f} | "
+              f"{s['ppl_p50']:>8.3f} | {s['sae_p50']:>9.3f} | "
               f"{g['pass_frac']*100:>6.1f}%")
 
 

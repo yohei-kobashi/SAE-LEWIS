@@ -428,25 +428,32 @@ Per-position op composition is handled by `apply_ops_for_editor` and the tagger 
 
 #### 6.2.6 N-dependent gates and self-consistent calibration
 
-The compound's PPL ratio and SAE shift both scale with N, so a fixed threshold rejects almost all `N ≥ 3` compounds at the PPL gate and accepts almost all `N ≥ 3` compounds at the SAE-shift gate — losing the filter function in both cases. The gates are therefore N-dependent. Per-op contributions to log-PPL and to ||SAE shift|| are approximately i.i.d., giving `sqrt(N)` scaling under the independence assumption:
+A compound corruption's fluency degradation and SAE shift both scale with N, so a fixed threshold either rejects almost all `N ≥ 3` compounds (too tight) or accepts almost all (too loose). The gates are therefore N-dependent. The fluency gate also follows the SLOR formulation (Pauls&Klein 2012 / Lau et al. 2017 / Kann et al. NAACL 2018) — per-token, unigram-normalised log-likelihood — instead of raw PPL ratio, which has well-documented length and rare-word artefacts (Wang+ 2022, Kann+ 2018).
 
 ```
-ppl_max(N) = ppl_per_op_factor ** sqrt(N)
-sae_min(N) = sae_per_op_min     * sqrt(N)
-sae_max(N) = sae_per_op_max     * sqrt(N)
+slor_drop_max(N) = slor_drop_per_op * N        (linear)
+sae_min(N)       = sae_per_op_min   * sqrt(N)
+sae_max(N)       = sae_per_op_max   * sqrt(N)  (minimality upper bound)
+
+SLOR(s) = (1/|s|) * [log p_M(s) − log p_unigram(s)]
+slor_drop = SLOR(X) − SLOR(X')                  (positive = X' is less fluent)
 ```
 
-The `sae_max` upper bound enforces **minimality**: compounds that change too much SAE structure are no longer minimal pairs and are excluded from training data.
+**Why SLOR.** Raw `PPL(X')/PPL(X)` over-penalises corruption that inserts a rare-but-fluent word (because the rare word's marginal probability is low) and conflates fluency change with length change (because PPL is a function of length). SLOR subtracts a unigram baseline and divides by `|s|`, which structurally removes both artefacts. Kann+ 2018 report a Pearson correlation of `0.454` for SLOR vs `0.325` for raw PPL on referenceless fluency evaluation. The same paper's "of Tuvalu" vs "of France" example mirrors what happens in our pipeline when the corruption MLM proposes rare-but-natural words: under raw PPL the candidate is wrongly rejected; under SLOR it survives.
 
-**Calibration.** The three scale constants are not fixed by theory; they are fit by running the compound generator on Dolma in a **calibration mode** that records every attempt's `(N, ppl_ratio, sae_shift)` without applying the gate. For each `N ∈ {1..N_MAX}`, percentile statistics of the empirical distribution drive the thresholds:
+**Why linear N for SLOR drop.** Per-token Δlog-likelihood per op is approximately constant under the empirical fit (we observed `factor^N` matching p50 of raw PPL ratio for `N ∈ 1..5` with `factor = 1.25 ≈ exp(0.22 nats/token/op)`), which says the expected SLOR drop is `(constant) × N` — linear, not `sqrt(N)`. SAE-shift retains `sqrt(N)` (a separate decision, calibrated independently against the same data).
+
+**Calibration.** The three scale constants are not fixed by theory; they are fit by running the compound generator on Dolma in a **calibration mode** that records every attempt's `(N, slor_drop, sae_shift, plus legacy ppl_ratio)` without applying the gate. For each `N ∈ {1..N_MAX}`, percentile statistics of the empirical distribution drive the thresholds:
 
 | Constant | Setting |
 | --- | --- |
-| `ppl_per_op_factor` | such that `ppl_max(N)` ≥ 75th percentile of `ppl_ratio` at each N |
+| `slor_drop_per_op` | such that `slor_drop_max(N)` ≥ 75th percentile of `slor_drop` at each N |
 | `sae_per_op_min`   | such that `sae_min(N)` ≤ 25th percentile of `sae_shift` at each N |
 | `sae_per_op_max`   | such that `sae_max(N)` ≥ 95th percentile of `sae_shift` at each N |
 
 The calibration is **self-consistent on the same Dolma + MLM compound distribution that the editor will train on**: the calibration source = the training source. We do not calibrate against external paraphrase corpora — paraphrase pairs have a fundamentally different position distribution (humans target meaning-relevant positions; this pipeline uses priority-biased random positions), so the metrics are not directly comparable and would mis-fit the threshold.
+
+**Unigram baseline.** Built once at startup from `--unigram-sample-size` Dolma sentences using the downstream Gemma tokenizer (skipping `<bos>` / `<eos>` / `[PAD]` / `[MASK]` / `[INS]` / `[DEL]`), with add-`unigram_smoothing` Laplace over the observed vocabulary plus one UNK bucket. Cached to `<out-dir>/unigram.json` so re-runs reuse the same baseline.
 
 The expected per-attempt yield after calibration is ~50% at the chosen percentiles, keeping `K_BUDGET = 6` adequate for almost all source sentences.
 
@@ -702,14 +709,19 @@ compound:
   k_budget:              6        # first-accept rejection attempts per source sentence
   apply_order:           "right_to_left"
 
-# N-dependent gates (§6.2.6); sqrt(N) scaling, calibrated by percentile
+# N-dependent gates (§6.2.6); SLOR drop for fluency (linear N), SAE shift
+# for minimality (sqrt N). All knobs calibrated by percentile.
 gates:
-  ppl_per_op_factor:     1.8      # ppl_max(N) = 1.8 ** sqrt(N)
+  slor_drop_per_op:      0.10     # slor_drop_max(N) = 0.10 * N (per-token, nats)
   sae_per_op_min:        0.30     # sae_min(N) = 0.30 * sqrt(N)
   sae_per_op_max:        2.50     # sae_max(N) = 2.50 * sqrt(N) (minimality upper bound)
+  unigram:
+    sample_size:         5000     # # Dolma sentences scanned to build the SLOR baseline
+    smoothing:           1.0      # add-k Laplace
+    cache:               "<out-dir>/unigram.json"
   calibration:
     source:              "dolma+mlm self-consistent"   # not external paraphrase corpora
-    ppl_percentile:      75       # ppl_max(N) ≥ this percentile of ppl_ratio at each N
+    slor_percentile:     75       # slor_drop_max(N) ≥ this percentile of slor_drop at each N
     sae_min_percentile:  25       # sae_min(N) ≤ this percentile of sae_shift at each N
     sae_max_percentile:  95       # sae_max(N) ≥ this percentile of sae_shift at each N
     attempts_per_N:      1000     # for the calibration run
@@ -868,3 +880,7 @@ Artifacts (`$RUN_DIR/measure_n/`):
 - Jing, Yao, Guo, Ran, Wang, Hou, Li. *LinguaLens: Towards Interpreting Linguistic Mechanisms of Large Language Models via Sparse Auto-Encoder.* EMNLP 2025 Main, pp. 28232–28251. https://aclanthology.org/2025.emnlp-main.1433/
 - Lieberum et al. *Gemma Scope: Open Sparse Autoencoders Everywhere All At Once on Gemma 2.* 2024.
 - BehnamGhader et al. *LLM2Vec: Large Language Models Are Secretly Powerful Text Encoders.* 2024.
+- Pauls & Klein. *Large-Scale Syntactic Language Modeling with Treelets.* ACL 2012. — original SLOR formulation.
+- Lau, Clark, Lappin. *Grammaticality, Acceptability, and Probability: A Probabilistic View of Linguistic Knowledge.* Cognitive Science 2017. https://onlinelibrary.wiley.com/doi/10.1111/cogs.12414 — SLOR vs raw LM probability for acceptability.
+- Kann, Rothe, Filippova. *Sentence-Level Fluency Evaluation: References Help, But Can Be Spared!* CoNLL 2018. https://aclanthology.org/K18-1031/ — SLOR vs raw PPL for referenceless fluency; basis for our fluency gate.
+- Wang et al. *Perplexity from PLM Is Unreliable for Evaluating Text Quality.* 2022. https://arxiv.org/abs/2210.05892 — length bias of raw PPL.

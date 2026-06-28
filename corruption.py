@@ -16,16 +16,25 @@ non-overlapping word ranges on the original X. First-accept rejection
 within K_BUDGET attempts per source sentence preserves the natural
 post-gate distribution (no PPL-ranking bias).
 
-**N-dependent gates (§6.2.6).** PPL ratio and SAE-shift thresholds scale
-with sqrt(N):
+**N-dependent gates (§6.2.6).** Fluency is gated by SLOR drop (per-token,
+unigram-normalised log-likelihood; Pauls&Klein 2012 / Lau+ 2017 /
+Kann+ 2018), with a LINEAR-in-N budget — each independent edit
+contributes a constant Δ on average, matching the empirical
+`factor^N` fit to the raw PPL ratio at p50. SAE shift gate stays
+on a sqrt(N) curve (independent decision):
 
-  ppl_max(N) = ppl_per_op_factor ** sqrt(N)
-  sae_min(N) = sae_per_op_min     * sqrt(N)
-  sae_max(N) = sae_per_op_max     * sqrt(N)   (minimality upper bound)
+  slor_drop_max(N) = slor_drop_per_op * N
+  sae_min(N)       = sae_per_op_min     * sqrt(N)
+  sae_max(N)       = sae_per_op_max     * sqrt(N)   (minimality upper bound)
+
+SLOR(s) = (1/|s|) * [log p_M(s) - log p_unigram(s)]. The unigram baseline
+is built once from a slice of Dolma at startup (or loaded from
+`--unigram-cache`) and reused for every (X, X') pair.
 
 The scale constants are calibrated against the empirical Dolma + MLM
 compound distribution via `--calibration-mode`, which records every
-attempt's (N, ppl_ratio, sae_shift) without applying the gate.
+attempt's (N, slor_drop, sae_shift, plus legacy ppl_ratio) without
+applying the gate.
 
 **Position selection (§6.2.3).** INS deletion positions are biased toward
 syntactic categories where removal is least disruptive: spaCy Universal
@@ -158,13 +167,37 @@ def parse_args():
     p.add_argument("--del-top1-prob", type=float, default=0.5)
 
     # N-dependent gates (§6.2.6)
-    p.add_argument("--ppl-per-op-factor", type=float, default=1.8,
-                   help="ppl_max(N) = ppl_per_op_factor ** sqrt(N).")
+    # Fluency gate: SLOR drop per op (linear N scaling). SLOR(s) =
+    # (log p_M(s) - log p_unigram(s)) / |s|. ΔSLOR = SLOR(X) - SLOR(X')
+    # is the per-token fluency degradation; budget is linear in N
+    # (each op contributes ~constant Δ on average, matching the
+    # empirical factor^N fit to p50 of raw PPL ratio).
+    p.add_argument("--slor-drop-per-op", type=float, default=0.10,
+                   help="Per-op SLOR drop budget. Gate: reject if "
+                        "(SLOR(X) - SLOR(X')) > slor_drop_per_op * N. "
+                        "0.10 nats/token/op is an initial guess; "
+                        "re-fit from calibration data.")
+    p.add_argument("--unigram-cache",
+                   help="Path to a JSON {token_id_str: log_prob} unigram "
+                        "table for SLOR. Defaults to <out-dir>/unigram.json. "
+                        "Built once from Dolma if missing.")
+    p.add_argument("--unigram-sample-size", type=int, default=5000,
+                   help="# of Dolma sentences to scan when building the "
+                        "unigram table (only used when no cache exists).")
+    p.add_argument("--unigram-smoothing", type=float, default=1.0,
+                   help="Add-k Laplace smoothing for unigram log-probs.")
     p.add_argument("--sae-per-op-min", type=float, default=0.30,
                    help="sae_min(N) = sae_per_op_min * sqrt(N).")
     p.add_argument("--sae-per-op-max", type=float, default=2.50,
                    help="sae_max(N) = sae_per_op_max * sqrt(N) (minimality "
                         "upper bound).")
+    # Deprecated — kept for backwards compatibility with old run scripts;
+    # ignored at runtime. The PPL ratio is still recorded in calibration
+    # JSONL alongside SLOR so historical analysis still works.
+    p.add_argument("--ppl-per-op-factor", type=float, default=1.8,
+                   help="DEPRECATED. PPL ratio is no longer the gate; "
+                        "SLOR drop is used instead. Kept so old scripts "
+                        "do not break.")
     p.add_argument("--force-n", type=int, default=None,
                    help="Override bucket sampling and force every attempt to "
                         "use this N. Useful for measuring per-N yield / "
@@ -172,12 +205,12 @@ def parse_args():
                         "When set, --p-identity / --p-single-op / "
                         "--p-compound-* and --n-distribution-p are ignored.")
     p.add_argument("--calibration-mode", action="store_true",
-                   help="Skip the PPL/SAE-shift gate; record every attempt's "
-                        "(N, ppl_ratio, sae_shift) to a JSONL file for "
-                        "percentile fitting.")
+                   help="Skip the SLOR / SAE-shift gate; record every attempt's "
+                        "(N, slor_drop, sae_shift, ppl_ratio) to a JSONL file "
+                        "for percentile fitting.")
     p.add_argument("--calibration-out",
-                   help="Path to JSONL of (N, ppl_ratio, sae_shift) records "
-                        "in --calibration-mode. Defaults to "
+                   help="Path to JSONL of calibration records (slor_drop, "
+                        "sae_shift, plus legacy ppl_ratio). Defaults to "
                         "<out-dir>/calibration.jsonl.")
 
     p.add_argument("--k-train", type=int, default=64,
@@ -204,6 +237,11 @@ class Stage:
     pad_id: int
     device: str
     k_train: int
+    # SLOR unigram baseline: {token_id (int): log p_unigram (float)}.
+    # `unigram_log_unk` is the log-prob assigned to any token id not in
+    # the table (smoothed). Built once at startup; see build_unigram(...).
+    unigram_log: Dict[int, float]
+    unigram_log_unk: float
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +418,139 @@ def causal_perplexity_text(stage: Stage, text: str) -> float:
         return float("nan")
     out = stage.causal_llm(input_ids=enc.input_ids, labels=enc.input_ids, use_cache=False)
     return float(math.exp(float(out.loss.item())))
+
+
+# ---------------------------------------------------------------------------
+# SLOR (Syntactic Log-Odds Ratio) — referenceless fluency score
+#
+#   SLOR(s) = (1/|s|) * [log p_M(s) - log p_unigram(s)]
+#
+# Conventional definition from Pauls & Klein (2012) / Lau et al. (2017) /
+# Kann et al. (NAACL 2018). Per-token normalisation removes the
+# raw-PPL length bias (Wang et al. 2022); the unigram baseline absorbs
+# rare-word penalties so that semantically equivalent but lexically
+# distinct paraphrases score similarly (Kann+ 2018 reports SLOR Pearson
+# 0.454 vs raw PPL 0.325 on referenceless fluency evaluation).
+#
+# Implementation alignment with `+1` shift:
+#   * `causal_llm(input_ids, labels=input_ids)` averages CE over T-1
+#     positions, predicting tokens at index 1..T-1 from hidden states
+#     at index 0..T-2. So sum log p_M(s) = -loss * (T-1) and the
+#     "tokens" SLOR averages over are the same content positions
+#     (index 1..T-1), excluding the BOS.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def causal_log_prob_and_token_ids(stage: Stage, text: str):
+    """Return (sum_log_p_M, label_token_ids).
+
+    sum_log_p_M  = -loss * n_pred  where n_pred = T - 1.
+    label_token_ids = the (T-1) token ids being predicted (positions 1..T-1).
+
+    Returns (None, None) when the sentence is too short for the +1 shift.
+    """
+    enc = stage.gemma_tok(
+        text, return_tensors="pt", truncation=True, max_length=256,
+    ).to(stage.device)
+    T = int(enc.input_ids.shape[1])
+    if T < 2:
+        return None, None
+    out = stage.causal_llm(
+        input_ids=enc.input_ids, labels=enc.input_ids, use_cache=False,
+    )
+    n_pred = T - 1
+    sum_log_p_M = -float(out.loss.item()) * n_pred
+    label_ids = enc.input_ids[0, 1:].tolist()  # positions 1..T-1
+    return sum_log_p_M, label_ids
+
+
+def unigram_sum_log_prob(token_ids, unigram_log: Dict[int, float],
+                         unigram_log_unk: float) -> float:
+    """Sum_t log p_unigram(t) over a list of token ids."""
+    s = 0.0
+    for tid in token_ids:
+        s += unigram_log.get(int(tid), unigram_log_unk)
+    return s
+
+
+def slor_text(stage: Stage, text: str):
+    """Return (slor, n_pred, sum_log_p_M, sum_log_p_unig).
+
+    SLOR = (sum_log_p_M - sum_log_p_unig) / n_pred.
+
+    Returns (None, 0, None, None) on too-short input. All four scalars
+    are useful for debugging / calibration recording.
+    """
+    sum_log_p_M, label_ids = causal_log_prob_and_token_ids(stage, text)
+    if sum_log_p_M is None:
+        return None, 0, None, None
+    sum_log_p_unig = unigram_sum_log_prob(
+        label_ids, stage.unigram_log, stage.unigram_log_unk,
+    )
+    n_pred = len(label_ids)
+    slor = (sum_log_p_M - sum_log_p_unig) / max(n_pred, 1)
+    return slor, n_pred, sum_log_p_M, sum_log_p_unig
+
+
+# ---------------------------------------------------------------------------
+# Unigram table — built once at startup from a slice of Dolma using the
+# downstream Gemma tokenizer. Skip special tokens (BOS / EOS / PAD /
+# [MASK] / [INS] / [DEL]) so the baseline reflects content vocabulary.
+# Cached as JSON so re-runs do not re-tokenize.
+# ---------------------------------------------------------------------------
+def build_unigram(
+    sentences,
+    gemma_tok,
+    sample_size: int,
+    smoothing: float,
+    skip_special_ids: set,
+):
+    """Scan up to `sample_size` sentences and return (log_prob_dict, log_unk).
+
+    Add-`smoothing` Laplace over the observed vocabulary plus one UNK
+    bucket.
+    """
+    counts: Dict[int, int] = {}
+    seen = 0
+    for sent in sentences:
+        if seen >= sample_size:
+            break
+        enc = gemma_tok(sent, add_special_tokens=False, truncation=True,
+                        max_length=256)
+        for tid in enc["input_ids"]:
+            tid = int(tid)
+            if tid in skip_special_ids:
+                continue
+            counts[tid] = counts.get(tid, 0) + 1
+        seen += 1
+    if not counts:
+        # Defensive fallback so the pipeline keeps going (we will produce
+        # SLOR ~ 0 which makes the gate inactive).
+        return {}, math.log(1e-9)
+    total = sum(counts.values())
+    V = len(counts) + 1  # +1 for the UNK bucket
+    denom = total + smoothing * V
+    log_prob: Dict[int, float] = {}
+    for tid, c in counts.items():
+        log_prob[tid] = math.log((c + smoothing) / denom)
+    log_unk = math.log(smoothing / denom)
+    return log_prob, log_unk
+
+
+def load_unigram(path: Path):
+    """Load {token_id: log_prob} JSON. Returns (dict, log_unk)."""
+    raw = json.loads(Path(path).read_text())
+    table = {int(k): float(v) for k, v in raw["table"].items()}
+    return table, float(raw["unk_log_prob"])
+
+
+def save_unigram(path: Path, table: Dict[int, float], log_unk: float):
+    """Persist {token_id: log_prob} to JSON."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps({
+        "table": {str(k): v for k, v in table.items()},
+        "unk_log_prob": log_unk,
+        "vocab_observed": len(table),
+    }))
 
 
 # ---------------------------------------------------------------------------
@@ -864,8 +1035,8 @@ COMPOUND_REJECT_REASONS = (
     "token_align_failed",     # find_token_range failed for some op
     "repl_token_count_mismatch",
     "gold_build_failed",      # tagger/editor gold construction failed
-    "ppl_inf",
-    "ppl_too_high",
+    "slor_undefined",         # SLOR could not be computed (e.g. T<2 tokens)
+    "slor_drop_too_high",     # corruption exceeds the per-N SLOR budget
     "sae_shift_too_small",
     "sae_shift_too_large",
     "empty_xprime_text",
@@ -1021,14 +1192,23 @@ def build_identity_sample(stage: Stage, text: str) -> Tuple[Optional[Dict], str]
 # N-dependent gates (§6.2.6)
 # ---------------------------------------------------------------------------
 def gate_thresholds(N: int, args) -> Tuple[float, float, float]:
-    """Return (ppl_max_ratio, sae_min, sae_max) for a compound of N ops."""
+    """Return (slor_drop_max, sae_min, sae_max) for a compound of N ops.
+
+    Fluency gate: SLOR drop budget is LINEAR in N (one "drop" per op).
+    Each independent edit, on average, lowers per-token log-likelihood
+    by a constant Δ; the gate budget tracks that with no √N correction.
+    See Kann+ 2018 (SLOR), Wang+ 2022 (length bias), and the per-N
+    empirical fit (factor^N matches p50 of raw PPL ratio for N ∈ 1..5).
+
+    SAE-shift gate: unchanged sqrt(N) scaling (independent decision).
+    """
     if N <= 0:
         return (float("inf"), 0.0, float("inf"))
+    slor_drop_max = args.slor_drop_per_op * N
     s = math.sqrt(N)
-    ppl_max = args.ppl_per_op_factor ** s
     sae_min = args.sae_per_op_min * s
     sae_max = args.sae_per_op_max * s
-    return ppl_max, sae_min, sae_max
+    return slor_drop_max, sae_min, sae_max
 
 
 def finalize_sample(
@@ -1051,9 +1231,20 @@ def finalize_sample(
     is_identity = (N == 0)
 
     if is_identity:
+        slor_X = slor_Xp = None
+        slor_drop: Optional[float] = None
         ppl_clean = ppl_corr = float("nan")
         ppl_ratio: Optional[float] = None
     else:
+        # SLOR is the primary fluency signal. The PPL ratio is recorded
+        # alongside for backwards-compat analysis but is no longer the gate.
+        slor_X, n_X, logp_M_X, logp_unig_X = slor_text(stage, x_text)
+        slor_Xp, n_Xp, logp_M_Xp, logp_unig_Xp = slor_text(stage, xp_text)
+        if slor_X is None or slor_Xp is None:
+            slor_drop = None
+        else:
+            slor_drop = slor_X - slor_Xp   # positive = corruption hurt fluency
+
         ppl_clean = causal_perplexity_text(stage, x_text)
         ppl_corr = causal_perplexity_text(stage, xp_text)
         if not (math.isfinite(ppl_clean) and math.isfinite(ppl_corr)):
@@ -1065,27 +1256,35 @@ def finalize_sample(
     fXp, vXp = sae_pool_max_topk_from_text(stage, xp_text)
     shift = sae_l2_shift(fX, vX, fXp, vXp)
 
-    ppl_max, sae_min, sae_max = gate_thresholds(N, args)
+    slor_drop_max, sae_min, sae_max = gate_thresholds(N, args)
 
     if calibration_writer is not None:
         calibration_writer.write(json.dumps({
             "N": N,
             "source_sent_id": source_id,
             "op_types": sample["op_types"],
+            # Primary fluency signal (SLOR)
+            "slor_clean": slor_X,
+            "slor_corr":  slor_Xp,
+            "slor_drop":  slor_drop,
+            "slor_drop_max_at_N": (
+                slor_drop_max if math.isfinite(slor_drop_max) else None
+            ),
+            # Legacy PPL ratio recorded for back-compat with analyze tools
             "ppl_clean": ppl_clean if math.isfinite(ppl_clean) else None,
-            "ppl_corr": ppl_corr if math.isfinite(ppl_corr) else None,
+            "ppl_corr":  ppl_corr  if math.isfinite(ppl_corr)  else None,
             "ppl_ratio": ppl_ratio,
+            # SAE
             "sae_shift": shift,
-            "ppl_max_at_N": ppl_max if math.isfinite(ppl_max) else None,
             "sae_min_at_N": sae_min,
             "sae_max_at_N": sae_max,
         }) + "\n")
 
     if not args.calibration_mode and not is_identity:
-        if ppl_ratio is None:
-            return None, "ppl_inf"
-        if ppl_ratio > ppl_max:
-            return None, "ppl_too_high"
+        if slor_drop is None:
+            return None, "slor_undefined"
+        if slor_drop > slor_drop_max:
+            return None, "slor_drop_too_high"
         if shift < sae_min:
             return None, "sae_shift_too_small"
         if shift > sae_max:
@@ -1098,9 +1297,14 @@ def finalize_sample(
         "z_X_topk": topk_records(fX, vX),
         "z_X_prime_topk": topk_records(fXp, vXp),
         "filter_telemetry": {
-            "ppl_clean": ppl_clean if math.isfinite(ppl_clean) else None,
-            "ppl_ratio": ppl_ratio,
-            "ppl_max_at_N": ppl_max if math.isfinite(ppl_max) else None,
+            "slor_clean": slor_X,
+            "slor_corr":  slor_Xp,
+            "slor_drop":  slor_drop,
+            "slor_drop_max_at_N": (
+                slor_drop_max if math.isfinite(slor_drop_max) else None
+            ),
+            "ppl_clean":   ppl_clean if math.isfinite(ppl_clean) else None,
+            "ppl_ratio":   ppl_ratio,
             "sae_shift_l2": shift,
             "sae_min_at_N": sae_min,
             "sae_max_at_N": sae_max,
@@ -1210,6 +1414,48 @@ def main():
     print(f"[corruption] loading spaCy POS tagger: {args.spacy_model}")
     spacy_nlp = load_spacy(args.spacy_model)
 
+    # ----- Build / load the SLOR unigram baseline -------------------------
+    skip_special_ids = {
+        int(gemma_tok.bos_token_id) if gemma_tok.bos_token_id is not None else -1,
+        int(gemma_tok.eos_token_id) if gemma_tok.eos_token_id is not None else -1,
+        int(gemma_tok.pad_token_id) if gemma_tok.pad_token_id is not None else -1,
+        int(gemma_tok.mask_token_id) if gemma_tok.mask_token_id is not None else -1,
+        int(gemma_tok.convert_tokens_to_ids("[INS]")),
+        int(gemma_tok.convert_tokens_to_ids("[DEL]")),
+    }
+    skip_special_ids.discard(-1)
+    unigram_path = Path(args.unigram_cache) if args.unigram_cache else (out_dir / "unigram.json")
+    if unigram_path.exists():
+        print(f"[corruption] loading unigram baseline from {unigram_path}")
+        unigram_log, unigram_log_unk = load_unigram(unigram_path)
+    else:
+        print(f"[corruption] building unigram baseline from "
+              f"{args.unigram_sample_size} Dolma sentences "
+              f"(smoothing={args.unigram_smoothing})")
+        shard_paths_for_unig = download_dolma_shards(
+            args.data_cache_dir, max_files=args.max_files,
+        )
+        unig_text_iter = iter_dolma_texts(shard_paths_for_unig, min_chars=64)
+        unig_sent_iter = iter_sentences(
+            unig_text_iter,
+            splitter=args.sentence_splitter,
+            min_chars=args.sent_min_chars,
+            max_chars=args.sent_max_chars,
+            max_sentences_per_text=args.max_sentences_per_text,
+            sample_strategy=args.sentence_sample_strategy,
+            seed=args.seed + 7777,   # distinct stream
+            quality_filter=True,
+        )
+        unigram_log, unigram_log_unk = build_unigram(
+            unig_sent_iter, gemma_tok,
+            sample_size=args.unigram_sample_size,
+            smoothing=args.unigram_smoothing,
+            skip_special_ids=skip_special_ids,
+        )
+        save_unigram(unigram_path, unigram_log, unigram_log_unk)
+        print(f"[corruption] unigram: V_obs={len(unigram_log)}  "
+              f"log_unk={unigram_log_unk:.3f}  saved={unigram_path}")
+
     stage = Stage(
         extractor=extractor, causal_llm=causal_llm, mlm=mlm,
         gemma_tok=gemma_tok,
@@ -1219,6 +1465,7 @@ def main():
         del_id=int(gemma_tok.convert_tokens_to_ids("[DEL]")),
         pad_id=int(gemma_tok.pad_token_id),
         device=args.device, k_train=int(args.k_train),
+        unigram_log=unigram_log, unigram_log_unk=unigram_log_unk,
     )
 
     bucket_probs = normalize_bucket_weights(args)
@@ -1387,9 +1634,15 @@ def main():
         "reject_reasons": {k: int(v) for k, v in reject_reasons.items()},
         "calibration_mode": bool(args.calibration_mode),
         "gates": {
-            "ppl_per_op_factor": float(args.ppl_per_op_factor),
+            "slor_drop_per_op": float(args.slor_drop_per_op),
+            "slor_n_scaling": "linear",
             "sae_per_op_min": float(args.sae_per_op_min),
             "sae_per_op_max": float(args.sae_per_op_max),
+            "sae_n_scaling": "sqrt",
+            "unigram_smoothing": float(args.unigram_smoothing),
+            "unigram_sample_size": int(args.unigram_sample_size),
+            # deprecated, kept so old downstream tools can read meta.json
+            "ppl_per_op_factor": float(args.ppl_per_op_factor),
         },
         "compound": {
             "n_max": int(args.n_max),
