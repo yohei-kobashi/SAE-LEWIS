@@ -293,8 +293,10 @@ def render_md(
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("run_dir", help="Output of scripts/measure_compound_n.sh "
-                                    "(containing n{N}/calibration.jsonl files)")
+    ap.add_argument("run_dir", help="Directory containing n{N}/calibration.jsonl "
+                                    "files (produced by smoke_pipeline.sh's "
+                                    "MEASURE_COMPOUND_N=1 sweep under "
+                                    "<run>/measure_n/).")
     ap.add_argument("--n-values", nargs="*", type=int, default=None,
                     help="N values to look for. Default = autodetect from "
                          "directories named nK under run_dir.")

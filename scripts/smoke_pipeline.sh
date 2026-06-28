@@ -46,6 +46,23 @@
 #                            (records (N, ppl_ratio, sae_shift) without applying
 #                            the gate; useful for fitting ppl_per_op_factor /
 #                            sae_per_op_min / sae_per_op_max).
+#   MEASURE_COMPOUND_N      1 → after the main pipeline, run an extra per-N
+#                            corruption sweep (one corruption.py invocation per
+#                            N in MEASURE_N_VALUES with --force-n /
+#                            --calibration-mode), then analyze_compound_n.py to
+#                            write report.tsv / report.md under
+#                            $RUN_DIR/measure_n/. Subsumes the standalone
+#                            measure_compound_n.sh script.
+#   MEASURE_N_VALUES        space-separated N values to sweep (default
+#                            "0 1 2 3 4 5"). Only used when MEASURE_COMPOUND_N=1.
+#   MEASURE_ATTEMPTS_PER_N  target attempts per N value (default 500). In
+#                            --calibration-mode every attempt is recorded
+#                            regardless of the gate, so this also drives the
+#                            percentile precision of the per-N report.
+#   MEASURE_K_BUDGET        first-accept attempts per source sentence in the
+#                            per-N sweep (default 6).
+#   MEASURE_N_MAX           upper bound on N passed to corruption.py during the
+#                            sweep (default 5). Should be ≥ max(MEASURE_N_VALUES).
 #
 # Each stage's stdout/stderr is captured under $RUN_DIR/logs/<stage>.log.
 # Per-stage wall time and status land in $RUN_DIR/timing.tsv.
@@ -91,6 +108,12 @@ SAE_LAYER=${SAE_LAYER:-12}
 MLM_MODEL=${MLM_MODEL:-"modernbert-base"}
 SPACY_MODEL=${SPACY_MODEL:-"en_core_web_sm"}
 CALIBRATION=${CALIBRATION:-0}
+
+MEASURE_COMPOUND_N=${MEASURE_COMPOUND_N:-0}
+MEASURE_N_VALUES=${MEASURE_N_VALUES:-"0 1 2 3 4 5"}
+MEASURE_ATTEMPTS_PER_N=${MEASURE_ATTEMPTS_PER_N:-500}
+MEASURE_K_BUDGET=${MEASURE_K_BUDGET:-6}
+MEASURE_N_MAX=${MEASURE_N_MAX:-5}
 
 # Production-scale defaults baked into the training scripts' argparses.
 # These are used only for the extrapolation table at the end.
@@ -261,7 +284,16 @@ SAE_LAYER            = $SAE_LAYER
 MLM_MODEL            = $MLM_MODEL
 SPACY_MODEL          = $SPACY_MODEL
 CALIBRATION          = $CALIBRATION
+MEASURE_COMPOUND_N   = $MEASURE_COMPOUND_N
 EOF
+if [[ "$MEASURE_COMPOUND_N" == "1" ]]; then
+    cat <<EOF
+MEASURE_N_VALUES     = $MEASURE_N_VALUES
+MEASURE_ATTEMPTS_PER_N = $MEASURE_ATTEMPTS_PER_N
+MEASURE_K_BUDGET     = $MEASURE_K_BUDGET
+MEASURE_N_MAX        = $MEASURE_N_MAX
+EOF
+fi
 
 # --------------------------------------------------------------------------- #
 # Stage 0: SAE cache
@@ -421,6 +453,75 @@ run_stage "06_evaluate" \
         --spec $EVAL_SPEC \
         --l-max 5 \
         --device "$DEVICE"
+
+# --------------------------------------------------------------------------- #
+# Optional Stage 7+8: per-N corruption sweep + analysis
+# (replaces the standalone scripts/measure_compound_n.sh)
+#
+# For each N in MEASURE_N_VALUES we run corruption.py with --force-n $N and
+# --calibration-mode so every attempt's (ppl_ratio, sae_shift) lands in
+# $RUN_DIR/measure_n/n${N}/calibration.jsonl regardless of the gate. After
+# all per-N runs complete we hand the directory to analyze_compound_n.py
+# which writes report.tsv / report.md.
+#
+# We seed each N differently (SEED + N) so a single Dolma stream does not
+# bias all N values toward the same source sentences; deterministic across
+# re-runs.
+# --------------------------------------------------------------------------- #
+if [[ "$MEASURE_COMPOUND_N" == "1" ]]; then
+    MEASURE_DIR="$RUN_DIR/measure_n"
+    mkdir -p "$MEASURE_DIR"
+
+    for MN in $MEASURE_N_VALUES; do
+        MEASURE_SUB="$MEASURE_DIR/n${MN}"
+        STAGE_NAME=$(printf "07_measure_n%s" "$MN")
+        if [[ -f "$MEASURE_SUB/calibration.jsonl" ]]; then
+            skip_stage "$STAGE_NAME" "exists at $MEASURE_SUB"
+            continue
+        fi
+        mkdir -p "$MEASURE_SUB"
+        run_stage "$STAGE_NAME" \
+            python corruption.py \
+                --data-cache-dir "$DOLMA_CACHE" \
+                --max-files "$DOLMA_MAX_FILES" \
+                --out-dir "$MEASURE_SUB" \
+                --llm2vec-dir "$LLM2VEC_DIR" \
+                --llm "$LLM" \
+                --sae-repo "$SAE_REPO" \
+                --sae-path "$SAE_PATH" \
+                --sae-layer "$SAE_LAYER" \
+                --mlm-model "$MLM_MODEL" \
+                --spacy-model "$SPACY_MODEL" \
+                --target-samples "$MEASURE_ATTEMPTS_PER_N" \
+                --samples-per-shard "$CORRUPTION_SHARD" \
+                --k-budget "$MEASURE_K_BUDGET" \
+                --n-max "$MEASURE_N_MAX" \
+                --force-n "$MN" \
+                --calibration-mode \
+                --calibration-out "$MEASURE_SUB/calibration.jsonl" \
+                --device "$DEVICE" \
+                --seed $((SEED + MN))
+    done
+
+    if [[ -f "$MEASURE_DIR/report.md" ]]; then
+        skip_stage "08_analyze_compound_n" "exists at $MEASURE_DIR/report.md"
+    else
+        # shellcheck disable=SC2086  # MEASURE_N_VALUES is intentionally word-split
+        run_stage "08_analyze_compound_n" \
+            python scripts/analyze_compound_n.py "$MEASURE_DIR" \
+                --report-tsv "$MEASURE_DIR/report.tsv" \
+                --report-md  "$MEASURE_DIR/report.md" \
+                --n-values $MEASURE_N_VALUES
+    fi
+
+    cat <<EOF
+
+[smoke] per-N measurement artifacts:
+  Per-N metrics : $MEASURE_DIR/n{N}/calibration.jsonl
+  Summary TSV   : $MEASURE_DIR/report.tsv
+  Summary MD    : $MEASURE_DIR/report.md
+EOF
+fi
 
 # --------------------------------------------------------------------------- #
 # Timing summary + production-scale extrapolation
