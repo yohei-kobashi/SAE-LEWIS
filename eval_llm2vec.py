@@ -1,7 +1,7 @@
 """
 Evaluate a trained LLM2Vec checkpoint.
 
-Run as a standalone post-mortem on a finished MNTP run. Four evals:
+Run as a standalone post-mortem on a finished MNTP run. Five evals:
 
   (1) MNTP held-out loss / perplexity. We re-apply the canonical LLM2Vec
       objective (DataCollatorForLanguageModeling 15% / 80-10-10 +
@@ -28,6 +28,13 @@ Run as a standalone post-mortem on a finished MNTP run. Four evals:
       ratio-to-median, and nearest neighbors by cosine. Used to spot
       undertrained or anomalous embeddings before they propagate into
       editor / tagger training.
+
+  (5) MTEB-lite paper-style sentence embedding eval. Wraps the bidir
+      model + tokenizer + pooling strategy as an `encode()` adapter and
+      runs a configurable set of MTEB tasks (default: STSBenchmark,
+      reporting Spearman correlation). Pooling strategy is a key LLM2Vec
+      paper ablation axis (`--pooling mean|last|weighted_mean`). Requires
+      `pip install mteb`; skipped gracefully if missing or if --skip-mteb.
 
 Outputs:
   $OUTPUT_DIR/eval_metrics.json   (machine-readable)
@@ -81,6 +88,26 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
+    # ---- MTEB-lite paper-style eval (eval 5) -------------------------------
+    p.add_argument("--pooling", choices=["mean", "last", "weighted_mean"],
+                   default="mean",
+                   help="Sentence-embedding pooling strategy used by eval (5). "
+                        "Key LLM2Vec paper ablation axis. 'mean' = canonical, "
+                        "'last' = decoder-LM style, 'weighted_mean' = "
+                        "position-weighted average.")
+    p.add_argument("--mteb-tasks", nargs="*",
+                   default=["STSBenchmark"],
+                   help="MTEB task names to run (default: STSBenchmark). "
+                        "Lightweight choices: STSBenchmark, STS17, BIOSSES, "
+                        "SciFact (retrieval). Heavy: MSMARCO. Empty list "
+                        "disables eval (5).")
+    p.add_argument("--mteb-batch-size", type=int, default=8,
+                   help="Encoder batch size for MTEB encoding (default: 8).")
+    p.add_argument("--mteb-output-folder", default=None,
+                   help="Per-task JSON results dir (default: "
+                        "$OUTPUT_DIR/mteb).")
+    p.add_argument("--skip-mteb", action="store_true",
+                   help="Skip eval (5) entirely even if mteb is installed.")
     return p.parse_args()
 
 
@@ -349,6 +376,225 @@ def eval_special_token_embeddings(model, tokenizer) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Eval (5): MTEB-lite paper-style sentence embedding eval
+# --------------------------------------------------------------------------- #
+def pool_hidden_states(
+    h: torch.Tensor,
+    mask: torch.Tensor,
+    strategy: str,
+) -> torch.Tensor:
+    """Pool (T, d) hidden states down to (d,) using `strategy`.
+
+    LLM2Vec paper §4.3 ablates pooling strategies — `mean` typically wins
+    for MNTP'd encoders, `last` mirrors causal-LM behavior, and
+    `weighted_mean` (linear position weights) is sometimes used as a
+    middle ground.
+    """
+    mask_b = mask.bool()
+    if not mask_b.any():
+        return h.mean(dim=0)
+    if strategy == "mean":
+        return h[mask_b].mean(dim=0)
+    if strategy == "last":
+        # Last non-pad position.
+        idx = mask_b.nonzero(as_tuple=True)[0][-1]
+        return h[idx]
+    if strategy == "weighted_mean":
+        # Position-weighted mean: token at position t gets weight (t+1).
+        # Mirrors the recipe used in several recent sentence-encoder papers.
+        T = h.shape[0]
+        w = torch.arange(1, T + 1, device=h.device, dtype=h.dtype)
+        w = w * mask_b.to(h.dtype)
+        return (h * w.unsqueeze(-1)).sum(dim=0) / w.sum().clamp_min(1e-9)
+    raise ValueError(f"unknown pooling strategy: {strategy!r}")
+
+
+class LLM2VecEncoder:
+    """`encode()` adapter for the `mteb` library.
+
+    Forwards the input through the bidir-patched LLM2Vec model, pools the
+    final-layer hidden states with `pool_hidden_states`, L2-normalizes,
+    and returns a (N, d) numpy array. Also exposes `encode_queries` /
+    `encode_corpus` so retrieval tasks work without extra glue.
+    """
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        device: str,
+        pooling: str = "mean",
+        max_seq_length: int = 256,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.pooling = pooling
+        self.max_seq_length = max_seq_length
+
+    @torch.no_grad()
+    def encode(self, sentences, batch_size: int = 8, **kwargs) -> np.ndarray:
+        if isinstance(sentences, str):
+            sentences = [sentences]
+        all_embs: List[np.ndarray] = []
+        # The inner GemmaModel (causal_lm.model) gives `last_hidden_state`
+        # without going through the lm_head — cheaper than the full
+        # CausalLM forward and exactly what mteb expects.
+        encoder = self.model.model
+        for i in range(0, len(sentences), batch_size):
+            batch = list(sentences[i : i + batch_size])
+            enc = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_seq_length,
+                return_tensors="pt",
+            ).to(self.device)
+            out = encoder(
+                input_ids=enc.input_ids,
+                attention_mask=enc.attention_mask,
+                use_cache=False,
+            )
+            h = out.last_hidden_state  # (B, T, d)
+            for b in range(h.shape[0]):
+                pooled = pool_hidden_states(
+                    h[b].float(),
+                    enc.attention_mask[b],
+                    self.pooling,
+                )
+                pooled = F.normalize(pooled, dim=-1)
+                all_embs.append(pooled.cpu().numpy())
+        return np.stack(all_embs)
+
+    # Retrieval-task hooks. mteb passes queries as `List[str]` and corpus
+    # as `List[Dict[str, str]]` with at least a "text" key (often also
+    # "title"). We concatenate title + text when both exist.
+    def encode_queries(self, queries, **kwargs) -> np.ndarray:
+        return self.encode(queries, **kwargs)
+
+    def encode_corpus(self, corpus, **kwargs) -> np.ndarray:
+        sents: List[str] = []
+        for c in corpus:
+            if isinstance(c, dict):
+                title = c.get("title", "")
+                text = c.get("text", "")
+                sents.append((title + " " + text).strip() if title else text)
+            else:
+                sents.append(str(c))
+        return self.encode(sents, **kwargs)
+
+
+def _flatten_mteb_results(raw, task_name: str) -> dict:
+    """Best-effort extraction of the headline score from mteb's results.
+
+    mteb's result schema has changed between versions. We try common keys
+    and gracefully fall back to dumping the raw dict so the user can read
+    the JSON.
+    """
+    out: dict = {"task": task_name, "raw": None, "main_score": None,
+                 "metric_name": None}
+
+    # Newer mteb (>= 1.x) returns a TaskResult-like object with .scores or
+    # .to_dict(). Older versions return a plain dict keyed by split.
+    obj = raw
+    if hasattr(raw, "to_dict"):
+        try:
+            obj = raw.to_dict()
+        except Exception:
+            obj = None
+    if obj is None and hasattr(raw, "scores"):
+        obj = {"scores": raw.scores}
+    if obj is None:
+        obj = raw
+
+    out["raw"] = obj
+
+    def _walk(d):
+        """DFS for a (key, value) pair where key suggests headline score."""
+        if not isinstance(d, dict):
+            return None
+        priority_keys = [
+            "main_score", "cos_sim_spearman", "cosine_spearman",
+            "spearman", "ndcg_at_10", "map_at_10", "spearman_correlation",
+        ]
+        for k in priority_keys:
+            if k in d and isinstance(d[k], (int, float)):
+                return k, float(d[k])
+        for v in d.values():
+            r = _walk(v)
+            if r is not None:
+                return r
+        return None
+
+    found = _walk(obj if isinstance(obj, dict) else {})
+    if found is not None:
+        out["metric_name"], out["main_score"] = found
+    return out
+
+
+def eval_mteb(
+    encoder: "LLM2VecEncoder",
+    tasks: List[str],
+    output_folder: Path,
+    batch_size: int,
+) -> dict:
+    """Run the requested MTEB tasks and return a per-task summary.
+
+    Returns dict {"tasks": [...], "available": bool, "error": Optional[str]}.
+    If mteb is not installed, returns {"available": False, ...} so the
+    caller can skip rendering this section gracefully.
+    """
+    try:
+        import mteb  # type: ignore
+    except ImportError as e:
+        return {
+            "available": False,
+            "error": f"`pip install mteb` to enable: {e}",
+            "tasks": [],
+        }
+
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    # mteb's task-listing API has shifted across versions. Try the
+    # explicit-name path first (simple, stable), fall back to
+    # `get_tasks` if needed.
+    try:
+        evaluation = mteb.MTEB(tasks=tasks)
+    except Exception:
+        # Newer-style: mteb.get_tasks(tasks=[...])
+        task_objs = mteb.get_tasks(tasks=tasks)
+        evaluation = mteb.MTEB(tasks=task_objs)
+
+    per_task: List[dict] = []
+    for t in tasks:
+        try:
+            sub_eval = mteb.MTEB(tasks=[t]) if hasattr(mteb, "MTEB") else evaluation
+            res = sub_eval.run(
+                encoder,
+                output_folder=str(output_folder),
+                batch_size=batch_size,
+                eval_splits=None,
+                overwrite_results=True,
+                verbosity=1,
+            )
+            # `res` is usually a list[TaskResult] (one per task in the call).
+            raw_for_t = res[0] if isinstance(res, list) and res else res
+            per_task.append(_flatten_mteb_results(raw_for_t, t))
+        except Exception as e:
+            per_task.append({
+                "task": t, "raw": None, "main_score": None,
+                "metric_name": None, "error": str(e),
+            })
+
+    return {
+        "available": True,
+        "error": None,
+        "tasks": per_task,
+        "output_folder": str(output_folder),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Report rendering
 # --------------------------------------------------------------------------- #
 def render_report(args, metrics: dict, out_path: Path):
@@ -467,6 +713,40 @@ def render_report(args, metrics: dict, out_path: Path):
             L.append(f"    - `{nn['token']}` (id={nn['id']}): {nn['cosine']:.4f}")
         L.append("")
 
+    # ---- Eval 5: MTEB-lite paper-style ------------------------------------
+    L.append("## 5. MTEB sentence embedding eval (paper-style)")
+    L.append("")
+    m5 = metrics.get("mteb")
+    if m5 is None:
+        L.append("Skipped (--skip-mteb or no tasks specified).")
+        L.append("")
+    elif not m5.get("available", False):
+        L.append(f"Skipped: {m5.get('error', 'mteb not available')}")
+        L.append("")
+    else:
+        L.append(f"Pooling strategy: **{args.pooling}**")
+        L.append("")
+        L.append("| Task | Metric | Score |")
+        L.append("|---|---|---|")
+        for t in m5.get("tasks", []):
+            score = t.get("main_score")
+            metric_name = t.get("metric_name") or "—"
+            err = t.get("error")
+            if err:
+                L.append(f"| {t['task']} | (error) | {err[:60]} |")
+            elif score is None:
+                L.append(f"| {t['task']} | {metric_name} | (no headline score parsed) |")
+            else:
+                L.append(f"| {t['task']} | {metric_name} | {score:.4f} |")
+        L.append("")
+        L.append(f"Per-task raw JSON: `{m5.get('output_folder')}`")
+        L.append("")
+        L.append("LLM2Vec paper §4.3 reports STS-B Spearman in the high 0.7s")
+        L.append("after Bi + MNTP (without SimCSE), pushing into the 0.8s with")
+        L.append("SimCSE. Smoke-scale MNTP (a few hundred steps) typically lands")
+        L.append("below 0.65 — interpret accordingly.")
+        L.append("")
+
     out_path.write_text("\n".join(L))
 
 
@@ -510,7 +790,7 @@ def main():
     metrics: dict = {"baseline_llm": baseline_llm, "config": vars(args)}
 
     # ---- Eval 1: MNTP held-out loss ----------------------------------------
-    print("[eval] (1/4) MNTP held-out loss / perplexity")
+    print("[eval] (1/5) MNTP held-out loss / perplexity")
     set_seed(args.seed)  # deterministic masking across model swaps
     metrics["mntp"] = eval_mntp_loss(model_bidir, tokenizer, sents, args)
     print(f"        loss = {metrics['mntp']['loss']:.4f}  "
@@ -518,7 +798,7 @@ def main():
           f"({metrics['mntp']['n_tokens']} tokens)")
 
     # ---- Eval 2: Causal PPL drift ------------------------------------------
-    print("[eval] (2/4) Causal PPL (this ckpt, no patch)")
+    print("[eval] (2/5) Causal PPL (this ckpt, no patch)")
     metrics["causal_ppl"] = {
         "llm2vec": eval_causal_ppl(model_causal, tokenizer, sents, args),
     }
@@ -526,7 +806,7 @@ def main():
           f"ppl = {metrics['causal_ppl']['llm2vec']['perplexity']:.2f}")
 
     if baseline_llm:
-        print(f"[eval] (2/4) Causal PPL (baseline {baseline_llm}, no patch)")
+        print(f"[eval] (2/5) Causal PPL (baseline {baseline_llm}, no patch)")
         base_model = load_model(baseline_llm, dtype, args.device, bidir_patch=False)
         base_tok = AutoTokenizer.from_pretrained(baseline_llm)
         if base_tok.pad_token is None:
@@ -544,7 +824,7 @@ def main():
             torch.cuda.empty_cache()
 
     # ---- Eval 3: bidir vs causal divergence --------------------------------
-    print("[eval] (3/4) Bidir vs causal hidden-state divergence")
+    print("[eval] (3/5) Bidir vs causal hidden-state divergence")
     metrics["bidir_vs_causal"] = eval_bidir_vs_causal(
         model_bidir, model_causal, tokenizer, sents, args,
     )
@@ -553,7 +833,7 @@ def main():
           f"last-pos {metrics['bidir_vs_causal']['last_pos_mean']:.4f})")
 
     # ---- Eval 4: special token embedding sanity ----------------------------
-    print("[eval] (4/4) Special token embedding sanity")
+    print("[eval] (4/5) Special token embedding sanity")
     metrics["special_tokens"] = eval_special_token_embeddings(model_bidir, tokenizer)
     for name, info in metrics["special_tokens"]["tokens"].items():
         if info.get("found"):
@@ -562,7 +842,45 @@ def main():
         else:
             print(f"        {name}: NOT FOUND")
 
-    (out_dir / "eval_metrics.json").write_text(json.dumps(metrics, indent=2))
+    # ---- Eval 5: MTEB-lite (paper-style) -----------------------------------
+    if args.skip_mteb or not args.mteb_tasks:
+        print("[eval] (5/5) MTEB skipped (--skip-mteb or empty --mteb-tasks)")
+        metrics["mteb"] = {"available": False,
+                           "error": "skipped via --skip-mteb / empty --mteb-tasks",
+                           "tasks": []}
+    else:
+        print(f"[eval] (5/5) MTEB sentence embedding eval — pooling={args.pooling}, "
+              f"tasks={args.mteb_tasks}")
+        encoder = LLM2VecEncoder(
+            model=model_bidir,
+            tokenizer=tokenizer,
+            device=args.device,
+            pooling=args.pooling,
+            max_seq_length=args.max_seq_length,
+        )
+        mteb_out = Path(args.mteb_output_folder) if args.mteb_output_folder \
+                   else (out_dir / "mteb")
+        metrics["mteb"] = eval_mteb(
+            encoder=encoder,
+            tasks=list(args.mteb_tasks),
+            output_folder=mteb_out,
+            batch_size=args.mteb_batch_size,
+        )
+        if not metrics["mteb"]["available"]:
+            print(f"        (skipped — {metrics['mteb']['error']})")
+        else:
+            for t in metrics["mteb"]["tasks"]:
+                if t.get("error"):
+                    print(f"        {t['task']:18s}  ERROR: {t['error'][:80]}")
+                elif t.get("main_score") is None:
+                    print(f"        {t['task']:18s}  (no headline score parsed; "
+                          f"see {mteb_out})")
+                else:
+                    print(f"        {t['task']:18s}  "
+                          f"{t.get('metric_name') or 'score'} = "
+                          f"{t['main_score']:.4f}")
+
+    (out_dir / "eval_metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     render_report(args, metrics, out_dir / "eval_report.md")
     print(f"[eval] wrote {out_dir / 'eval_metrics.json'}")
     print(f"[eval] wrote {out_dir / 'eval_report.md'}")

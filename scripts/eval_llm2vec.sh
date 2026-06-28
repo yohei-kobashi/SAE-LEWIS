@@ -25,6 +25,12 @@
 #   MLM_PROBABILITY    default: 0.15
 #   DEVICE             default: cuda
 #   SEED               default: 42
+#   POOLING            sentence-embedding pooling for eval (5):
+#                       mean | last | weighted_mean (default: mean)
+#   MTEB_TASKS         space-separated MTEB task list for eval (5)
+#                       (default: "STSBenchmark"). Empty string disables (5).
+#   MTEB_BATCH_SIZE    encoder batch size for MTEB (default: 8)
+#   SKIP_MTEB          1 → skip eval (5) entirely (default: 0)
 
 set -euo pipefail
 
@@ -42,10 +48,17 @@ MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-256}
 MLM_PROBABILITY=${MLM_PROBABILITY:-0.15}
 DEVICE=${DEVICE:-cuda}
 SEED=${SEED:-42}
+POOLING=${POOLING:-mean}
+MTEB_TASKS=${MTEB_TASKS:-"STSBenchmark"}
+MTEB_BATCH_SIZE=${MTEB_BATCH_SIZE:-8}
+SKIP_MTEB=${SKIP_MTEB:-0}
 
 EXTRA_ARGS=()
 if [[ -n "${BASELINE_LLM:-}" ]]; then
     EXTRA_ARGS+=(--baseline-llm "$BASELINE_LLM")
+fi
+if [[ "$SKIP_MTEB" == "1" ]]; then
+    EXTRA_ARGS+=(--skip-mteb)
 fi
 
 mkdir -p "$OUTPUT_DIR"
@@ -64,8 +77,15 @@ N_BIDIR_CAUSAL  = $N_BIDIR_CAUSAL
 MAX_SEQ_LENGTH  = $MAX_SEQ_LENGTH
 MLM_PROBABILITY = $MLM_PROBABILITY
 DEVICE          = $DEVICE        SEED = $SEED
+POOLING         = $POOLING
+MTEB_TASKS      = $MTEB_TASKS
+MTEB_BATCH_SIZE = $MTEB_BATCH_SIZE
+SKIP_MTEB       = $SKIP_MTEB
 EOF
 
+# MTEB_TASKS is intentionally word-split so the user can pass multiple
+# task names separated by spaces.
+# shellcheck disable=SC2086
 python eval_llm2vec.py \
     --llm2vec-dir "$LLM2VEC_DIR" \
     --output-dir "$OUTPUT_DIR" \
@@ -75,6 +95,9 @@ python eval_llm2vec.py \
     --n-bidir-causal "$N_BIDIR_CAUSAL" \
     --max-seq-length "$MAX_SEQ_LENGTH" \
     --mlm-probability "$MLM_PROBABILITY" \
+    --pooling "$POOLING" \
+    --mteb-tasks $MTEB_TASKS \
+    --mteb-batch-size "$MTEB_BATCH_SIZE" \
     --device "$DEVICE" \
     --seed "$SEED" \
     "${EXTRA_ARGS[@]}"
