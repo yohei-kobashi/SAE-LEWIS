@@ -81,6 +81,18 @@ def histogram(values: List[int], buckets: List[Tuple[int, int, str]]) -> Counter
     return out
 
 
+def _per_value_hist(values: List[int], max_exact: int = 20) -> Tuple[Dict[str, int], List[str]]:
+    """Histogram with one bucket per integer up to `max_exact`, plus tail
+    buckets. Returns (counts, ordered_label_list)."""
+    buckets: List[Tuple[int, int, str]] = (
+        [(v, v, str(v)) for v in range(0, max_exact + 1)]
+        + [(max_exact + 1, 50, f"{max_exact + 1}-50"), (51, 10_000, "51+")]
+    )
+    counts = histogram(values, buckets)
+    labels = [lab for _, _, lab in buckets] + ["other"]
+    return dict(counts), labels
+
+
 def summarise(records: List[Dict]) -> Dict:
     if not records:
         return {
@@ -98,6 +110,8 @@ def summarise(records: List[Dict]) -> Dict:
     p_dlen = percentiles(dlen, qs)
     p_edit = percentiles(edit, qs)
     p_setd = percentiles(setd, qs)
+    edit_hist, edit_labels = _per_value_hist(edit, max_exact=20)
+    set_diff_hist, set_diff_labels = _per_value_hist(setd, max_exact=20)
     return {
         "n": len(records),
         "len1_mean": sum(len1) / len(len1),
@@ -109,18 +123,11 @@ def summarise(records: List[Dict]) -> Dict:
         "delta_len_pcts": p_dlen,
         "edit_pcts": p_edit,
         "set_diff_pcts": p_setd,
-        # Bucketed histogram of edit distance
-        "edit_hist": dict(histogram(edit, [
-            (0, 0, "=0"),
-            (1, 1, "=1"),
-            (2, 2, "=2"),
-            (3, 3, "=3"),
-            (4, 5, "4-5"),
-            (6, 10, "6-10"),
-            (11, 20, "11-20"),
-            (21, 50, "21-50"),
-            (51, 10_000, "51+"),
-        ])),
+        # Per-integer histogram of edit distance (0..20 exact, then tail).
+        "edit_hist": edit_hist,
+        "edit_hist_labels": edit_labels,
+        "set_diff_hist": set_diff_hist,
+        "set_diff_hist_labels": set_diff_labels,
     }
 
 
@@ -147,32 +154,24 @@ def render_md(
     # Overall
     out.append("\n## Overall\n")
     out.append(_render_summary_table(overall, qs_labels))
-    out.append(
-        "\n**Edit-distance histogram (overall):**\n\n"
-        "| edit | count | % |\n"
-        "|------|-------|---|\n"
-    )
-    n_total = overall["n"]
-    for label in ("=0", "=1", "=2", "=3", "4-5", "6-10",
-                  "11-20", "21-50", "51+", "other"):
-        c = overall["edit_hist"].get(label, 0)
-        pct = (100.0 * c / n_total) if n_total else 0.0
-        out.append(f"| {label} | {c} | {pct:.1f}% |\n")
+    out.append(_render_hist_table(
+        "Edit-distance histogram (overall)",
+        overall["edit_hist"], overall["edit_hist_labels"], overall["n"],
+    ))
+    out.append(_render_hist_table(
+        "Set-diff histogram (overall)",
+        overall["set_diff_hist"], overall["set_diff_hist_labels"], overall["n"],
+    ))
 
     # Per language
     out.append("\n## Per language\n")
     for lang, summ in sorted(by_lang.items()):
         out.append(f"\n### {lang}  (n = {summ['n']})\n")
         out.append(_render_summary_table(summ, qs_labels))
-        out.append(
-            "\nEdit histogram: "
-            + ", ".join(
-                f"{label}={summ['edit_hist'].get(label, 0)}"
-                for label in ("=0", "=1", "=2", "=3", "4-5",
-                              "6-10", "11-20", "21-50", "51+")
-            )
-            + "\n"
-        )
+        out.append(_render_hist_table(
+            f"{lang}: Edit-distance histogram",
+            summ["edit_hist"], summ["edit_hist_labels"], summ["n"],
+        ))
 
     # Top features (by edit-distance median, to flag what's hardest)
     out.append("\n## Top features by edit-distance p50 (largest first)\n")
@@ -211,6 +210,27 @@ def render_md(
         "* Re-run with `--sample-size 7251` to use the full dataset, or "
         "`--language English` / `--language Chinese` to slice.\n"
     )
+    return "".join(out)
+
+
+def _render_hist_table(
+    title: str, hist: Dict[str, int], labels: List[str], n_total: int,
+) -> str:
+    """Render a one-per-value histogram with count, %, and cumulative %."""
+    out: List[str] = []
+    out.append(f"\n**{title}:**\n\n")
+    out.append("| value | count | % | cum % |\n")
+    out.append("|-------|-------|---|-------|\n")
+    cum = 0
+    for label in labels:
+        c = hist.get(label, 0)
+        if c == 0 and label in ("21-50", "51+", "other"):
+            # Skip empty tail rows to keep the table readable
+            continue
+        cum += c
+        pct = (100.0 * c / n_total) if n_total else 0.0
+        cum_pct = (100.0 * cum / n_total) if n_total else 0.0
+        out.append(f"| {label} | {c} | {pct:.1f}% | {cum_pct:.1f}% |\n")
     return "".join(out)
 
 
@@ -334,7 +354,17 @@ def main():
           f"p90={overall['set_diff_pcts'][4]:.1f}")
     print(f"  len1       p50={overall['len1_pcts'][2]:.1f}  "
           f"len2 p50={overall['len2_pcts'][2]:.1f}")
-    print(f"  edit hist (overall): {overall['edit_hist']}")
+    # Print histogram in label order (0, 1, 2, ..., 20, 21-50, 51+).
+    print("  edit hist (overall):")
+    n_overall = overall["n"]
+    cum = 0
+    for label in overall["edit_hist_labels"]:
+        c = overall["edit_hist"].get(label, 0)
+        if c == 0 and label in ("21-50", "51+", "other"):
+            continue
+        cum += c
+        print(f"    {label:>5} : {c:>5}  ({100.0*c/n_overall:5.1f}%, "
+              f"cum {100.0*cum/n_overall:5.1f}%)")
 
 
 if __name__ == "__main__":
