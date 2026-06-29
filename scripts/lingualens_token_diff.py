@@ -253,9 +253,11 @@ def main():
                         "in the SAE-LEWIS pipeline).")
     p.add_argument("--sample-size", type=int, default=2000)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--language", default=None,
-                   help="Filter to a single language (English | Chinese). "
-                        "None = use both.")
+    p.add_argument("--language", default="English",
+                   help="Filter to a single language (English | Chinese | "
+                        "'all'). Default is English — matches the SAE-LEWIS "
+                        "pipeline's current scope. Pass 'all' to keep both "
+                        "languages.")
     p.add_argument("--out-md", default="runs/lingualens_token_diff.md")
     p.add_argument("--out-jsonl", default=None,
                    help="Optional path to write per-pair raw records as JSONL.")
@@ -264,7 +266,7 @@ def main():
     print(f"[lingualens] loading dataset")
     ds = load_dataset("THU-KEG/LinguaLens-Data", split="train")
     print(f"[lingualens] total examples: {len(ds)}")
-    if args.language:
+    if args.language and args.language.lower() != "all":
         ds = ds.filter(lambda r: r["language"] == args.language)
         print(f"[lingualens] after language={args.language} filter: {len(ds)}")
 
