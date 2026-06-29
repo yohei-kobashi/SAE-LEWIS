@@ -431,16 +431,19 @@ Per-position op composition is handled by `apply_ops_for_editor` and the tagger 
 Two independent gates are applied to each (X, X') pair:
 
 ```
-fluency  :  slor_drop = SLOR(X) − SLOR(X')    <= slor_drop_per_op * N    (linear)
-SAE      :  |top_K(X) \ top_K(X')|             >= sae_min_topk_change    (binary by default)
+fluency  :  slor_drop = SLOR(X) − SLOR(X')                 <= slor_drop_per_op * N    (linear)
+SAE      :  |top_K_local(X) \ top_K_local(X')|              >= sae_min_topk_change    (binary by default)
 
-SLOR(s)  = (1/|s|) * [log p_M(s) − log p_unigram(s)]
-top_K(z) = the set of K (default 10) SAE features with the highest pool-max activation
+SLOR(s)        = (1/|s|) * [log p_M(s) − log p_unigram(s)]
+top_K_local(z) = the set of K SAE features with the highest pool-max activation
+                 RESTRICTED to tokens that overlap an edited char range.
 ```
 
 Fluency uses **SLOR** (Pauls&Klein 2012 / Lau et al. 2017 / Kann et al. NAACL 2018) — per-token, unigram-normalised log-likelihood — instead of raw PPL ratio, which has well-documented length and rare-word artefacts (Wang+ 2022, Kann+ 2018).
 
-The **SAE gate** is a **top-K identity change check** (BINARY by default): reject the pair if the top-`K` most-active SAE features are the same SET before and after corruption. The L2 shift was the previous metric but conflates magnitude wiggles with actual representation change — if the top-K features have the same identities, the editor cannot learn from the conditioning vector even when `||z_X − z_X'||` is non-zero. The default `sae_min_topk_change = 1` means "at least 1 feature must change identity"; raise it for stricter SAE-space separation.
+The **SAE gate** is a **top-K identity change check** (BINARY by default): reject the pair if the top-`K` most-active SAE features at the *edited* token positions are the same SET before and after corruption. The L2 shift was the previous metric but conflates magnitude wiggles with actual representation change — if the top-K features have the same identities, the editor cannot learn from the conditioning vector even when `||z_X − z_X'||` is non-zero. The default `sae_min_topk_change = 1` means "at least 1 feature must change identity"; raise it for stricter SAE-space separation.
+
+**Why local pool-max instead of global.** The first empirical sweep used pool-max over ALL token positions and saw `top_K change p50 = 0` for every `N ∈ {1..5}` at K=10, with corresponding yield ~0% — even though L2 shift grew from 1.5 to 11.8 across the same N range. The diagnosis: the global top-K is dominated by **content-independent features** (language id / BOS-EOS / punctuation / sentence-initial position) whose pool-max happens at unedited positions, so local edits leave the global top-K identity unchanged even when they substantially move the SAE representation. Restricting the pool to tokens that overlap an edited char range removes that floor: the gate measures whether the SAE features *where the edit actually landed* changed. The global top-K is still recorded in calibration JSONL as `sae_topk_change_global` for diagnostic comparison.
 
 **No L2 upper bound.** An earlier design included a `sae_max = sae_per_op_max * sqrt(N)` L2 cap to enforce minimality. It was removed: top-K identity change already captures whether the SAE-space interpretation moved, and a corruption that flips a small number of top-K features with high magnitude — exactly the case the editor learns most from — would be wrongly rejected by an L2 cap. The raw L2 shift is still recorded in calibration / telemetry for offline analysis but is not gated against.
 

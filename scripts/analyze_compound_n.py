@@ -87,11 +87,38 @@ def load_calibration(path: Path) -> List[Dict]:
 # --------------------------------------------------------------------------- #
 # Per-N summary
 # --------------------------------------------------------------------------- #
+def _bucketed_change(values: List[Optional[int]]) -> Dict[str, int]:
+    """Bucket discrete top-K change values: 0 / 1 / 2-3 / 4+."""
+    buckets = {"=0": 0, "=1": 0, "2-3": 0, "4+": 0, "unknown": 0}
+    for v in values:
+        if v is None:
+            buckets["unknown"] += 1
+        elif v == 0:
+            buckets["=0"] += 1
+        elif v == 1:
+            buckets["=1"] += 1
+        elif v <= 3:
+            buckets["2-3"] += 1
+        else:
+            buckets["4+"] += 1
+    return buckets
+
+
 def summarise_one_N(records: List[Dict]) -> Dict:
     slor_drops = [r.get("slor_drop") for r in records]
     ppl_ratios = [r.get("ppl_ratio") for r in records]
     sae_shifts = [r.get("sae_shift") for r in records]
-    sae_topk_changes = [r.get("sae_topk_change") for r in records]
+    # New runs record both local (gate-relevant) and global (telemetry)
+    # top-K change. Old runs only have sae_topk_change → treat that as
+    # local for back-compat.
+    sae_topk_changes = [
+        r.get("sae_topk_change_local",
+              r.get("sae_topk_change"))
+        for r in records
+    ]
+    sae_topk_changes_global = [
+        r.get("sae_topk_change_global") for r in records
+    ]
     op_counter: Counter = Counter()
     for r in records:
         for t in r.get("op_types", []):
@@ -101,19 +128,11 @@ def summarise_one_N(records: List[Dict]) -> Dict:
     ppl_pcts = percentiles(ppl_ratios, [0.25, 0.50, 0.75, 0.95])
     sae_pcts = percentiles(sae_shifts, [0.05, 0.25, 0.50, 0.75, 0.95])
     topk_pcts = percentiles(sae_topk_changes, [0.05, 0.25, 0.50, 0.75, 0.95])
-    # Bucket the discrete topk_change values: 0 / 1 / 2-3 / 4+
-    topk_buckets = {"=0": 0, "=1": 0, "2-3": 0, "4+": 0, "unknown": 0}
-    for v in sae_topk_changes:
-        if v is None:
-            topk_buckets["unknown"] += 1
-        elif v == 0:
-            topk_buckets["=0"] += 1
-        elif v == 1:
-            topk_buckets["=1"] += 1
-        elif v <= 3:
-            topk_buckets["2-3"] += 1
-        else:
-            topk_buckets["4+"] += 1
+    topk_g_pcts = percentiles(
+        sae_topk_changes_global, [0.05, 0.25, 0.50, 0.75, 0.95],
+    )
+    topk_buckets = _bucketed_change(sae_topk_changes)
+    topk_g_buckets = _bucketed_change(sae_topk_changes_global)
     return {
         "n_records": n_total,
         "slor_mean": mean(slor_drops),
@@ -134,13 +153,19 @@ def summarise_one_N(records: List[Dict]) -> Dict:
         "sae_p50": sae_pcts[2],
         "sae_p75": sae_pcts[3],
         "sae_p95": sae_pcts[4],
-        # Top-K identity-change (new SAE lower-bound metric)
+        # Top-K identity-change — LOCAL pool over edited tokens (gate).
         "topk_mean":  mean(sae_topk_changes),
         "topk_p25":   topk_pcts[1],
         "topk_p50":   topk_pcts[2],
         "topk_p75":   topk_pcts[3],
         "topk_p95":   topk_pcts[4],
         "topk_bucket": topk_buckets,
+        # Global pool, all positions — telemetry / diagnostic only.
+        "topk_global_mean": mean(sae_topk_changes_global),
+        "topk_global_p50":  topk_g_pcts[2],
+        "topk_global_p75":  topk_g_pcts[3],
+        "topk_global_p95":  topk_g_pcts[4],
+        "topk_global_bucket": topk_g_buckets,
         "op_counts": dict(op_counter),
     }
 
@@ -168,7 +193,11 @@ def simulate_gate_yield(
     r_slor_inf = r_slor_drop = r_sae_topk = 0
     for r in records:
         slor_drop = r.get("slor_drop")
-        topk_change = r.get("sae_topk_change")
+        # Prefer the local (gate-relevant) value; fall back to the older
+        # field name so reports of pre-local-gate runs still work.
+        topk_change = r.get(
+            "sae_topk_change_local", r.get("sae_topk_change"),
+        )
         if slor_drop is None or not math.isfinite(slor_drop):
             r_slor_inf += 1
             continue
@@ -277,9 +306,11 @@ def render_md(
         )
 
     # Top-K identity-change distribution (the SAE gate metric)
-    out.append("\n## Top-K SAE feature identity change per N\n")
-    out.append("How many of the top-K features differ between top_K(X) and top_K(X'). "
-               "0 = activation pattern unchanged (rejected by sae_min); K = completely replaced.\n")
+    out.append("\n## Top-K SAE feature identity change per N (LOCAL — gate signal)\n")
+    out.append("Pool-max restricted to tokens overlapping edited char ranges. "
+               "How many of the top-K local features differ between X and X'. "
+               "0 = activation pattern at the edit sites unchanged (rejected by "
+               "sae_min); K = completely replaced.\n")
     out.append("| N | records | mean | p25 | p50 | p75 | p95 | =0 | =1 | 2-3 | 4+ |")
     out.append("|---|---------|------|-----|-----|-----|-----|-----|-----|-----|-----|")
     for row in rows:
@@ -290,6 +321,23 @@ def render_md(
             f"{s['topk_mean']:.2f} | {s['topk_p25']:.1f} | {s['topk_p50']:.1f} | "
             f"{s['topk_p75']:.1f} | {s['topk_p95']:.1f} | "
             f"{b['=0']} | {b['=1']} | {b['2-3']} | {b['4+']} |"
+        )
+
+    # Global top-K change (diagnostic). Shows whether global pool-max top-K
+    # would have been stable (the case that motivated the switch to local).
+    out.append("\n## Top-K SAE feature identity change per N (GLOBAL — telemetry only)\n")
+    out.append("Pool-max over ALL token positions. Provided so historical K=10 "
+               "global numbers stay reproducible; not used by the gate.\n")
+    out.append("| N | records | mean | p50 | p75 | p95 | =0 | =1 | 2-3 | 4+ |")
+    out.append("|---|---------|------|-----|-----|-----|-----|-----|-----|-----|")
+    for row in rows:
+        s = row["summary"]
+        bg = s["topk_global_bucket"]
+        out.append(
+            f"| {row['N']} | {s['n_records']} | "
+            f"{s['topk_global_mean']:.2f} | {s['topk_global_p50']:.1f} | "
+            f"{s['topk_global_p75']:.1f} | {s['topk_global_p95']:.1f} | "
+            f"{bg['=0']} | {bg['=1']} | {bg['2-3']} | {bg['4+']} |"
         )
 
     # Default gate yields
@@ -450,13 +498,15 @@ def main():
     # Console summary
     print()
     print("Per-N summary:")
-    print(f"  {'N':>3} | {'records':>7} | {'SLOR p50':>9} | {'topK p50':>8} | "
+    print(f"  {'N':>3} | {'records':>7} | {'SLOR p50':>9} | "
+          f"{'topK(loc) p50':>13} | {'topK(glob) p50':>14} | "
           f"{'PPL p50':>8} | {'shift p50':>9} | {'yield':>7}")
     for row in rows:
         s = row["summary"]
         g = row["gate_default"]
         print(f"  {row['N']:>3} | {s['n_records']:>7} | "
-              f"{s['slor_p50']:>9.3f} | {s['topk_p50']:>8.1f} | "
+              f"{s['slor_p50']:>9.3f} | {s['topk_p50']:>13.1f} | "
+              f"{s['topk_global_p50']:>14.1f} | "
               f"{s['ppl_p50']:>8.3f} | {s['sae_p50']:>9.3f} | "
               f"{g['pass_frac']*100:>6.1f}%")
 

@@ -412,23 +412,106 @@ def upos_priority_for_words(
 
 
 # ---------------------------------------------------------------------------
-# SAE pool-max top-K helper
+# SAE pool-max top-K helpers
+#
+# We split the work into:
+#   (1) sae_encode_with_offsets: tokenize + forward + SAE encode once, return
+#       (offsets, z[seq_len, d_sae]). This is the expensive step.
+#   (2) sae_global_pool_topk: max-pool z over ALL positions → top-K (used
+#       for the downstream SAE conditioning passed to the editor and for the
+#       global L2 shift telemetry).
+#   (3) sae_local_topk_at_char_ranges: max-pool z over ONLY tokens that
+#       overlap a given list of (char_start, char_end) ranges → top-K set.
+#       This is the gate signal: "did the SAE features at edited positions
+#       change?" The empirical issue we hit at K=10 was that global top-K
+#       is dominated by content-independent features (BOS/EOS/punctuation/
+#       language id) whose pool-max is taken at unedited positions, so
+#       local edits do not flip global top-K. Restricting the pool to
+#       edited positions makes the gate sensitive to those edits.
 # ---------------------------------------------------------------------------
+@torch.no_grad()
+def sae_encode_with_offsets(
+    stage: Stage, text: str,
+) -> Tuple[List[Tuple[int, int]], torch.Tensor]:
+    """Tokenize `text`, run the SAE backbone, and return (offsets, z).
+
+    `offsets[i] = (char_start, char_end)` for token i, computed by the
+    SAE's base-Gemma tokenizer (NOT the LLM2Vec tokenizer). Used to
+    locate edited regions by char range. `z` has shape [seq_len, d_sae].
+    """
+    enc = stage.extractor.llm_tokenizer(
+        text, return_tensors="pt", truncation=True, max_length=256,
+        return_offsets_mapping=True, add_special_tokens=True,
+    )
+    offsets = [tuple(o) for o in enc["offset_mapping"][0].tolist()]
+    enc_input = {k: v.to(stage.device) for k, v in enc.items()
+                 if k in ("input_ids", "attention_mask")}
+    out = stage.extractor.llm(
+        **enc_input, output_hidden_states=True, use_cache=False,
+    )
+    h = out.hidden_states[stage.extractor.layer_idx][0]
+    z = stage.extractor.sae.encode(h.to(stage.extractor.sae.W_enc.dtype))
+    return offsets, z
+
+
+def sae_global_pool_topk(
+    stage: Stage, z: torch.Tensor,
+) -> Tuple[List[int], List[float]]:
+    """Global max-pool top-K (matches the historical behavior used for the
+    z_X_topk conditioning fed into the editor)."""
+    sparse = stage.extractor.pool_max_topk(z, stage.k_train)
+    nz = (sparse > 0).nonzero(as_tuple=True)[0]
+    return nz.tolist(), sparse[nz].cpu().float().tolist()
+
+
+def _char_ranges_to_token_positions(
+    offsets: List[Tuple[int, int]], char_ranges: List[Tuple[int, int]],
+) -> List[int]:
+    """Return the list of token indices that overlap any (cs, ce) range.
+
+    Special tokens whose offset is (0, 0) are skipped (BOS/EOS pad).
+    """
+    pos: Set[int] = set()
+    for (cs, ce) in char_ranges:
+        if ce <= cs:
+            continue
+        for ti, (ts, te) in enumerate(offsets):
+            if ts == 0 and te == 0:
+                continue
+            if te <= cs or ts >= ce:
+                continue
+            pos.add(ti)
+    return sorted(pos)
+
+
+def sae_local_topk_at_char_ranges(
+    z: torch.Tensor, offsets: List[Tuple[int, int]],
+    char_ranges: List[Tuple[int, int]], k: int,
+) -> Set[int]:
+    """Pool z over the tokens that overlap `char_ranges`, return top-K
+    feature ids by that pooled activation. Empty if no positions match.
+    """
+    if k <= 0 or not char_ranges:
+        return set()
+    positions = _char_ranges_to_token_positions(offsets, char_ranges)
+    if not positions:
+        return set()
+    pos_idx = torch.tensor(positions, device=z.device, dtype=torch.long)
+    z_restricted = z.index_select(0, pos_idx)
+    z_pooled, _ = z_restricted.max(dim=0)
+    k_eff = min(k, z_pooled.numel())
+    vals, ids = z_pooled.topk(k_eff)
+    return {int(f) for v, f in zip(vals.tolist(), ids.tolist()) if v > 0}
+
+
 @torch.no_grad()
 def sae_pool_max_topk_from_text(
     stage: Stage, text: str,
 ) -> Tuple[List[int], List[float]]:
-    enc = stage.extractor.llm_tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=256,
-    ).to(stage.device)
-    out = stage.extractor.llm(
-        **enc, output_hidden_states=True, use_cache=False,
-    )
-    h = out.hidden_states[stage.extractor.layer_idx][0]
-    z = stage.extractor.sae.encode(h.to(stage.extractor.sae.W_enc.dtype))
-    sparse = stage.extractor.pool_max_topk(z, stage.k_train)
-    nz = (sparse > 0).nonzero(as_tuple=True)[0]
-    return nz.tolist(), sparse[nz].cpu().float().tolist()
+    """Backwards-compatible wrapper used outside finalize_sample
+    (e.g. precompute_sae paths)."""
+    _, z = sae_encode_with_offsets(stage, text)
+    return sae_global_pool_topk(stage, z)
 
 
 def topk_records(feature_ids: List[int], values: List[float]) -> List[Dict]:
@@ -1161,6 +1244,59 @@ def sample_compound(
     return ops, ""
 
 
+def derive_edit_char_ranges(
+    ops: List[OpSpec], final_pos: Dict[int, int],
+    text: str, xp_text: str, words: List[Tuple[str, int, int]],
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Return (x_edit_char_ranges, xp_edit_char_ranges).
+
+    Used to restrict the SAE gate signal to "the SAE features at edited
+    positions". For each op:
+      REPL: X = original-word span;  X' = replacement payload span.
+      INS:  X = original-word span;  X' = [INS] marker span.
+      DEL:  X = 1-char window around the insertion anchor (zero-width edit
+            on X side); X' = inserted payload span.
+
+    The X side for DEL ops is a small window because the deletion has no
+    extent in X — but anchoring at the gap captures the immediate
+    syntactic context where the edit happens.
+    """
+    x_ranges: List[Tuple[int, int]] = []
+    xp_ranges: List[Tuple[int, int]] = []
+    for idx, op in enumerate(ops):
+        if op.op_type == "repl":
+            cs = words[op.word_start][1]
+            ce = words[op.word_end - 1][2]
+            x_ranges.append((cs, ce))
+            ps = final_pos[idx]
+            pe = ps + len(op.payload or "")
+            xp_ranges.append((ps, pe))
+        elif op.op_type == "ins":
+            cs = words[op.word_start][1]
+            ce = words[op.word_end - 1][2]
+            x_ranges.append((cs, ce))
+            ps = final_pos[idx]
+            # The [INS] marker text in xp_text starts at final_pos[idx]; the
+            # marker length is fixed ("[INS]"). Hard-code rather than depending
+            # on tokenizer specials to avoid a circular dep.
+            xp_ranges.append((ps, ps + len("[INS]")))
+        elif op.op_type == "del":
+            # X-side anchor: 1-char window centered on the gap. Clamp to text.
+            if op.word_start < len(words):
+                anchor = words[op.word_start][1]
+            else:
+                anchor = len(text)
+            cs_win = max(0, anchor - 1)
+            ce_win = min(len(text), anchor + 1)
+            if cs_win < ce_win:
+                x_ranges.append((cs_win, ce_win))
+            ps = final_pos[idx]
+            pe = ps + len(op.payload or "")
+            if pe > ps:
+                xp_ranges.append((ps, pe))
+    return x_ranges, xp_ranges
+
+
 def build_compound_sample(
     stage: Stage, text: str, ops: List[OpSpec],
 ) -> Tuple[Optional[Dict], str]:
@@ -1200,6 +1336,10 @@ def build_compound_sample(
     if gold is None:
         return None, "gold_build_failed"
 
+    x_edit_char_ranges, xp_edit_char_ranges = derive_edit_char_ranges(
+        ops, final_pos, text, xp_text, words,
+    )
+
     sample = {
         "x_token_ids": x_ids,
         "x_prime_token_ids": xp_ids,
@@ -1212,6 +1352,8 @@ def build_compound_sample(
         "N_total": len(ops),
         "x_text": text,
         "x_prime_text": xp_text,
+        "_x_edit_char_ranges": x_edit_char_ranges,
+        "_xp_edit_char_ranges": xp_edit_char_ranges,
     }
     return sample, ""
 
@@ -1310,19 +1452,51 @@ def finalize_sample(
         else:
             ppl_ratio = ppl_corr / ppl_clean
 
-    fX, vX = sae_pool_max_topk_from_text(stage, x_text)
-    fXp, vXp = sae_pool_max_topk_from_text(stage, xp_text)
+    # One SAE forward per text, then derive both global and local pools
+    # from the same z. Global is used for the downstream conditioning and
+    # L2 shift telemetry; local (= pool-max over tokens that overlap an
+    # edited char range) is what the SAE gate decides on.
+    offsets_X, z_X = sae_encode_with_offsets(stage, x_text)
+    offsets_Xp, z_Xp = sae_encode_with_offsets(stage, xp_text)
+    fX, vX = sae_global_pool_topk(stage, z_X)
+    fXp, vXp = sae_global_pool_topk(stage, z_Xp)
     shift = sae_l2_shift(fX, vX, fXp, vXp)
 
     # Top-K SAE feature identity diff (lower bound).
     topk_size = int(args.sae_min_topk_size)
-    topk_X = topk_feature_set(fX, vX, topk_size)
-    topk_Xp = topk_feature_set(fXp, vXp, topk_size)
-    topk_overlap = len(topk_X & topk_Xp)
-    # `topk_change` = how many features dropped out of the top-K (== how
-    # many new ones came in). 0 means the top-K activation set is
-    # identical; topk_size means it was completely replaced.
-    topk_change = max(len(topk_X), len(topk_Xp)) - topk_overlap
+
+    # Global top-K change (for telemetry / back-compat with old reports).
+    topk_X_global = topk_feature_set(fX, vX, topk_size)
+    topk_Xp_global = topk_feature_set(fXp, vXp, topk_size)
+    topk_overlap_global = len(topk_X_global & topk_Xp_global)
+    topk_change_global = (
+        max(len(topk_X_global), len(topk_Xp_global)) - topk_overlap_global
+    )
+
+    # Local top-K change (the gate). Falls back to global when no edit
+    # char ranges are available (identity sample, or compound build that
+    # did not populate the ranges).
+    x_ranges = sample.get("_x_edit_char_ranges", [])
+    xp_ranges = sample.get("_xp_edit_char_ranges", [])
+    if x_ranges or xp_ranges:
+        topk_X_local = sae_local_topk_at_char_ranges(
+            z_X, offsets_X, x_ranges, topk_size,
+        )
+        topk_Xp_local = sae_local_topk_at_char_ranges(
+            z_Xp, offsets_Xp, xp_ranges, topk_size,
+        )
+        topk_overlap_local = len(topk_X_local & topk_Xp_local)
+        topk_change_local = (
+            max(len(topk_X_local), len(topk_Xp_local)) - topk_overlap_local
+        )
+        used_local = True
+    else:
+        topk_change_local = topk_change_global
+        used_local = False
+
+    # The gate uses the local change. `topk_change` (the value referenced
+    # by downstream tools / the JSONL schema) reflects the gate signal.
+    topk_change = topk_change_local
 
     slor_drop_max, sae_min_topk_change = gate_thresholds(N, args)
 
@@ -1345,7 +1519,14 @@ def finalize_sample(
             # SAE
             "sae_shift": shift,                           # telemetry only
             "sae_topk_size": topk_size,
-            "sae_topk_change": topk_change,
+            # The gate-relevant signal: pool-max restricted to tokens
+            # overlapping edited char ranges.
+            "sae_topk_change": topk_change_local,
+            "sae_topk_change_local": topk_change_local,
+            # Global pool-max (all positions). Kept so the legacy K=10
+            # comparison in old runs is still reproducible.
+            "sae_topk_change_global": topk_change_global,
+            "sae_topk_used_local": used_local,
             "sae_min_topk_change_at_N": sae_min_topk_change,
         }) + "\n")
 
@@ -1359,6 +1540,8 @@ def finalize_sample(
 
     sample.pop("x_text", None)
     sample.pop("x_prime_text", None)
+    sample.pop("_x_edit_char_ranges", None)
+    sample.pop("_xp_edit_char_ranges", None)
     sample.update({
         "source_sent_id": source_id,
         "z_X_topk": topk_records(fX, vX),
@@ -1374,7 +1557,10 @@ def finalize_sample(
             "ppl_ratio":   ppl_ratio,
             "sae_shift_l2":  shift,
             "sae_topk_size": topk_size,
-            "sae_topk_change": topk_change,
+            "sae_topk_change": topk_change_local,
+            "sae_topk_change_local":  topk_change_local,
+            "sae_topk_change_global": topk_change_global,
+            "sae_topk_used_local": used_local,
             "sae_min_topk_change_at_N": sae_min_topk_change,
         },
     })
