@@ -403,7 +403,8 @@ Compound corruption layers multiple ops on a single clean sentence by composing 
 2. Sample N ~ truncated geometric (p ≈ 0.4), capped at N_MAX (default 5).
    N=0 is identity. N=1 is single-op. N ≥ 2 is multi-op compound.
 3. Sample op types op_1..op_N i.i.d. from {REPL, INS, DEL} with weights
-   (0.55, 0.25, 0.20).
+   (0.70, 0.18, 0.12) — calibrated to the LinguaLens English op-type
+   ratio (see `runs/lingualens_token_diff.md`).
 4. Assign each op a non-overlapping word span on X. INS spans are drawn
    with the priority bias of §6.2.3. REPL and DEL spans use uniform
    random word positions (REPL relies on MLM top-K for substitution
@@ -472,12 +473,12 @@ A single end-to-end training phase trains the editor and the tagger on the same 
 
 | Bucket | Probability | Source |
 | --- | --- | --- |
-| Identity (N=0) | 10% | clean Dolma sentence, empty conditioning; KEEP-only tagger gold |
-| Single-op (N=1) | 15% | one of REPL / INS / DEL with equal weight; clean tagger op-discrimination |
-| Compound N=2..3 | 45% | §6.2.5 with N drawn from the truncated geometric restricted to {2, 3} |
-| Compound N=4..N_MAX | 30% | §6.2.5 with N ≥ 4 |
+| Identity (N=0) | 5% | clean Dolma sentence, empty conditioning; KEEP-only tagger gold |
+| Single-op (N=1) | 55% | one of REPL / INS / DEL with the bucket-N=1 weight; clean tagger op-discrimination |
+| Compound N=2..3 | 35% | §6.2.5 with N drawn from the truncated geometric restricted to {2, 3} |
+| Compound N=4..N_MAX | 5% | §6.2.5 with N ≥ 4 |
 
-Compound samples dominate because the inference-time setting is compositional: real minimal-pair edits combine REPL, INS, and DEL at multiple positions simultaneously. Single-op and identity samples are retained as a small fraction because they give the tagger a clean per-class signal and the editor a low-noise restoration target — useful especially early in training.
+These weights are calibrated against the **LinguaLens English minimal-pair `n_hunks` distribution** (see `scripts/lingualens_token_diff.py` and `runs/lingualens_token_diff.md`), which finds 66.6% N=1 / 28.9% N=2 / 3.6% N=3 / 0.1% N≥4 — minimal pairs in the wild are dominated by single substitutions and short two-op compounds, not by deep compounds. We bias slightly more toward N=2-3 than the empirical 32.5% (35%) and retain a 5% N≥4 long-tail bucket so the editor still sees occasional harder cases. The earlier (10 / 15 / 45 / 30) split, which assumed compositionality was the dominant inference-time regime, over-trained on compound N=4+ at ~300× the empirical rate.
 
 Bucket selection is implemented as **rejection on N after sampling**: a fresh sentence is run through the compound generator, the realised N determines the bucket, and the sample is accepted into the stream if the bucket's per-N quota has not yet been filled. Per-bucket and per-N accept rates are logged in `meta.json`.
 
@@ -486,7 +487,7 @@ Bucket selection is implemented as **rejection on N after sampling**: a fresh se
 | Variable | Range | Distribution |
 | --- | --- | --- |
 | `N_total` per sample | 0..N_MAX (default 5) | truncated geometric, p ≈ 0.4 |
-| op type within compound | {REPL, INS, DEL} | (0.55, 0.25, 0.20) |
+| op type within compound | {REPL, INS, DEL} | (0.70, 0.18, 0.12) — calibrated to LinguaLens English op-type ratio |
 | `p_high` (INS HIGH-priority bias) | 0.85 | flat |
 | `ins_span_length` per INS op | 1..L_MAX | log-uniform |
 | `del_span_length` per DEL op | 1..L_MAX_DEL | log-uniform (typically L_MAX_DEL ≤ L_MAX) |
@@ -700,19 +701,24 @@ l_max_sent: 256
 
 # corruption — sample bucket mix (§6.3.1)
 sample_buckets:
-  identity:           0.10        # N=0; empty conditioning; KEEP-only tagger gold
-  single_op:          0.15        # N=1; uniform over {REPL, INS, DEL}
-  compound_2_3:       0.45        # N ∈ {2, 3}
-  compound_4_plus:    0.30        # N ∈ {4..N_MAX}
+  # Calibrated to LinguaLens English n_hunks distribution (see
+  # scripts/lingualens_token_diff.py). Real minimal pairs are 67% N=1,
+  # 29% N=2, 3.6% N=3, 0.1% N>=4 — single substitutions dominate.
+  identity:           0.05        # N=0; empty conditioning; KEEP-only tagger gold
+  single_op:          0.55        # N=1; one of {REPL, INS, DEL}
+  compound_2_3:       0.35        # N ∈ {2, 3}
+  compound_4_plus:    0.05        # N ∈ {4..N_MAX}; small long-tail bucket
 
 # compound op sampling (§6.2.5)
 compound:
   n_max:                 5        # cap on op count per sample
   n_distribution_p:      0.4      # truncated geometric over {0..N_MAX}
   op_weights:                     # per-op type within a compound
-    repl:                0.55
-    ins:                 0.25
-    del:                 0.20
+    # Calibrated to LinguaLens English op-type ratio (REPL 70.0% /
+    # INS 18.2% / DEL 11.8%).
+    repl:                0.70
+    ins:                 0.18
+    del:                 0.12
   k_budget:              6        # first-accept rejection attempts per source sentence
   apply_order:           "right_to_left"
 

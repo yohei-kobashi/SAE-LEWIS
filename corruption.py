@@ -148,19 +148,30 @@ def parse_args():
     # Sample bucket weights (§6.3.1). Buckets are determined post-hoc by
     # realised N from the compound generator. We rejection-sample on N to
     # match the target weights.
-    p.add_argument("--p-identity", type=float, default=0.10)
-    p.add_argument("--p-single-op", type=float, default=0.15)
-    p.add_argument("--p-compound-2-3", type=float, default=0.45)
-    p.add_argument("--p-compound-4-plus", type=float, default=0.30)
+    # Bucket weights calibrated to the LinguaLens English minimal-pair N
+    # distribution (n_hunks histogram from scripts/lingualens_token_diff.py):
+    # 66.6% N=1, 28.9% N=2, 3.6% N=3, 0.1% N>=4. We bias slightly more
+    # toward N=2-3 than the empirical 32.5% (35%) and keep a small
+    # N>=4 long-tail bucket (5%) so the editor still sees the
+    # occasional harder compound.
+    p.add_argument("--p-identity",        type=float, default=0.05)
+    p.add_argument("--p-single-op",       type=float, default=0.55)
+    p.add_argument("--p-compound-2-3",    type=float, default=0.35)
+    p.add_argument("--p-compound-4-plus", type=float, default=0.05)
 
     # Compound op sampling (§6.2.5)
     p.add_argument("--n-max", type=int, default=5,
                    help="Cap on op count per compound sample.")
     p.add_argument("--n-distribution-p", type=float, default=0.4,
                    help="Truncated geometric parameter for N over {0..N_MAX}.")
-    p.add_argument("--op-weight-repl", type=float, default=0.55)
-    p.add_argument("--op-weight-ins", type=float, default=0.25)
-    p.add_argument("--op-weight-del", type=float, default=0.20)
+    # Op weights calibrated to the LinguaLens English op-type histogram
+    # (REPL 70.0% / INS 18.2% / DEL 11.8%). Minimal-pair edits skew
+    # toward word substitutions (passivisation, synonym swap, etc.);
+    # INS / DEL are less common than the previous (0.55, 0.25, 0.20)
+    # default assumed.
+    p.add_argument("--op-weight-repl", type=float, default=0.70)
+    p.add_argument("--op-weight-ins",  type=float, default=0.18)
+    p.add_argument("--op-weight-del",  type=float, default=0.12)
     p.add_argument("--op-position-max-retries", type=int, default=20,
                    help="Per-op attempts to find a non-conflicting position "
                         "before giving up on the compound.")
