@@ -85,6 +85,13 @@ def parse_args():
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    # Resume: default ON. HF Trainer auto-detects the latest checkpoint-*
+    # directory in --output-dir (model + optim + sched + RNG state).
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="Default. Resume from the latest checkpoint-* under "
+                        "--output-dir if one exists.")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="Ignore any existing checkpoint-* and start fresh.")
     return p.parse_args()
 
 
@@ -255,10 +262,19 @@ def main():
     # `forward(input_ids, labels=labels)` returns the +1-shifted CE loss,
     # which is the MNTP objective. No wrapper that would re-compute the
     # loss in a non-shifted way.
-    Trainer(
+    trainer = Trainer(
         model=model, args=targs,
         train_dataset=dataset, data_collator=collator,
-    ).train()
+    )
+    # HF Trainer auto-detects the latest checkpoint-* sub-directory under
+    # output_dir when resume_from_checkpoint=True; if there is no
+    # checkpoint it starts fresh, so the flag is safe even on a clean run.
+    resume_arg = True if args.resume and any(
+        Path(args.output_dir).glob("checkpoint-*")
+    ) else False
+    if resume_arg:
+        print(f"[llm2vec] RESUME: continuing from latest checkpoint-* in {args.output_dir}")
+    trainer.train(resume_from_checkpoint=resume_arg)
 
     out_dir = Path(args.output_dir)
     model.save_pretrained(out_dir, safe_serialization=False)

@@ -17,12 +17,17 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 from data import CorruptionCollator, CorruptionDataset
 from editor import load_editor_from_checkpoint
 from intervene import diff_to_sparse
 from length_head import LengthHead
+from resume_utils import (
+    add_resume_args, find_latest_ckpt,
+    load_train_state, save_train_state,
+)
 
 
 def parse_args():
@@ -46,6 +51,7 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
+    add_resume_args(p)
     return p.parse_args()
 
 
@@ -89,8 +95,25 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0
+    # Resume: length_head uses raw state_dict (no wrapper class).
+    if args.resume:
+        latest = find_latest_ckpt(out_dir, "length")
+        if latest is not None:
+            ckpt_path, ckpt_step = latest
+            print(f"[length] RESUME: loading {ckpt_path} (step {ckpt_step})")
+            head.load_state_dict(torch.load(
+                str(ckpt_path), map_location=args.device, weights_only=False,
+            ))
+            restored = load_train_state(ckpt_path, optim, sched, device=args.device)
+            step = restored if restored is not None else ckpt_step
+            if step >= args.max_steps:
+                print(f"[length] RESUME: already past max_steps ({step} >= {args.max_steps}); nothing to do")
+                torch.save(head.state_dict(), out_dir / "length-final.pt")
+                return
     loss_window = []
     empty_batches = 0
+    pbar = tqdm(total=args.max_steps, initial=step,
+                desc="[length]", unit="step", dynamic_ncols=True)
     # If the corruption cache has zero (or near-zero) INS yield, every batch
     # we pull will fail the `gold_length > 0` filter and the loop never
     # increments `step`. Cap consecutive empties so this case fails loudly
@@ -171,10 +194,14 @@ def main():
             print(f"[length] step={step} loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e}")
 
         if step > 0 and step % args.save_steps == 0:
-            torch.save(head.state_dict(), out_dir / f"length-step{step}.pt")
+            ckpt = out_dir / f"length-step{step}.pt"
+            torch.save(head.state_dict(), ckpt)
+            save_train_state(ckpt, optim, sched, step)
 
         step += 1
+        pbar.update(1)
 
+    pbar.close()
     torch.save(head.state_dict(), out_dir / "length-final.pt")
     print(f"[length] done at step {step}")
 

@@ -13,11 +13,16 @@ from typing import Dict, Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 from data import CorruptionCollator, CorruptionDataset
 from intervene import diff_to_sparse
 from lewis_ops import NUM_OPS, OP_NAMES
+from resume_utils import (
+    add_resume_args, find_latest_ckpt,
+    load_train_state, save_train_state,
+)
 from tagger import SAETagger
 
 
@@ -46,6 +51,7 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
+    add_resume_args(p)
     return p.parse_args()
 
 
@@ -118,8 +124,32 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     step = 0
-    proj_a_unfrozen = False
+
+    # Resume from the latest <out_dir>/tagger-step{N}.pt if requested.
+    # The model class checkpoints ONLY the trainable params (the LLM2Vec
+    # backbone is reloaded fresh), so we go through `load_trainable`.
+    # Optim / sched / step / RNG come from a sidecar state file.
+    if args.resume:
+        latest = find_latest_ckpt(out_dir, "tagger")
+        if latest is not None:
+            ckpt_path, ckpt_step = latest
+            print(f"[tagger] RESUME: loading {ckpt_path} (step {ckpt_step})")
+            blob = torch.load(str(ckpt_path), map_location=args.device, weights_only=False)
+            tagger.load_trainable(blob["trainable"])
+            restored = load_train_state(ckpt_path, optim, sched, device=args.device)
+            step = restored if restored is not None else ckpt_step
+            if step >= args.max_steps:
+                print(f"[tagger] RESUME: already past max_steps ({step} >= {args.max_steps}); nothing to do")
+                tagger.save(str(out_dir / "tagger-final.pt"))
+                return
+
+    proj_a_unfrozen = step >= args.proj_a_freeze_steps
+    if proj_a_unfrozen:
+        for p in tagger.proj_a.parameters():
+            p.requires_grad_(True)
     loss_window = []
+    pbar = tqdm(total=args.max_steps, initial=step,
+                desc="[tagger]", unit="step", dynamic_ncols=True)
 
     for batch in loader:
         if step >= args.max_steps:
@@ -170,10 +200,13 @@ def main():
         if step > 0 and step % args.save_steps == 0:
             ckpt = out_dir / f"tagger-step{step}.pt"
             tagger.save(str(ckpt))
+            save_train_state(ckpt, optim, sched, step)
             print(f"[tagger] saved {ckpt}")
 
         step += 1
+        pbar.update(1)
 
+    pbar.close()
     tagger.save(str(out_dir / "tagger-final.pt"))
     print(f"[tagger] done at step {step}")
 

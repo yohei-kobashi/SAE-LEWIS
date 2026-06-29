@@ -20,11 +20,16 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 from data import CorruptionCollator, CorruptionDataset
 from editor import SAEEditor
 from intervene import diff_to_sparse
+from resume_utils import (
+    add_resume_args, find_latest_ckpt,
+    load_train_state, save_train_state,
+)
 
 
 def parse_args():
@@ -51,6 +56,7 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
+    add_resume_args(p)
     return p.parse_args()
 
 
@@ -101,8 +107,27 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     step = 0
-    proj_a_unfrozen = False
+    if args.resume:
+        latest = find_latest_ckpt(out_dir, "editor")
+        if latest is not None:
+            ckpt_path, ckpt_step = latest
+            print(f"[phase-a] RESUME: loading {ckpt_path} (step {ckpt_step})")
+            blob = torch.load(str(ckpt_path), map_location=args.device, weights_only=False)
+            editor.load_trainable(blob["trainable"])
+            restored = load_train_state(ckpt_path, optim, sched, device=args.device)
+            step = restored if restored is not None else ckpt_step
+            if step >= args.max_steps:
+                print(f"[phase-a] RESUME: already past max_steps ({step} >= {args.max_steps}); nothing to do")
+                editor.save(str(out_dir / "editor-final.pt"))
+                return
+
+    proj_a_unfrozen = step >= args.proj_a_freeze_steps
+    if proj_a_unfrozen:
+        for p in editor.proj_a.parameters():
+            p.requires_grad_(True)
     loss_window = []
+    pbar = tqdm(total=args.max_steps, initial=step,
+                desc="[phase-a]", unit="step", dynamic_ncols=True)
 
     for batch in loader:
         if step >= args.max_steps:
@@ -157,10 +182,13 @@ def main():
         if step > 0 and step % args.save_steps == 0:
             ckpt = out_dir / f"editor-step{step}.pt"
             editor.save(str(ckpt))
+            save_train_state(ckpt, optim, sched, step)
             print(f"[phase-a] saved {ckpt}")
 
         step += 1
+        pbar.update(1)
 
+    pbar.close()
     editor.save(str(out_dir / "editor-final.pt"))
     print(f"[phase-a] done at step {step}")
 

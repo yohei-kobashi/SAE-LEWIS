@@ -78,6 +78,7 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, set_seed
 
 from data import download_dolma_shards, iter_dolma_texts, iter_sentences
@@ -265,6 +266,17 @@ def parse_args():
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
+    # Resume: default ON. Counts samples in existing shards under --out-dir,
+    # advances the Dolma stream past the source_sent_id of the last written
+    # sample, and continues writing until target_samples is reached. RNG
+    # state is NOT exactly restored (re-seeded), so the post-resume
+    # sample-by-sample sequence may differ from a fresh run, but the
+    # cumulative distribution is preserved.
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="Default. Resume from existing shards under --out-dir.")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="Ignore existing shards and start fresh "
+                        "(overwrites previous output).")
     return p.parse_args()
 
 
@@ -1769,11 +1781,53 @@ def main():
     reject_reasons: Dict[str, int] = defaultdict(int)
     cur_shard_file = None
 
+    # Resume: count samples in existing shards and skip Dolma sentences to
+    # the last written sample's source_sent_id. New samples land in a
+    # FRESH shard (we never append to a partial shard — keeps gzip
+    # streams atomic).
+    skip_n_sentences = 0
+    if args.resume:
+        existing_shards = sorted(out_dir.glob("shard-*.jsonl.gz"))
+        last_sent_idx = 0
+        for p in existing_shards:
+            try:
+                with gzip.open(p, "rt", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        written += 1
+                        try:
+                            obj = json.loads(line)
+                            sid = obj.get("source_sent_id", "")
+                            if sid.startswith("dolma:s"):
+                                last_sent_idx = max(
+                                    last_sent_idx, int(sid.split("s", 1)[1])
+                                )
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            except (OSError, EOFError):
+                # Last shard may have been interrupted mid-gzip. Skip it
+                # silently — we will overwrite it with a fresh shard.
+                break
+        shard_idx = len(existing_shards)
+        skip_n_sentences = last_sent_idx
+        if written > 0:
+            print(f"[corruption] RESUME: {written} samples in "
+                  f"{shard_idx} shards under {out_dir}; skipping the "
+                  f"first {skip_n_sentences} Dolma sentences and "
+                  f"continuing to shard-{shard_idx:05d}")
+        if written >= args.target_samples:
+            print(f"[corruption] RESUME: already have "
+                  f"{written} >= target {args.target_samples}; nothing to do")
+            return
+        sent_idx = last_sent_idx
+
+    calibration_writer_mode = "at" if args.resume and written > 0 else "wt"
     calibration_writer = None
     if args.calibration_mode:
         cal_path = Path(args.calibration_out) if args.calibration_out else (out_dir / "calibration.jsonl")
         cal_path.parent.mkdir(parents=True, exist_ok=True)
-        calibration_writer = open(cal_path, "wt", encoding="utf-8")
+        calibration_writer = open(cal_path, calibration_writer_mode, encoding="utf-8")
 
     def open_shard():
         nonlocal cur_shard_file, shard_idx
@@ -1782,6 +1836,21 @@ def main():
         shard_idx += 1
 
     open_shard()
+
+    # tqdm progress bar over written/target_samples. initial=written lets
+    # the bar start at the resumed offset.
+    pbar = tqdm(
+        total=args.target_samples, initial=written,
+        desc="[corruption]", unit="sample", dynamic_ncols=True,
+        smoothing=0.05,
+    )
+
+    # Advance the Dolma stream past sentences already represented in the
+    # existing shards (resume) before entering the main loop.
+    if skip_n_sentences > 0:
+        for _ in range(skip_n_sentences):
+            if next(sent_iter, None) is None:
+                break
 
     for sent in sent_iter:
         if written >= args.target_samples:
@@ -1828,6 +1897,7 @@ def main():
             final["bucket"] = bucket
             cur_shard_file.write(json.dumps(final, ensure_ascii=False) + "\n")
             written += 1
+            pbar.update(1)
             bucket_accepts[bucket] += 1
             n_accepts[N] += 1
             if written % args.samples_per_shard == 0 and written < args.target_samples:
@@ -1859,6 +1929,7 @@ def main():
         cur_shard_file.close()
     if calibration_writer is not None:
         calibration_writer.close()
+    pbar.close()
 
     # Final summary
     yield_pct = written / max(1, attempted)

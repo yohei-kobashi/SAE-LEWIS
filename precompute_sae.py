@@ -32,6 +32,7 @@ from typing import List
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 from transformers import set_seed
 
 from data import download_dolma_shards, iter_dolma_texts, iter_sentences
@@ -71,6 +72,16 @@ def parse_args():
     p.add_argument("--max-sentences", type=int, default=None,
                    help="Optional cap on the number of cached sentences.")
     p.add_argument("--seed", type=int, default=42)
+    # Resume is all-or-nothing here: SAE caches use length-prefix binary
+    # files that are awkward to truncate mid-write, so we just skip the
+    # whole stage if meta.json (the last thing written) exists.
+    p.add_argument("--resume", dest="resume", action="store_true", default=True,
+                   help="Default. Skip the entire stage if a previous "
+                        "complete run (meta.json) already exists under "
+                        "--out-dir.")
+    p.add_argument("--no-resume", dest="resume", action="store_false",
+                   help="Ignore any existing cache files and start fresh "
+                        "(overwrites previous output).")
     return p.parse_args()
 
 
@@ -79,6 +90,10 @@ def main():
     set_seed(args.seed)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.resume and (out_dir / "meta.json").exists():
+        print(f"[stage0] RESUME: {out_dir / 'meta.json'} already exists; nothing to do")
+        return
 
     shard_paths = download_dolma_shards(args.data_cache_dir, max_files=args.max_files)
     print(f"[stage0] {len(shard_paths)} Dolma shards")
@@ -159,10 +174,17 @@ def main():
                 sae_doc_offsets.append(cur_tok)
                 n_sents += 1
 
+        pbar = tqdm(
+            total=args.max_sentences, desc="[stage0]",
+            unit="sent", dynamic_ncols=True, smoothing=0.05,
+        )
+        last_logged = 0
         for sent in sent_stream:
             batch.append(sent)
             if len(batch) >= args.batch_size:
                 flush(batch)
+                pbar.update(n_sents - last_logged)
+                last_logged = n_sents
                 batch = []
                 if n_sents % args.log_every == 0:
                     rate = n_sents / max(1e-6, time.time() - t0)
@@ -170,6 +192,8 @@ def main():
             if args.max_sentences is not None and n_sents >= args.max_sentences:
                 break
         flush(batch)
+        pbar.update(n_sents - last_logged)
+        pbar.close()
 
     np.save(paths["text_off"], np.array(text_offsets, dtype=np.int64))
     np.save(paths["sae_doc_off"], np.array(sae_doc_offsets, dtype=np.int64))
