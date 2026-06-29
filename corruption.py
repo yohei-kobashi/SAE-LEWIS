@@ -1507,8 +1507,7 @@ def main():
         unig_sent_iter = iter_sentences(
             unig_text_iter,
             splitter=args.sentence_splitter,
-            min_chars=args.sent_min_chars,
-            max_chars=args.sent_max_chars,
+            min_chars=16, max_chars=2000,
             max_sentences_per_text=args.max_sentences_per_text,
             sample_strategy=args.sentence_sample_strategy,
             seed=args.seed + 7777,   # distinct stream
