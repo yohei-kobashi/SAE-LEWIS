@@ -689,6 +689,13 @@ k_train: 64                       # top-K for SAE pool max in conditioning
 mntp:
   mlm_probability:    0.15          # 15% / 80-10-10 (DataCollatorForLanguageModeling)
   objective:          predict_i_from_h_im1   # +1 shift via GemmaForCausalLM.forward(labels=...)
+  # LR / warmup for FULL fine-tune of Gemma-2B in bf16. The canonical
+  # LLM2Vec recipe uses LoRA + LR=3e-4; we are not, so we run at the
+  # full-FT-stable range. 5e-5 with 500-step warmup blew up at the LR
+  # peak (loss 4.3 → 5.4 then stuck at ≈ 5.0). 1e-5 with 1000-step
+  # warmup keeps the loss curve monotonic-ish through the LR peak.
+  learning_rate:      1e-5
+  warmup_steps:       1000          # ≈ 10% of max_steps; canonical large-warmup config
   bidir_patch:
     attn_implementation: sdpa       # 3-5x faster than eager; Gemma SDPA respects module.is_causal=False + explicit mask
     is_causal:        false         # set on every self-attention module

@@ -299,7 +299,7 @@ else
             --max-files "$DOLMA_MAX_FILES" \
             --output-dir "$LLM2VEC_DIR" \
             --max-steps "$LLM2VEC_STEPS" \
-            --warmup-steps 500 \
+            --warmup-steps 1000 \
             --per-device-batch-size "$LLM2VEC_BATCH" \
             --grad-accum-steps "$LLM2VEC_ACCUM" \
             --save-steps 1000 \

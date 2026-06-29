@@ -76,9 +76,17 @@ def parse_args():
 
     p.add_argument("--per-device-batch-size", type=int, default=8)
     p.add_argument("--grad-accum-steps", type=int, default=4)
-    p.add_argument("--learning-rate", type=float, default=5e-5)
+    # LR / warmup calibrated to the canonical "full fine-tune Gemma-2B
+    # under bf16" stable range. The previous (5e-5, 500-step warmup)
+    # default blew up at the LR peak: loss dipped 5.0 → 4.3 during
+    # warmup, then climbed back to 5.4 the moment the LR hit 5e-5, and
+    # never recovered. 1e-5 with 1000-step warmup keeps the loss
+    # monotonic-ish through the LR peak. Canonical LLM2Vec uses LoRA
+    # + LR=3e-4, which we are NOT doing — full FT requires a much
+    # lower LR.
+    p.add_argument("--learning-rate", type=float, default=1e-5)
     p.add_argument("--max-steps", type=int, default=10000)
-    p.add_argument("--warmup-steps", type=int, default=500)
+    p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--save-steps", type=int, default=1000)
     p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--num-workers", type=int, default=2)
