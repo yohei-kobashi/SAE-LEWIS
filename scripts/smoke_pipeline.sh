@@ -22,6 +22,10 @@
 #   SAE_MAX_SENTS           cap on stage-0 SAE cache size (default: 2000)
 #   LLM2VEC_STEPS           MNTP steps (default: 200)
 #   LLM2VEC_BATCH           per-device batch for MNTP (default: 2)
+#   SIMCSE_STEPS            SimCSE steps (default: 100)
+#   SIMCSE_BATCH            per-device batch for SimCSE (default: 4)
+#   SKIP_SIMCSE             1 → skip the SimCSE stage; downstream consumes
+#                            the MNTP-only dir (default: 0)
 #   CORRUPTION_SAMPLES      stage-2 target sample count (default: 1000)
 #   CORRUPTION_SHARD        samples per corruption shard (default: 500)
 #   TAGGER_STEPS            (default: 200)
@@ -90,6 +94,9 @@ DOLMA_MAX_FILES=${DOLMA_MAX_FILES:-1}
 SAE_MAX_SENTS=${SAE_MAX_SENTS:-2000}
 LLM2VEC_STEPS=${LLM2VEC_STEPS:-200}
 LLM2VEC_BATCH=${LLM2VEC_BATCH:-2}
+SIMCSE_STEPS=${SIMCSE_STEPS:-100}
+SIMCSE_BATCH=${SIMCSE_BATCH:-4}
+SKIP_SIMCSE=${SKIP_SIMCSE:-0}
 CORRUPTION_SAMPLES=${CORRUPTION_SAMPLES:-1000}
 CORRUPTION_SHARD=${CORRUPTION_SHARD:-500}
 TAGGER_STEPS=${TAGGER_STEPS:-200}
@@ -120,6 +127,8 @@ MEASURE_N_MAX=${MEASURE_N_MAX:-5}
 PROD_LLM2VEC_STEPS=10000
 PROD_LLM2VEC_BATCH=8
 PROD_LLM2VEC_ACCUM=4
+PROD_SIMCSE_STEPS=2000
+PROD_SIMCSE_BATCH=32
 PROD_CORRUPTION_SAMPLES=100000
 PROD_TAGGER_STEPS=10000
 PROD_TAGGER_BATCH=8
@@ -158,6 +167,7 @@ trap 'if [[ -n "${GPU_MON_PID:-}" ]]; then kill "$GPU_MON_PID" 2>/dev/null || tr
 DOLMA_CACHE="$RUN_DIR/dolma_cache"
 SAE_CACHE="$RUN_DIR/sae_cache"
 LLM2VEC_DIR="$RUN_DIR/llm2vec"
+SIMCSE_DIR="$RUN_DIR/llm2vec_simcse"
 CORRUPTION_DIR="$RUN_DIR/corruption"
 TAGGER_DIR="$RUN_DIR/tagger"
 EDITOR_DIR="$RUN_DIR/editor"
@@ -166,6 +176,13 @@ LENGTH_DIR="$RUN_DIR/length_head"
 TAGGER_CKPT="$TAGGER_DIR/tagger-final.pt"
 EDITOR_CKPT="$EDITOR_DIR/editor-final.pt"
 LENGTH_CKPT="$LENGTH_DIR/length-final.pt"
+
+# Downstream stages consume the SimCSE output unless SKIP_SIMCSE=1.
+if [[ "$SKIP_SIMCSE" == "1" ]]; then
+    DOWNSTREAM_LLM2VEC_DIR="$LLM2VEC_DIR"
+else
+    DOWNSTREAM_LLM2VEC_DIR="$SIMCSE_DIR"
+fi
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -269,6 +286,7 @@ DEVICE               = $DEVICE        SEED = $SEED
 DOLMA_MAX_FILES      = $DOLMA_MAX_FILES
 SAE_MAX_SENTS        = $SAE_MAX_SENTS
 LLM2VEC_STEPS / BS   = $LLM2VEC_STEPS / $LLM2VEC_BATCH
+SIMCSE_STEPS / BS    = $SIMCSE_STEPS / $SIMCSE_BATCH   (SKIP_SIMCSE=$SKIP_SIMCSE)
 CORRUPTION samples   = $CORRUPTION_SAMPLES   (shard size $CORRUPTION_SHARD)
 TAGGER_STEPS         = $TAGGER_STEPS
 EDITOR_STEPS         = $EDITOR_STEPS
@@ -339,6 +357,36 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# Stage 1b: SimCSE — canonical LLM2Vec Bi+MNTP+SimCSE. Cheap at smoke scale.
+# --------------------------------------------------------------------------- #
+SIMCSE_DONE=0
+if [[ -f "$SIMCSE_DIR/llm2vec_meta.json" ]] && \
+   [[ "$(python -c "import json,sys; print('simcse' in json.load(open('$SIMCSE_DIR/llm2vec_meta.json')))" 2>/dev/null)" == "True" ]]; then
+    SIMCSE_DONE=1
+fi
+if [[ "$SKIP_SIMCSE" == "1" ]]; then
+    skip_stage "01b_train_simcse" "SKIP_SIMCSE=1"
+elif [[ "$SIMCSE_DONE" == "1" ]]; then
+    skip_stage "01b_train_simcse" "exists at $SIMCSE_DIR"
+else
+    run_stage "01b_train_simcse" \
+        python train_simcse.py \
+            --llm2vec-dir "$LLM2VEC_DIR" \
+            --output-dir "$SIMCSE_DIR" \
+            --data-cache-dir "$DOLMA_CACHE" \
+            --max-files "$DOLMA_MAX_FILES" \
+            --max-steps "$SIMCSE_STEPS" \
+            --warmup-steps 10 \
+            --per-device-batch-size "$SIMCSE_BATCH" \
+            --max-seq-length 64 \
+            --save-steps "$SIMCSE_STEPS" \
+            --logging-steps 20 \
+            --num-workers "$NUM_WORKERS" \
+            --device "$DEVICE" \
+            --seed "$SEED"
+fi
+
+# --------------------------------------------------------------------------- #
 # Stage 2: corruption
 # --------------------------------------------------------------------------- #
 CORRUPTION_EXTRA_ARGS=()
@@ -355,7 +403,7 @@ else
             --data-cache-dir "$DOLMA_CACHE" \
             --max-files "$DOLMA_MAX_FILES" \
             --out-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --llm "$LLM" \
             --sae-repo "$SAE_REPO" \
             --sae-path "$SAE_PATH" \
@@ -378,7 +426,7 @@ else
     run_stage "03_train_tagger" \
         python train_tagger.py \
             --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --output-dir "$TAGGER_DIR" \
             --max-steps "$TAGGER_STEPS" \
             --warmup-steps 20 \
@@ -401,7 +449,7 @@ else
     run_stage "04_train_editor_phaseA" \
         python train_editor_phaseA.py \
             --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --output-dir "$EDITOR_DIR" \
             --max-steps "$EDITOR_STEPS" \
             --warmup-steps 20 \
@@ -423,7 +471,7 @@ else
     run_stage "05_train_length_head" \
         python train_length_head.py \
             --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --editor-ckpt "$EDITOR_CKPT" \
             --output-dir "$LENGTH_DIR" \
             --max-steps "$LENGTH_STEPS" \
@@ -441,7 +489,7 @@ fi
 # --------------------------------------------------------------------------- #
 run_stage "06_evaluate" \
     python evaluate_intervention.py \
-        --llm2vec-dir "$LLM2VEC_DIR" \
+        --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
         --tagger-ckpt "$TAGGER_CKPT" \
         --editor-ckpt "$EDITOR_CKPT" \
         --mu "$SAE_CACHE/mu.npy" \
@@ -558,6 +606,7 @@ banner "[smoke] linear extrapolation to production scale"
 cat <<EOF
 Production-scale defaults assumed:
   LLM2Vec MNTP   :  $PROD_LLM2VEC_STEPS steps × batch $PROD_LLM2VEC_BATCH × accum $PROD_LLM2VEC_ACCUM
+  SimCSE         :  $PROD_SIMCSE_STEPS steps × batch $PROD_SIMCSE_BATCH
   Corruption     :  $PROD_CORRUPTION_SAMPLES samples
   Tagger         :  $PROD_TAGGER_STEPS steps × batch $PROD_TAGGER_BATCH
   Editor (Phase A):  $PROD_EDITOR_STEPS steps × batch $PROD_EDITOR_BATCH
@@ -570,6 +619,7 @@ EOF
 echo
 
 llm2vec_sec=$(elapsed_of "01_train_llm2vec")
+simcse_sec=$(elapsed_of  "01b_train_simcse")
 corr_sec=$(elapsed_of    "02_corruption")
 tag_sec=$(elapsed_of     "03_train_tagger")
 ed_sec=$(elapsed_of      "04_train_editor_phaseA")
@@ -579,6 +629,9 @@ llm2vec_ratio=$(awk -v ps="$PROD_LLM2VEC_STEPS" -v pb="$PROD_LLM2VEC_BATCH" \
                     -v pa="$PROD_LLM2VEC_ACCUM" \
                     -v ss="$LLM2VEC_STEPS"     -v sb="$LLM2VEC_BATCH" \
     'BEGIN { print (ps*pb*pa)/(ss*sb*1) }')
+simcse_ratio=$(awk  -v ps="$PROD_SIMCSE_STEPS"  -v pb="$PROD_SIMCSE_BATCH" \
+                    -v ss="$SIMCSE_STEPS"       -v sb="$SIMCSE_BATCH" \
+    'BEGIN { if (ss*sb == 0) print 0; else print (ps*pb)/(ss*sb) }')
 corr_ratio=$(awk    -v p="$PROD_CORRUPTION_SAMPLES" -v s="$CORRUPTION_SAMPLES" \
     'BEGIN { print p/s }')
 tag_ratio=$(awk     -v ps="$PROD_TAGGER_STEPS"  -v pb="$PROD_TAGGER_BATCH" \
@@ -591,18 +644,20 @@ len_ratio=$(awk     -v ps="$PROD_LENGTH_STEPS"  -v pb="$PROD_LENGTH_BATCH" \
                     -v ss="$LENGTH_STEPS"       -v sb="$BATCH_SIZE" \
     'BEGIN { print (ps*pb)/(ss*sb) }')
 
-extrap_row "01_train_llm2vec"      "$llm2vec_sec" "$llm2vec_ratio"
-extrap_row "02_corruption"         "$corr_sec"    "$corr_ratio"
-extrap_row "03_train_tagger"       "$tag_sec"     "$tag_ratio"
-extrap_row "04_train_editor_phaseA" "$ed_sec"     "$ed_ratio"
-extrap_row "05_train_length_head"  "$len_sec"     "$len_ratio"
+extrap_row "01_train_llm2vec"       "$llm2vec_sec" "$llm2vec_ratio"
+extrap_row "01b_train_simcse"       "$simcse_sec"  "$simcse_ratio"
+extrap_row "02_corruption"          "$corr_sec"    "$corr_ratio"
+extrap_row "03_train_tagger"        "$tag_sec"     "$tag_ratio"
+extrap_row "04_train_editor_phaseA" "$ed_sec"      "$ed_ratio"
+extrap_row "05_train_length_head"   "$len_sec"     "$len_ratio"
 
 prod_total=$(awk -v a="$llm2vec_sec" -v ar="$llm2vec_ratio" \
+                 -v as="$simcse_sec" -v asr="$simcse_ratio" \
                  -v b="$corr_sec"    -v br="$corr_ratio" \
                  -v c="$tag_sec"     -v cr="$tag_ratio" \
                  -v d="$ed_sec"      -v dr="$ed_ratio" \
                  -v e="$len_sec"     -v er="$len_ratio" \
-    'BEGIN { print int(a*ar + b*br + c*cr + d*dr + e*er) }')
+    'BEGIN { print int(a*ar + as*asr + b*br + c*cr + d*dr + e*er) }')
 printf '\n[smoke] training stages (1..5) at prod scale: ≈ %dh%02dm  (%d sec)\n' \
     $((prod_total / 3600)) $(((prod_total % 3600) / 60)) "$prod_total"
 
@@ -666,6 +721,7 @@ if [[ "$GPU_AVAILABLE" -eq 1 ]] && [[ "$(wc -l < "$GPU_TSV")" -gt 1 ]]; then
 
     banner "[smoke] recommended batch sizes for production"
     recommend_batch "01_train_llm2vec"       "$LLM2VEC_BATCH" "LLM2Vec MNTP (per-device)"
+    recommend_batch "01b_train_simcse"       "$SIMCSE_BATCH"  "SimCSE (per-device)"
     recommend_batch "03_train_tagger"        "$BATCH_SIZE"    "Tagger"
     recommend_batch "04_train_editor_phaseA" "$BATCH_SIZE"    "Editor (Phase A)"
     recommend_batch "05_train_length_head"   "$BATCH_SIZE"    "Length head"

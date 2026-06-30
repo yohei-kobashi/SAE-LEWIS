@@ -34,6 +34,16 @@
 #   LLM2VEC_STEPS           MNTP steps (default: 10000)
 #   LLM2VEC_BATCH           per-device batch for MNTP (default: 8)
 #   LLM2VEC_ACCUM           grad-accum-steps for MNTP (default: 4)
+#   SIMCSE_STEPS            SimCSE steps (default: 2000)
+#   SIMCSE_BATCH            per-device batch for SimCSE (default: 32)
+#   SIMCSE_LR               SimCSE learning rate (default: 1e-6)
+#   SIMCSE_TEMP             NT-Xent temperature (default: 0.05)
+#   SIMCSE_DROPOUT          injected attention dropout (default: 0.1)
+#   SIMCSE_MAX_SEQ_LEN      sequence length for SimCSE (default: 128)
+#   SIMCSE_GRAD_CKPT        1 → --gradient-checkpointing (default: 0)
+#   SKIP_SIMCSE             1 → skip SimCSE; downstream consumes MNTP dir directly
+#                            (LLM2Vec paper: Bi+MNTP only ≈ 0.55-0.65 on STS-B;
+#                             SimCSE adds another 0.1+; only skip for ablation)
 #   CORRUPTION_SAMPLES      stage-2 target sample count (default: 100000)
 #   CORRUPTION_SHARD        samples per corruption shard (default: 10000)
 #   TAGGER_STEPS            tagger training steps (default: 10000)
@@ -77,6 +87,14 @@ SAE_MAX_SENTS=${SAE_MAX_SENTS:-100000}
 LLM2VEC_STEPS=${LLM2VEC_STEPS:-10000}
 LLM2VEC_BATCH=${LLM2VEC_BATCH:-8}
 LLM2VEC_ACCUM=${LLM2VEC_ACCUM:-4}
+SIMCSE_STEPS=${SIMCSE_STEPS:-2000}
+SIMCSE_BATCH=${SIMCSE_BATCH:-32}
+SIMCSE_LR=${SIMCSE_LR:-1e-6}
+SIMCSE_TEMP=${SIMCSE_TEMP:-0.05}
+SIMCSE_DROPOUT=${SIMCSE_DROPOUT:-0.1}
+SIMCSE_MAX_SEQ_LEN=${SIMCSE_MAX_SEQ_LEN:-128}
+SIMCSE_GRAD_CKPT=${SIMCSE_GRAD_CKPT:-0}
+SKIP_SIMCSE=${SKIP_SIMCSE:-0}
 CORRUPTION_SAMPLES=${CORRUPTION_SAMPLES:-100000}
 CORRUPTION_SHARD=${CORRUPTION_SHARD:-10000}
 TAGGER_STEPS=${TAGGER_STEPS:-10000}
@@ -136,11 +154,22 @@ trap 'if [[ -n "${GPU_MON_PID:-}" ]]; then kill "$GPU_MON_PID" 2>/dev/null || tr
 DOLMA_CACHE="$RUN_DIR/dolma_cache"
 SAE_CACHE="$RUN_DIR/sae_cache"
 LLM2VEC_DIR="$RUN_DIR/llm2vec"
+SIMCSE_DIR="$RUN_DIR/llm2vec_simcse"
 CORRUPTION_DIR="$RUN_DIR/corruption"
 TAGGER_DIR="$RUN_DIR/tagger"
 EDITOR_DIR="$RUN_DIR/editor"
 LENGTH_DIR="$RUN_DIR/length_head"
 EVAL_DIR="$RUN_DIR/eval"
+
+# Downstream stages (corruption / tagger / editor / length / evaluate) all
+# consume an LLM2Vec-style HF checkpoint via --llm2vec-dir. We normally
+# point this at the SimCSE output (canonical LLM2Vec end-product); set
+# SKIP_SIMCSE=1 to consume the MNTP-only dir for ablation.
+if [[ "$SKIP_SIMCSE" == "1" ]]; then
+    DOWNSTREAM_LLM2VEC_DIR="$LLM2VEC_DIR"
+else
+    DOWNSTREAM_LLM2VEC_DIR="$SIMCSE_DIR"
+fi
 
 TAGGER_CKPT="$TAGGER_DIR/tagger-final.pt"
 EDITOR_CKPT="$EDITOR_DIR/editor-final.pt"
@@ -248,6 +277,8 @@ DEVICE               = $DEVICE        SEED = $SEED
 DOLMA_MAX_FILES      = $DOLMA_MAX_FILES
 SAE_MAX_SENTS        = $SAE_MAX_SENTS
 LLM2VEC_STEPS / BS   = $LLM2VEC_STEPS / $LLM2VEC_BATCH (accum $LLM2VEC_ACCUM, effective $((LLM2VEC_BATCH * LLM2VEC_ACCUM)))
+SIMCSE_STEPS / BS    = $SIMCSE_STEPS / $SIMCSE_BATCH  (LR $SIMCSE_LR, τ $SIMCSE_TEMP, dropout $SIMCSE_DROPOUT)
+SKIP_SIMCSE          = $SKIP_SIMCSE  → downstream LLM2Vec dir = $DOWNSTREAM_LLM2VEC_DIR
 CORRUPTION samples   = $CORRUPTION_SAMPLES   (shard size $CORRUPTION_SHARD)
 TAGGER_STEPS / BS    = $TAGGER_STEPS / $TAGGER_BATCH
 EDITOR_STEPS / BS    = $EDITOR_STEPS / $EDITOR_BATCH
@@ -310,8 +341,49 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# Stage 2: corruption — generate (X, X') training pairs with the new
-# bidirectional encoder + Gemma Scope SAE conditioning. Longest stage.
+# Stage 1b: SimCSE — canonical LLM2Vec finishes Bi+MNTP with unsupervised
+# contrastive (NT-Xent / in-batch negatives). Outputs a fresh HF-format
+# checkpoint at $SIMCSE_DIR that downstream stages consume.
+# --------------------------------------------------------------------------- #
+SIMCSE_DONE=0
+if [[ -f "$SIMCSE_DIR/llm2vec_meta.json" ]] && \
+   [[ "$(python -c "import json,sys; print('simcse' in json.load(open('$SIMCSE_DIR/llm2vec_meta.json')))" 2>/dev/null)" == "True" ]]; then
+    SIMCSE_DONE=1
+fi
+if [[ "$SKIP_SIMCSE" == "1" ]]; then
+    skip_stage "01b_train_simcse" "SKIP_SIMCSE=1; downstream uses $LLM2VEC_DIR"
+elif [[ "$SIMCSE_DONE" == "1" ]]; then
+    skip_stage "01b_train_simcse" "exists at $SIMCSE_DIR"
+else
+    SIMCSE_EXTRA=()
+    if [[ "$SIMCSE_GRAD_CKPT" == "1" ]]; then
+        SIMCSE_EXTRA+=(--gradient-checkpointing)
+    fi
+    run_stage "01b_train_simcse" \
+        python train_simcse.py \
+            --llm2vec-dir "$LLM2VEC_DIR" \
+            --output-dir "$SIMCSE_DIR" \
+            --data-cache-dir "$DOLMA_CACHE" \
+            --max-files "$DOLMA_MAX_FILES" \
+            --max-steps "$SIMCSE_STEPS" \
+            --warmup-steps 100 \
+            --learning-rate "$SIMCSE_LR" \
+            --per-device-batch-size "$SIMCSE_BATCH" \
+            --temperature "$SIMCSE_TEMP" \
+            --dropout "$SIMCSE_DROPOUT" \
+            --max-seq-length "$SIMCSE_MAX_SEQ_LEN" \
+            --save-steps 500 \
+            --logging-steps 50 \
+            --num-workers "$NUM_WORKERS" \
+            --device "$DEVICE" \
+            --seed "$SEED" \
+            "${SIMCSE_EXTRA[@]}" \
+            $RESUME_FLAG
+fi
+
+# --------------------------------------------------------------------------- #
+# Stage 2: corruption — generate (X, X') training pairs with the
+# Bi+MNTP+SimCSE encoder + Gemma Scope SAE conditioning. Longest stage.
 # --------------------------------------------------------------------------- #
 if [[ -f "$CORRUPTION_DIR/meta.json" ]]; then
     skip_stage "02_corruption" "exists at $CORRUPTION_DIR"
@@ -321,7 +393,7 @@ else
             --data-cache-dir "$DOLMA_CACHE" \
             --max-files "$DOLMA_MAX_FILES" \
             --out-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --llm "$LLM" \
             --sae-repo "$SAE_REPO" \
             --sae-path "$SAE_PATH" \
@@ -344,7 +416,7 @@ else
     run_stage "03_train_tagger" \
         python train_tagger.py \
             --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --output-dir "$TAGGER_DIR" \
             --max-steps "$TAGGER_STEPS" \
             --warmup-steps 500 \
@@ -368,7 +440,7 @@ else
     run_stage "04_train_editor_phaseA" \
         python train_editor_phaseA.py \
             --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --output-dir "$EDITOR_DIR" \
             --max-steps "$EDITOR_STEPS" \
             --warmup-steps 500 \
@@ -391,7 +463,7 @@ else
     run_stage "05_train_length_head" \
         python train_length_head.py \
             --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$LLM2VEC_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
             --editor-ckpt "$EDITOR_CKPT" \
             --output-dir "$LENGTH_DIR" \
             --max-steps "$LENGTH_STEPS" \
@@ -412,7 +484,7 @@ fi
 mkdir -p "$EVAL_DIR"
 run_stage "06_evaluate" \
     python evaluate_intervention.py \
-        --llm2vec-dir "$LLM2VEC_DIR" \
+        --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
         --tagger-ckpt "$TAGGER_CKPT" \
         --editor-ckpt "$EDITOR_CKPT" \
         --mu "$SAE_CACHE/mu.npy" \
@@ -436,15 +508,17 @@ printf 'Total wall time this invocation: %dh%02dm%02ds\n' \
     $((TOTAL / 3600)) $(((TOTAL % 3600) / 60)) $((TOTAL % 60))
 echo
 echo "Artifacts under $RUN_DIR:"
-echo "  SAE cache       : $SAE_CACHE"
-echo "  LLM2Vec MNTP    : $LLM2VEC_DIR"
-echo "  Corruption data : $CORRUPTION_DIR"
-echo "  Tagger          : $TAGGER_CKPT"
-echo "  Editor          : $EDITOR_CKPT"
-echo "  Length head     : $LENGTH_CKPT"
-echo "  Per-stage logs  : $LOG_DIR/"
-echo "  Timing summary  : $SUMMARY"
-echo "  GPU summary     : $GPU_TSV"
+echo "  SAE cache         : $SAE_CACHE"
+echo "  LLM2Vec MNTP      : $LLM2VEC_DIR"
+echo "  LLM2Vec MNTP+SimCSE: $SIMCSE_DIR  (skipped if SKIP_SIMCSE=1)"
+echo "  Downstream uses   : $DOWNSTREAM_LLM2VEC_DIR"
+echo "  Corruption data   : $CORRUPTION_DIR"
+echo "  Tagger            : $TAGGER_CKPT"
+echo "  Editor            : $EDITOR_CKPT"
+echo "  Length head       : $LENGTH_CKPT"
+echo "  Per-stage logs    : $LOG_DIR/"
+echo "  Timing summary    : $SUMMARY"
+echo "  GPU summary       : $GPU_TSV"
 echo
 echo "If a stage failed, fix the underlying issue and re-run the SAME"
 echo "command. Completed stages will be skipped; the failed stage will"
