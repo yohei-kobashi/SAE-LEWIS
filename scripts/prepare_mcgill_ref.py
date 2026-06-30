@@ -87,6 +87,71 @@ def _peek_adapter_config(adapter_repo: str) -> dict:
         return {"_error": str(e)}
 
 
+def _load_adapter_with_remap(model, adapter_repo: str, adapter_name: str = "default"):
+    """Manually load LoRA weights from `adapter_model.safetensors`, remapping
+    legacy keys (saved without `.{adapter_name}.` infix by older PEFT
+    versions) to the format current PEFT expects.
+
+    Old PEFT (≤ 0.6) saved adapter weights as
+        base_model.model.<base_path>.lora_A.weight
+    Current PEFT (≥ 0.7) expects
+        base_model.model.<base_path>.lora_A.{adapter_name}.weight
+    The mismatch means PeftModel.from_pretrained creates the LoRA modules
+    correctly (so trainable_params count looks right) but silently leaves
+    lora_A at Kaiming init and lora_B at zero — merge → no-op.
+
+    This helper hot-patches the weights AFTER PEFT has built the module
+    tree, so the merge sees the real adapter.
+
+    Returns the number of remapped keys that landed in the model.
+    """
+    import re
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    weights_path = hf_hub_download(adapter_repo, filename="adapter_model.safetensors")
+    raw = load_file(weights_path)
+
+    sample_keys = list(raw.items())[:3]
+    print(f"[mcgill]   safetensors sample keys: {[k for k, _ in sample_keys]}")
+
+    # Detect format: do keys already contain `.{adapter_name}.`?
+    have_adapter_infix = any(f".lora_A.{adapter_name}.weight" in k for k in raw)
+    if have_adapter_infix:
+        print(f"[mcgill]   keys already have .{adapter_name}. infix — no remap needed")
+        remapped = raw
+    else:
+        # Legacy format: insert the adapter name between lora_A/lora_B and `.weight`.
+        pat = re.compile(r"(lora_[AB])\.weight$")
+        remapped = {}
+        for k, v in raw.items():
+            new_k = pat.sub(rf"\1.{adapter_name}.weight", k)
+            remapped[new_k] = v
+        print(f"[mcgill]   remapped {len(remapped)} keys to add .{adapter_name}. infix")
+
+    # Use the peft helper if available — it handles a few more edge cases
+    # (e.g. base_model.model vs base_model prefix differences) than plain
+    # nn.Module.load_state_dict.
+    try:
+        from peft.utils.save_and_load import set_peft_model_state_dict
+        # `set_peft_model_state_dict` already strips the `base_model.model.`
+        # prefix for us; pass the dict as-is.
+        out = set_peft_model_state_dict(model, remapped, adapter_name=adapter_name)
+        # Newer peft returns IncompatibleKeys, older returns None.
+        if hasattr(out, "missing_keys"):
+            missing = len(out.missing_keys)
+            unexpected = len(out.unexpected_keys)
+        else:
+            missing = unexpected = "?"
+    except ImportError:
+        out = model.load_state_dict(remapped, strict=False)
+        missing = len(out.missing_keys)
+        unexpected = len(out.unexpected_keys)
+    print(f"[mcgill]   set_peft_model_state_dict: missing={missing}, "
+          f"unexpected={unexpected}")
+    return len(remapped)
+
+
 def main():
     args = parse_args()
     out_dir = Path(args.output_dir)
@@ -141,7 +206,7 @@ def main():
 
     # Quick sanity: how many trainable params does the loaded adapter expose?
     n_lora = sum(p.numel() for n, p in mntp.named_parameters() if "lora" in n.lower())
-    print(f"[mcgill]   loaded LoRA params: {n_lora:,}")
+    print(f"[mcgill]   PEFT-loaded LoRA params: {n_lora:,}")
     if n_lora == 0:
         raise SystemExit(
             "[mcgill] FATAL: PEFT loaded the adapter but found 0 LoRA params "
@@ -151,6 +216,13 @@ def main():
             "(`pip install llm2vec`)."
         )
 
+    # PEFT.from_pretrained may have silently left lora_A at Kaiming init +
+    # lora_B at zero if the safetensors uses the legacy `lora_A.weight`
+    # naming (no `.default.` infix). The helper re-loads the actual weights
+    # with key remapping; harmless no-op when keys are already current.
+    print("[mcgill]   hot-patching adapter weights via remap helper...")
+    _load_adapter_with_remap(mntp, args.mntp_adapter, adapter_name="default")
+
     print("[mcgill] merging MNTP adapter into base...")
     base = mntp.merge_and_unload()
     delta = (_sample_weight(base) - base_weight_orig).abs().mean().item()
@@ -158,15 +230,18 @@ def main():
     if delta < 1e-8:
         raise SystemExit(
             "[mcgill] FATAL: MNTP merge produced zero weight change. The "
-            "adapter loaded but its LoRA B matrices are all-zero (incompatible "
-            "adapter format?). Either upgrade peft or use the llm2vec library."
+            "adapter loaded but its LoRA B matrices are all-zero "
+            "(remapping didn't catch the key format). Inspect the "
+            "safetensors keys printed above and update _load_adapter_with_remap."
         )
 
     base_weight_after_mntp = _sample_weight(base)
     print(f"[mcgill] applying SimCSE adapter {args.simcse_adapter}...")
     simcse = PeftModel.from_pretrained(base, args.simcse_adapter)
     n_lora2 = sum(p.numel() for n, p in simcse.named_parameters() if "lora" in n.lower())
-    print(f"[mcgill]   loaded LoRA params: {n_lora2:,}")
+    print(f"[mcgill]   PEFT-loaded LoRA params: {n_lora2:,}")
+    print("[mcgill]   hot-patching adapter weights via remap helper...")
+    _load_adapter_with_remap(simcse, args.simcse_adapter, adapter_name="default")
     print("[mcgill] merging SimCSE adapter...")
     final = simcse.merge_and_unload()
     delta2 = (_sample_weight(final) - base_weight_after_mntp).abs().mean().item()
