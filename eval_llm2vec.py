@@ -73,7 +73,16 @@ def parse_args():
                         "'none' to skip.")
     p.add_argument("--data-cache-dir", default="./dolma_cache")
     p.add_argument("--max-files", type=int, default=1,
-                   help="# of Dolma shards to stream.")
+                   help="# of Dolma shards to stream FOR EVAL.")
+    p.add_argument("--train-max-files", type=int, default=None,
+                   help="# of Dolma shards consumed at training time. Eval "
+                        "reads shards from index `train_max_files` onward, "
+                        "so its sentences are held-out from the training "
+                        "stream (which always starts at shard 0). Auto-"
+                        "detected from llm2vec_meta.json['dolma_max_files'] "
+                        "when omitted; pass 0 to disable holdout (legacy "
+                        "behaviour — eval reads from shard 0, leakage "
+                        "possible).")
     p.add_argument("--n-sentences", type=int, default=500,
                    help="Held-out sentence count for evals (1) and (2).")
     p.add_argument("--n-bidir-causal", type=int, default=100,
@@ -150,8 +159,30 @@ def load_model(
 
 
 def collect_sentences(args, tokenizer) -> List[str]:
-    """Stream Dolma until we have N quality-filtered sentences."""
-    shards = download_dolma_shards(args.data_cache_dir, max_files=args.max_files)
+    """Stream Dolma until we have N quality-filtered sentences.
+
+    Eval shards are taken from `[train_max_files, train_max_files + max_files)`
+    in URL-list order — strictly outside the training stream which always
+    starts at index 0. With train_max_files=0 (legacy / unknown) eval and
+    training read the same shards and overlap is possible.
+    """
+    start_index = int(args.train_max_files or 0)
+    shards = download_dolma_shards(
+        args.data_cache_dir,
+        max_files=args.max_files,
+        start_index=start_index,
+    )
+    print(
+        f"[eval] held-out shards: indices [{start_index}, "
+        f"{start_index + (args.max_files or 0)}) "
+        f"({len(shards)} shard(s))"
+    )
+    if start_index == 0:
+        print(
+            "[eval] WARNING: train_max_files=0 — eval reads from shard 0, "
+            "the same range training consumed. Sentence-level leakage is "
+            "possible. Pass --train-max-files <N> to force a holdout."
+        )
     sents: List[str] = []
     for s in iter_sentences(
         iter_dolma_texts(shards, min_chars=64),
@@ -160,12 +191,10 @@ def collect_sentences(args, tokenizer) -> List[str]:
         max_chars=2000,
         max_sentences_per_text=None,
         sample_strategy="random",
-        # Distinct seed so held-out sentences don't overlap with any
-        # training-time stream that used --seed args.seed.
-        # NB: with max_sentences_per_text=None the strategy has no effect on
-        # sentence selection (all sentences are yielded in order). Leakage
-        # vs the training stream is bounded by `--max-files 1` (eval reads
-        # only the first shard) + the seed offset above.
+        # Distinct seed from any training-time stream that used --seed args.seed.
+        # (max_sentences_per_text=None means strategy has no effect on
+        # sentence-level selection; shard-level holdout above is the real
+        # leakage guard.)
         seed=args.seed + 9999,
         quality_filter=True,
     ):
@@ -561,34 +590,72 @@ def eval_mteb(
 
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    # mteb's task-listing API has shifted across versions. Try the
-    # explicit-name path first (simple, stable), fall back to
-    # `get_tasks` if needed.
+    # Resolve task NAMES → Task OBJECTS. mteb 2.x silently accepts strings
+    # in the MTEB(tasks=[...]) constructor (no exception at construction),
+    # but the downstream .run() then fails with
+    #   AttributeError: 'MTEB' object has no attribute 'tasks'.
+    # `mteb.get_tasks` is the canonical way to get the Task objects that
+    # the constructor expects. mteb 1.x doesn't need this but tolerates
+    # passing objects too, so we always go through this path.
     try:
-        evaluation = mteb.MTEB(tasks=tasks)
-    except Exception:
-        # Newer-style: mteb.get_tasks(tasks=[...])
-        task_objs = mteb.get_tasks(tasks=tasks)
-        evaluation = mteb.MTEB(tasks=task_objs)
+        task_objs = list(mteb.get_tasks(tasks=tasks))
+    except AttributeError:
+        # Ancient mteb without get_tasks — fall back to strings (will only
+        # work on those legacy versions).
+        task_objs = list(tasks)
+
+    def _task_name(t) -> str:
+        if isinstance(t, str):
+            return t
+        # mteb 2.x: t.metadata.name (TaskMetadata object).
+        md = getattr(t, "metadata", None)
+        if md is not None:
+            v = getattr(md, "name", None)
+            if v is None and isinstance(md, dict):
+                v = md.get("name")
+            if v:
+                return str(v)
+        # mteb 1.x: t.description["name"].
+        desc = getattr(t, "description", None)
+        if isinstance(desc, dict) and desc.get("name"):
+            return desc["name"]
+        return type(t).__name__
+
+    # Index resolved objects by the canonical name so we can preserve the
+    # user's input order for per-task reporting.
+    by_name = {_task_name(o): o for o in task_objs}
+
+    # mteb 2.x dropped `batch_size` from MTEB.run() top-level kwargs; it now
+    # lives under `encode_kwargs={"batch_size": ...}`. Build both shapes.
+    encode_kwargs = {"batch_size": batch_size}
 
     per_task: List[dict] = []
-    for t in tasks:
+    for t_name in tasks:
+        t_obj = by_name.get(t_name, t_name)
         try:
-            sub_eval = mteb.MTEB(tasks=[t]) if hasattr(mteb, "MTEB") else evaluation
-            res = sub_eval.run(
-                encoder,
-                output_folder=str(output_folder),
-                batch_size=batch_size,
-                eval_splits=None,
-                overwrite_results=True,
-                verbosity=1,
-            )
-            # `res` is usually a list[TaskResult] (one per task in the call).
+            sub_eval = mteb.MTEB(tasks=[t_obj])
+            try:
+                res = sub_eval.run(
+                    encoder,
+                    output_folder=str(output_folder),
+                    overwrite_results=True,
+                    verbosity=1,
+                    encode_kwargs=encode_kwargs,
+                )
+            except TypeError:
+                # mteb 1.x path: batch_size is a direct kwarg.
+                res = sub_eval.run(
+                    encoder,
+                    output_folder=str(output_folder),
+                    batch_size=batch_size,
+                    overwrite_results=True,
+                    verbosity=1,
+                )
             raw_for_t = res[0] if isinstance(res, list) and res else res
-            per_task.append(_flatten_mteb_results(raw_for_t, t))
+            per_task.append(_flatten_mteb_results(raw_for_t, t_name))
         except Exception as e:
             per_task.append({
-                "task": t, "raw": None, "main_score": None,
+                "task": t_name, "raw": None, "main_score": None,
                 "metric_name": None, "error": str(e),
             })
 
@@ -769,14 +836,37 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve baseline LLM from meta if not supplied.
+    # Resolve baseline LLM + train_max_files from meta if not supplied.
     baseline_llm: Optional[str] = args.baseline_llm
     meta_path = Path(args.llm2vec_dir) / "llm2vec_meta.json"
-    if baseline_llm is None and meta_path.exists():
-        meta = json.loads(meta_path.read_text())
+    meta: dict = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            meta = {}
+    if baseline_llm is None:
         baseline_llm = meta.get("base_llm")
     if baseline_llm == "none":
         baseline_llm = None
+    if args.train_max_files is None:
+        # `dolma_max_files` may be None (training streamed every shard) — in
+        # that case we have no way to choose held-out shards, so fall back
+        # to 0 and let collect_sentences print the leakage warning.
+        meta_tmf = meta.get("dolma_max_files")
+        if meta_tmf is None:
+            print(
+                "[eval] NOTE: llm2vec_meta.json has dolma_max_files=None "
+                "(or no entry). Defaulting --train-max-files=0; eval will "
+                "warn about possible leakage."
+            )
+            args.train_max_files = 0
+        else:
+            args.train_max_files = int(meta_tmf)
+            print(
+                f"[eval] auto-detected --train-max-files={args.train_max_files} "
+                f"from llm2vec_meta.json"
+            )
 
     print(f"[eval] LLM2Vec checkpoint : {args.llm2vec_dir}")
     print(f"[eval] Baseline LLM       : {baseline_llm}")
