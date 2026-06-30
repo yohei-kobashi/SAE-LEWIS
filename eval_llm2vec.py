@@ -589,28 +589,143 @@ def _flatten_mteb_results(raw, task_name: str) -> dict:
     return out
 
 
+def _eval_stsb_direct(encoder: "LLM2VecEncoder", batch_size: int) -> dict:
+    """Direct STS-Benchmark Spearman eval — no mteb dependency.
+
+    mteb 2.x's API has churned (EncoderProtocol checks, signature changes,
+    MTEB → mteb.evaluate). For the single most important sentence-eval
+    signal (STS-B Spearman from the LLM2Vec paper) it is simpler and more
+    robust to just load the dataset from HF and compute the metric here.
+
+    Loads the canonical `mteb/stsbenchmark-sts` test split (falls back to
+    `sentence-transformers/stsb`), encodes both halves of each pair with
+    `encoder.encode` (which L2-normalizes internally so dot product =
+    cosine), and reports Spearman ρ against the gold continuous score.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        return {"task": "STSBenchmark", "main_score": None,
+                "metric_name": None,
+                "error": f"`pip install datasets` to enable STS-B: {e}",
+                "raw": None}
+    try:
+        from scipy.stats import spearmanr
+    except ImportError as e:
+        return {"task": "STSBenchmark", "main_score": None,
+                "metric_name": None,
+                "error": f"`pip install scipy` to enable STS-B: {e}",
+                "raw": None}
+
+    candidates = [
+        ("mteb/stsbenchmark-sts", "test"),
+        ("sentence-transformers/stsb", "test"),
+    ]
+    ds = None
+    last_err: Optional[Exception] = None
+    for name, split in candidates:
+        try:
+            ds = load_dataset(name, split=split)
+            print(f"[eval] STS-B loaded from {name} ({split} split, "
+                  f"{len(ds)} pairs)")
+            break
+        except Exception as e:
+            last_err = e
+    if ds is None:
+        return {"task": "STSBenchmark", "main_score": None,
+                "metric_name": None,
+                "error": f"failed to load STS-B test split: {last_err}",
+                "raw": None}
+
+    cols = set(ds.column_names)
+    if {"sentence1", "sentence2"}.issubset(cols):
+        s1 = list(ds["sentence1"])
+        s2 = list(ds["sentence2"])
+    else:
+        return {"task": "STSBenchmark", "main_score": None,
+                "metric_name": None,
+                "error": f"unexpected columns: {sorted(cols)}",
+                "raw": None}
+    score_col = "score" if "score" in cols else ("label" if "label" in cols else None)
+    if score_col is None:
+        return {"task": "STSBenchmark", "main_score": None,
+                "metric_name": None,
+                "error": f"no score/label column: {sorted(cols)}",
+                "raw": None}
+    gold = np.asarray(ds[score_col], dtype=np.float64)
+
+    z1 = encoder.encode(s1, batch_size=batch_size)
+    z2 = encoder.encode(s2, batch_size=batch_size)
+    # encoder.encode L2-normalizes, so the per-pair dot product is cosine.
+    cos = (z1 * z2).sum(axis=1)
+    rho, _ = spearmanr(cos, gold)
+    return {
+        "task": "STSBenchmark",
+        "main_score": float(rho),
+        "metric_name": "cosine_spearman",
+        "raw": {
+            "n_pairs": int(len(gold)),
+            "cos_min": float(cos.min()),
+            "cos_max": float(cos.max()),
+            "cos_mean": float(cos.mean()),
+            "gold_min": float(gold.min()),
+            "gold_max": float(gold.max()),
+        },
+    }
+
+
 def eval_mteb(
     encoder: "LLM2VecEncoder",
     tasks: List[str],
     output_folder: Path,
     batch_size: int,
 ) -> dict:
-    """Run the requested MTEB tasks and return a per-task summary.
+    """Run the requested sentence-embedding tasks.
+
+    STSBenchmark is evaluated DIRECTLY via `_eval_stsb_direct` (no mteb
+    dependency — avoids mteb 2.x's churning EncoderProtocol / API). Other
+    tasks fall through to the mteb library when available.
 
     Returns dict {"tasks": [...], "available": bool, "error": Optional[str]}.
-    If mteb is not installed, returns {"available": False, ...} so the
-    caller can skip rendering this section gracefully.
     """
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    # Split tasks: direct-impl ones vs mteb-only.
+    DIRECT_ALIASES = {"STSBenchmark", "STSBenchmark-sts", "STS-B", "stsb"}
+    per_task: List[dict] = []
+    mteb_tasks: List[str] = []
+    for t_name in tasks:
+        if t_name in DIRECT_ALIASES:
+            per_task.append(_eval_stsb_direct(encoder, batch_size))
+        else:
+            mteb_tasks.append(t_name)
+    if not mteb_tasks:
+        return {
+            "available": True,
+            "error": None,
+            "tasks": per_task,
+            "output_folder": str(output_folder),
+        }
+
+    # Fall through to mteb for tasks we don't reimplement directly.
     try:
         import mteb  # type: ignore
     except ImportError as e:
+        for t_name in mteb_tasks:
+            per_task.append({
+                "task": t_name, "raw": None, "main_score": None,
+                "metric_name": None,
+                "error": f"`pip install mteb` to enable {t_name}: {e}",
+            })
         return {
-            "available": False,
-            "error": f"`pip install mteb` to enable: {e}",
-            "tasks": [],
+            "available": True,
+            "error": None,
+            "tasks": per_task,
+            "output_folder": str(output_folder),
         }
 
-    output_folder.mkdir(parents=True, exist_ok=True)
+    # Reassign so the existing mteb code below operates on the leftover tasks.
+    tasks = mteb_tasks
 
     # Resolve task NAMES → Task OBJECTS. mteb 2.x silently accepts strings
     # in the MTEB(tasks=[...]) constructor (no exception at construction),
