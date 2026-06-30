@@ -381,6 +381,16 @@ def main():
     # HF save (it's a monkey-patch on instance methods + flags).
     _patch_attention_bidirectional(base_model.model)
     base_model.config.use_cache = False
+    # Stash the inner backbone (GemmaModel) BEFORE peft wraps the CausalLM.
+    # The training loop forwards through this directly so we get
+    # `last_hidden_state` instead of CausalLM logits; LoRA adapters inserted
+    # into q_proj/k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj are still
+    # exercised because they live inside the attention/MLP blocks of this
+    # exact backbone instance.
+    # Without this, `model.model(...)` would resolve to the WRAPPED
+    # GemmaForCausalLM on PeftModel (PeftModel.__getattr__ → base_model.model
+    # = LoraModel.model = CausalLM) and return logits, not hidden states.
+    inner_backbone = base_model.model
 
     # ---- Wrap with LoRA (or resume an existing LoRA adapter) -------------
     is_peft = False
@@ -572,14 +582,17 @@ def main():
         attention_mask = batch["attention_mask"].to(args.device, non_blocking=True)
 
         # Two STOCHASTIC forwards (independent dropout masks). Each goes
-        # through model.model (the inner backbone) — we don't need the LM
-        # head here, but it's still attached so save_pretrained writes a
-        # GemmaForCausalLM compatible checkpoint.
-        out1 = model.model(
+        # through the inner GemmaModel directly so the output is
+        # `last_hidden_state`, not LM-head logits. LoRA adapters in the
+        # attention/MLP blocks still get exercised — they were inserted
+        # in-place by peft. The LM head stays attached on the outer
+        # GemmaForCausalLM so save_pretrained writes a CausalLM-compatible
+        # checkpoint that downstream `corruption.py` can use for PPL.
+        out1 = inner_backbone(
             input_ids=input_ids, attention_mask=attention_mask, use_cache=False,
         )
         z1 = _pool(out1.last_hidden_state, attention_mask, args.pooling)
-        out2 = model.model(
+        out2 = inner_backbone(
             input_ids=input_ids, attention_mask=attention_mask, use_cache=False,
         )
         z2 = _pool(out2.last_hidden_state, attention_mask, args.pooling)
