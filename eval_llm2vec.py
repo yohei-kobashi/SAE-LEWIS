@@ -451,7 +451,19 @@ class LLM2VecEncoder:
     final-layer hidden states with `pool_hidden_states`, L2-normalizes,
     and returns a (N, d) numpy array. Also exposes `encode_queries` /
     `encode_corpus` so retrieval tasks work without extra glue.
+
+    Satisfies mteb 2.x's `EncoderProtocol` runtime check:
+      - `mteb_model_meta` class attribute must exist (any value, incl. None)
+      - `encode` must accept `task_metadata`, `hf_subset`, `hf_split`,
+        `prompt_type` as keyword-only args (we absorb them via **kwargs but
+        also list them explicitly for `inspect` / documentation)
     """
+
+    # Required by mteb 2.x's EncoderProtocol isinstance check. Without
+    # this attribute mteb raises:
+    #   "Expected model to be an instance of EncoderProtocol"
+    # and refuses to run.
+    mteb_model_meta = None
 
     def __init__(
         self,
@@ -468,7 +480,17 @@ class LLM2VecEncoder:
         self.max_seq_length = max_seq_length
 
     @torch.no_grad()
-    def encode(self, sentences, batch_size: int = 8, **kwargs) -> np.ndarray:
+    def encode(
+        self,
+        sentences,
+        *,
+        batch_size: int = 8,
+        task_metadata=None,
+        hf_subset=None,
+        hf_split=None,
+        prompt_type=None,
+        **kwargs,
+    ) -> np.ndarray:
         if isinstance(sentences, str):
             sentences = [sentences]
         all_embs: List[np.ndarray] = []
