@@ -66,6 +66,27 @@ def parse_args():
     return p.parse_args()
 
 
+def _sample_weight(model) -> torch.Tensor:
+    """Snapshot a representative weight for before/after comparison."""
+    # Layer-0 q_proj is one of the canonical LoRA targets; if the adapter
+    # is real it will be changed by merge_and_unload.
+    return model.model.layers[0].self_attn.q_proj.weight.detach().clone()
+
+
+def _peek_adapter_config(adapter_repo: str) -> dict:
+    """Download just adapter_config.json (~1KB) to see target_modules etc."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        return {}
+    try:
+        path = hf_hub_download(adapter_repo, filename="adapter_config.json")
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        return {"_error": str(e)}
+
+
 def main():
     args = parse_args()
     out_dir = Path(args.output_dir)
@@ -88,6 +109,21 @@ def main():
             f"error: {e}"
         )
 
+    # Inspect adapter configs before downloading the base — surfaces module-
+    # naming or task-type mismatches early.
+    for label, repo in [("MNTP", args.mntp_adapter),
+                         ("SimCSE", args.simcse_adapter)]:
+        cfg_blob = _peek_adapter_config(repo)
+        target = cfg_blob.get("target_modules", "?")
+        mts = cfg_blob.get("modules_to_save", None)
+        task = cfg_blob.get("task_type", "?")
+        rank = cfg_blob.get("r", "?")
+        alpha = cfg_blob.get("lora_alpha", "?")
+        print(f"[mcgill] {label} adapter ({repo}):")
+        print(f"          target_modules    = {target}")
+        print(f"          modules_to_save   = {mts}")
+        print(f"          task_type r/alpha = {task} / {rank} / {alpha}")
+
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
              "float32": torch.float32}[args.dtype]
 
@@ -98,16 +134,45 @@ def main():
         attn_implementation="sdpa",
     )
     print(f"[mcgill] base loaded: vocab_size={base.config.vocab_size}")
+    base_weight_orig = _sample_weight(base)
 
     print(f"[mcgill] applying MNTP adapter {args.mntp_adapter}...")
     mntp = PeftModel.from_pretrained(base, args.mntp_adapter)
+
+    # Quick sanity: how many trainable params does the loaded adapter expose?
+    n_lora = sum(p.numel() for n, p in mntp.named_parameters() if "lora" in n.lower())
+    print(f"[mcgill]   loaded LoRA params: {n_lora:,}")
+    if n_lora == 0:
+        raise SystemExit(
+            "[mcgill] FATAL: PEFT loaded the adapter but found 0 LoRA params "
+            "— target_modules in adapter_config.json don't match any module "
+            "name in the base. Likely the McGill adapter targets a custom "
+            "BiMistral subclass; use the llm2vec library instead "
+            "(`pip install llm2vec`)."
+        )
+
     print("[mcgill] merging MNTP adapter into base...")
     base = mntp.merge_and_unload()
+    delta = (_sample_weight(base) - base_weight_orig).abs().mean().item()
+    print(f"[mcgill]   weight delta after MNTP merge: mean_abs = {delta:.2e}")
+    if delta < 1e-8:
+        raise SystemExit(
+            "[mcgill] FATAL: MNTP merge produced zero weight change. The "
+            "adapter loaded but its LoRA B matrices are all-zero (incompatible "
+            "adapter format?). Either upgrade peft or use the llm2vec library."
+        )
 
+    base_weight_after_mntp = _sample_weight(base)
     print(f"[mcgill] applying SimCSE adapter {args.simcse_adapter}...")
     simcse = PeftModel.from_pretrained(base, args.simcse_adapter)
+    n_lora2 = sum(p.numel() for n, p in simcse.named_parameters() if "lora" in n.lower())
+    print(f"[mcgill]   loaded LoRA params: {n_lora2:,}")
     print("[mcgill] merging SimCSE adapter...")
     final = simcse.merge_and_unload()
+    delta2 = (_sample_weight(final) - base_weight_after_mntp).abs().mean().item()
+    print(f"[mcgill]   weight delta after SimCSE merge: mean_abs = {delta2:.2e}")
+    if delta2 < 1e-8:
+        print("[mcgill] WARNING: SimCSE merge produced no weight change.")
 
     print(f"[mcgill] saving merged checkpoint to {out_dir}...")
     final.save_pretrained(out_dir, safe_serialization=False)
