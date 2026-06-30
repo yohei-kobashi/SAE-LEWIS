@@ -128,7 +128,17 @@ SIMCSE_DROPOUT=${SIMCSE_DROPOUT:-0.1}
 SIMCSE_SAVE_STEPS=${SIMCSE_SAVE_STEPS:-500}
 SIMCSE_MAX_SEQ_LEN=${SIMCSE_MAX_SEQ_LEN:-128}
 SIMCSE_POOLING=${SIMCSE_POOLING:-mean}
-SIMCSE_GRAD_CKPT=${SIMCSE_GRAD_CKPT:-0}
+# SimCSE retains TWO forwards in autograd (positive pair via dropout-as-
+# augmentation), which doubles activation memory vs MNTP. At batch=128 +
+# Gemma-2B this is ~85 GB and OOMs on 95 GB H200. Canonical LLM2Vec uses
+# gradient_checkpointing in this exact spot. Auto-enable when USE_LORA=1
+# (canonical setup); for the full-FT ablation batch is small enough that
+# it's not needed by default.
+if [[ "$USE_LORA" == "1" ]]; then
+    SIMCSE_GRAD_CKPT=${SIMCSE_GRAD_CKPT:-1}
+else
+    SIMCSE_GRAD_CKPT=${SIMCSE_GRAD_CKPT:-0}
+fi
 
 N_SENTENCES=${N_SENTENCES:-500}
 N_BIDIR_CAUSAL=${N_BIDIR_CAUSAL:-100}

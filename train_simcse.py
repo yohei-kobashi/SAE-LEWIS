@@ -472,7 +472,19 @@ def main():
         )
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        # PEFT + gradient checkpointing gotcha: the base model is frozen
+        # (requires_grad=False everywhere), so the autograd graph would
+        # stop at the base inputs and the LoRA adapter wouldn't see any
+        # gradient. `enable_input_require_grads()` registers a forward
+        # hook on embed_tokens that re-attaches requires_grad to the
+        # embedding output, which lets the upstream LoRA modules receive
+        # gradients through grad-ckpt. Required for any peft + grad-ckpt
+        # combination.
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+        if is_peft and hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
     model.to(args.device)
     model.train()
 
