@@ -2,39 +2,49 @@
 End-to-end diagnostic: figure out why McGill's published LLM2Vec ckpt
 gives STS-B 0.50 in our pipeline vs the paper's 0.79.
 
-Tests three hypotheses in one run:
-  A. Merge issue   — prepare_mcgill_ref.py produced a partially-merged ckpt
-  B. Pipeline bug  — our LLM2VecEncoder / mean-pool / cosine differs from canonical
-  C. Instruction   — paper numbers require task-specific instruction prefix
+Hypothesis A (merge issue) was RULED OUT by an earlier run that showed
+non-trivial weight deltas at layer-0 q_proj AND layer-15 down_proj after
+both LoRA merges, so the published prepare_mcgill_ref.py is producing a
+correctly-merged Mistral checkpoint.
 
-Test matrix (each cell = STS-B Spearman):
+This version drops the `llm2vec` library dependency — it pins
+transformers<=4.44.2 / tokenizers<0.20, which downgrades the env and
+breaks our newer-format tokenizer.json files. Instead we reimplement
+the library's one essential contribution for STS evaluation: tokenize
+the instruction separately so we know how many tokens to mask out of
+the mean pool.
 
-  | route                                    | no inst | with inst |
-  |------------------------------------------|---------|-----------|
-  | McGill ckpt via official `llm2vec` lib   | (1)     | (2)       |
-  | Our merged McGill ckpt via OUR encoder   | (3)     | (4)       |
-  | Our Gemma LoRA ckpt via OUR encoder      | (5)     | (6)       |
+Tests in one run:
 
-Decision tree:
-  (1) ≈ 0.79 → official path works without instruction. If (3) ≪ (1), our
-              merge or encoder is broken. If (3) ≈ (1), it must be something
-              else (e.g. tokenizer config).
-  (1) ≈ 0.50, (2) ≈ 0.79 → C confirmed; add instruction support to eval.
-  (1) ≈ 0.50, (2) ≈ 0.50 → McGill ckpt does not reach paper numbers
-              without supervised fine-tuning. Our 0.54 on Gemma is correct.
-  (3) ≈ (1) → our encoder agrees with official; merge is OK.
-  (3) ≪ (1) → our encoder is broken even when given the correctly-merged
-              ckpt — bug is in LLM2VecEncoder.encode, not in prepare_mcgill_ref.
+  | route                                              | STS-B Spearman |
+  |----------------------------------------------------|----------------|
+  | our merged McGill ckpt — no instruction            | (already 0.50) |
+  | our merged McGill ckpt — naive prepend             | (sanity check) |
+  | our merged McGill ckpt — proper inst-masked pool   | (decisive)     |
+  | our Gemma LoRA ckpt — no instruction               | (already 0.54) |
+  | our Gemma LoRA ckpt — naive prepend                |                |
+  | our Gemma LoRA ckpt — proper inst-masked pool      |                |
 
-Also reports weight delta between our merged McGill ckpt and base Mistral
-as a sanity check on the merge itself (independent of any encoder issue).
+Interpretation:
+  - proper-masked ≫ no-inst → hypothesis C confirmed: instruction is
+    essential. Add instruction support to eval_llm2vec.py.
+  - proper-masked ≈ no-inst → instructions don't help this model. Either
+    our recipe gives genuinely lower-quality embeddings (look elsewhere)
+    or McGill's paper number requires supervised fine-tune we haven't
+    done.
+  - naive ≈ proper → the masking detail doesn't matter much; only the
+    presence of the instruction prefix matters.
+
+The merge sanity check from the previous version is retained as an
+independent confirmation that the saved ckpt isn't just base Mistral.
 
 Usage:
-    pip install llm2vec
     python scripts/diagnose_eval_pipeline.py
-    # or with limited tests:
-    python scripts/diagnose_eval_pipeline.py --skip-official  # no llm2vec dep
-    python scripts/diagnose_eval_pipeline.py --max-pairs 200  # quick smoke
+    python scripts/diagnose_eval_pipeline.py --max-pairs 200   # quick smoke
+
+NB: if you ran `pip install llm2vec` earlier and got env breakage, run
+    pip install --upgrade transformers tokenizers
+first to restore the working transformers/tokenizers pair.
 """
 
 from __future__ import annotations
@@ -47,6 +57,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset
 from scipy.stats import spearmanr
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -61,26 +72,16 @@ def parse_args():
                    help="Output of prepare_mcgill_ref.py (merged Mistral ckpt).")
     p.add_argument("--our-gemma-dir", default="./runs/llm2vec_lora/llm2vec_simcse",
                    help="Our Gemma LoRA Bi+MNTP+SimCSE ckpt.")
-    p.add_argument("--max-pairs", type=int, default=1379,
-                   help="STS-B pairs to evaluate. Full test split = 1379. "
-                        "Use --max-pairs 200 for a quick smoke (~30s).")
+    p.add_argument("--max-pairs", type=int, default=1379)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32"])
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--max-seq-length", type=int, default=256)
 
-    p.add_argument("--skip-official", action="store_true",
-                   help="Skip tests (1)/(2) — useful if `pip install llm2vec` "
-                        "is unavailable or you've already tested.")
-    p.add_argument("--skip-our-mcgill", action="store_true",
-                   help="Skip tests (3)/(4) — useful if our merged McGill dir "
-                        "doesn't exist or you only care about the official "
-                        "vs paper comparison.")
-    p.add_argument("--skip-our-gemma", action="store_true",
-                   help="Skip tests (5)/(6) — useful if Gemma ckpt is absent.")
-    p.add_argument("--skip-merge-check", action="store_true",
-                   help="Skip the McGill merge weight-delta sanity check.")
+    p.add_argument("--skip-our-mcgill", action="store_true")
+    p.add_argument("--skip-our-gemma", action="store_true")
+    p.add_argument("--skip-merge-check", action="store_true")
 
     p.add_argument("--output-json", default="./runs/diagnose_eval_pipeline.json")
     return p.parse_args()
@@ -94,8 +95,7 @@ def _dtype(s: str) -> torch.dtype:
             "float32": torch.float32}[s]
 
 
-def _free(obj_name: str = "<model>") -> None:
-    """Aggressively release CUDA memory between loads of 7B-class models."""
+def _free() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -110,8 +110,7 @@ def _load_stsb(max_pairs: int) -> Tuple[List[str], List[str], List[float]]:
     return s1, s2, gold
 
 
-def _spearman_from_embeds(z1, z2, gold) -> float:
-    """Cosine spearman. Accepts numpy or torch (N, d). Auto-L2-normalizes."""
+def _spearman(z1, z2, gold) -> float:
     if isinstance(z1, torch.Tensor):
         z1 = z1.detach().float().cpu().numpy()
     if isinstance(z2, torch.Tensor):
@@ -125,110 +124,149 @@ def _spearman_from_embeds(z1, z2, gold) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Test 1+2: McGill ckpt via the official llm2vec library
+# Encode functions (replace the llm2vec library)
 # --------------------------------------------------------------------------- #
-def test_official_llm2vec(s1, s2, gold, args) -> Dict[str, float]:
-    from llm2vec import LLM2Vec  # type: ignore
+@torch.no_grad()
+def _encode(
+    inner_backbone, tokenizer, sentences: List[str], *,
+    instruction: Optional[str] = None,
+    mask_instruction: bool = False,
+    batch_size: int = 8, max_seq_length: int = 256, device: str = "cuda",
+) -> np.ndarray:
+    """Encode sentences with optional instruction handling.
 
-    print("[diag] (official) loading McGill ckpt via llm2vec library...")
-    l2v = LLM2Vec.from_pretrained(
-        "McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp",
-        peft_model_name_or_path="McGill-NLP/LLM2Vec-Mistral-7B-Instruct-v2-mntp-unsup-simcse",
-        device_map=args.device,
-        torch_dtype=_dtype(args.dtype),
-    )
+    instruction=None          : plain mean pool over the sentence's
+                                non-pad positions.
+    instruction=s, mask=False : naive prepend — instruction text becomes
+                                part of the sentence, pooled with it.
+    instruction=s, mask=True  : prepend AND mask the instruction's token
+                                positions out of the pool. This is what
+                                the llm2vec library does for MTEB STS.
+                                The mask span starts at index 1 (BOS) and
+                                covers `len(tokenize(instruction))` tokens.
+    """
+    inst_len = 0
+    if instruction is not None:
+        # Tokenize WITHOUT special tokens to count exactly the instruction's
+        # token contribution; the BOS is added later by the full tokenize.
+        inst_ids = tokenizer.encode(instruction, add_special_tokens=False)
+        inst_len = len(inst_ids)
+        prepended = [instruction + s for s in sentences]
+    else:
+        prepended = sentences
 
-    print("[diag] (official) encoding without instruction...")
-    z1 = l2v.encode(s1, batch_size=args.batch_size, show_progress_bar=False)
-    z2 = l2v.encode(s2, batch_size=args.batch_size, show_progress_bar=False)
-    no_inst = _spearman_from_embeds(z1, z2, gold)
-    print(f"[diag] (official) no instruction  STS-B = {no_inst:.4f}")
-
-    print("[diag] (official) encoding with instruction...")
-    s1_inst = [[STS_INSTRUCTION, s] for s in s1]
-    s2_inst = [[STS_INSTRUCTION, s] for s in s2]
-    z1i = l2v.encode(s1_inst, batch_size=args.batch_size, show_progress_bar=False)
-    z2i = l2v.encode(s2_inst, batch_size=args.batch_size, show_progress_bar=False)
-    with_inst = _spearman_from_embeds(z1i, z2i, gold)
-    print(f"[diag] (official) with instruction STS-B = {with_inst:.4f}")
-
-    del l2v, z1, z2, z1i, z2i
-    _free("official-l2v")
-    return {"no_inst": no_inst, "with_inst": with_inst}
+    embs: List[np.ndarray] = []
+    for i in range(0, len(prepended), batch_size):
+        chunk = prepended[i : i + batch_size]
+        enc = tokenizer(
+            chunk, padding=True, truncation=True,
+            max_length=max_seq_length, return_tensors="pt",
+        ).to(device)
+        out = inner_backbone(
+            input_ids=enc.input_ids,
+            attention_mask=enc.attention_mask,
+            use_cache=False,
+        )
+        h = out.last_hidden_state  # (B, T, d)
+        for b in range(h.shape[0]):
+            mask = enc.attention_mask[b].float()
+            if mask_instruction and inst_len > 0:
+                # Drop BOS (index 0) + instruction tokens (indices 1..inst_len).
+                # If after masking nothing remains (very short sentence
+                # truncated below the instruction), fall back to no-mask.
+                trial = mask.clone()
+                trial[: 1 + inst_len] = 0
+                if trial.sum() > 0:
+                    mask = trial
+            h_b = h[b].float()
+            pooled = (h_b * mask.unsqueeze(-1)).sum(dim=0) / mask.sum().clamp_min(1e-9)
+            pooled = F.normalize(pooled, dim=-1)
+            embs.append(pooled.cpu().numpy())
+    return np.stack(embs)
 
 
 # --------------------------------------------------------------------------- #
-# Test 3-6: arbitrary HF-format ckpt via OUR LLM2VecEncoder
+# Test entry point
 # --------------------------------------------------------------------------- #
-def test_our_encoder(
+def test_route(
     model_dir: str, label: str, s1, s2, gold, args,
 ) -> Dict[str, float]:
-    """Re-uses the SAME LLM2VecEncoder / load_model that eval_llm2vec.py uses,
-    so this measures exactly what our eval reports. With-instruction path
-    naively prepends the prefix into the sentence text — pooling will include
-    the instruction tokens (no masking). Sufficient to see directional effect."""
     import sys
     repo_root = str(Path(__file__).resolve().parent.parent)
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    from eval_llm2vec import LLM2VecEncoder, load_model  # type: ignore
+    from eval_llm2vec import load_model  # type: ignore
 
-    print(f"[diag] ({label}) loading {model_dir} via our pipeline...")
+    print(f"[diag] ({label}) loading {model_dir}...")
     model = load_model(model_dir, _dtype(args.dtype), args.device, bidir_patch=True)
+    inner = model.model  # GemmaModel / MistralModel
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    encoder = LLM2VecEncoder(
-        model=model, tokenizer=tokenizer, device=args.device,
-        pooling="mean", max_seq_length=args.max_seq_length,
-    )
 
-    print(f"[diag] ({label}) encoding without instruction...")
-    z1 = encoder.encode(s1, batch_size=args.batch_size)
-    z2 = encoder.encode(s2, batch_size=args.batch_size)
-    no_inst = _spearman_from_embeds(z1, z2, gold)
-    print(f"[diag] ({label}) no instruction  STS-B = {no_inst:.4f}")
+    # Determine instruction token count (just for logging).
+    inst_ids = tokenizer.encode(STS_INSTRUCTION, add_special_tokens=False)
+    print(f"[diag] ({label}) STS_INSTRUCTION tokenized to {len(inst_ids)} tokens "
+          f"(will be masked out of the pool for the proper-inst test)")
 
-    print(f"[diag] ({label}) encoding with instruction (naive prepend)...")
-    s1_inst = [STS_INSTRUCTION + s for s in s1]
-    s2_inst = [STS_INSTRUCTION + s for s in s2]
-    z1i = encoder.encode(s1_inst, batch_size=args.batch_size)
-    z2i = encoder.encode(s2_inst, batch_size=args.batch_size)
-    with_inst = _spearman_from_embeds(z1i, z2i, gold)
-    print(f"[diag] ({label}) with instruction STS-B = {with_inst:.4f}")
+    print(f"[diag] ({label}) [a] no instruction...")
+    z1 = _encode(inner, tokenizer, s1,
+                 batch_size=args.batch_size,
+                 max_seq_length=args.max_seq_length, device=args.device)
+    z2 = _encode(inner, tokenizer, s2,
+                 batch_size=args.batch_size,
+                 max_seq_length=args.max_seq_length, device=args.device)
+    no_inst = _spearman(z1, z2, gold)
+    print(f"[diag] ({label}) [a] no instruction          STS-B = {no_inst:.4f}")
 
-    del model, encoder, z1, z2, z1i, z2i
-    _free(label)
-    return {"no_inst": no_inst, "with_inst": with_inst}
+    print(f"[diag] ({label}) [b] naive prepend (inst in pool)...")
+    z1 = _encode(inner, tokenizer, s1, instruction=STS_INSTRUCTION,
+                 mask_instruction=False, batch_size=args.batch_size,
+                 max_seq_length=args.max_seq_length, device=args.device)
+    z2 = _encode(inner, tokenizer, s2, instruction=STS_INSTRUCTION,
+                 mask_instruction=False, batch_size=args.batch_size,
+                 max_seq_length=args.max_seq_length, device=args.device)
+    naive_inst = _spearman(z1, z2, gold)
+    print(f"[diag] ({label}) [b] naive prepend           STS-B = {naive_inst:.4f}")
+
+    print(f"[diag] ({label}) [c] proper inst-masked pool (canonical)...")
+    z1 = _encode(inner, tokenizer, s1, instruction=STS_INSTRUCTION,
+                 mask_instruction=True, batch_size=args.batch_size,
+                 max_seq_length=args.max_seq_length, device=args.device)
+    z2 = _encode(inner, tokenizer, s2, instruction=STS_INSTRUCTION,
+                 mask_instruction=True, batch_size=args.batch_size,
+                 max_seq_length=args.max_seq_length, device=args.device)
+    proper_inst = _spearman(z1, z2, gold)
+    print(f"[diag] ({label}) [c] proper inst-masked      STS-B = {proper_inst:.4f}")
+
+    del model, inner
+    _free()
+    return {
+        "no_inst": no_inst,
+        "naive_inst": naive_inst,
+        "proper_inst": proper_inst,
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Merge sanity check: weight diff between base Mistral and our merged ckpt
+# Merge sanity (independent confirmation that the merged ckpt ≠ base)
 # --------------------------------------------------------------------------- #
 def test_merge_sanity(our_mcgill_dir: str, dtype: str) -> Dict[str, float]:
-    """Compare q_proj.weight at layer 0 (and a deeper layer) between base
-    Mistral-7B-Instruct-v0.2 and our merged ckpt. Both stages of LoRA should
-    have produced non-trivial weight changes; mean_abs < 1e-6 ⇒ silent
-    no-op somewhere."""
     print("[diag] (merge-check) computing weight delta vs base Mistral...")
     dt = _dtype(dtype)
-
     base = AutoModelForCausalLM.from_pretrained(
-        "mistralai/Mistral-7B-Instruct-v0.2",
-        torch_dtype=dt,
+        "mistralai/Mistral-7B-Instruct-v0.2", torch_dtype=dt,
     )
-    base_w0 = base.model.layers[0].self_attn.q_proj.weight.float().cpu().clone()
-    base_w15 = base.model.layers[15].mlp.down_proj.weight.float().cpu().clone()
+    base_w0 = base.model.layers[0].self_attn.q_proj.weight.detach().float().cpu().clone()
+    base_w15 = base.model.layers[15].mlp.down_proj.weight.detach().float().cpu().clone()
     del base
-    _free("base-mistral")
+    _free()
 
-    ours = AutoModelForCausalLM.from_pretrained(
-        our_mcgill_dir, torch_dtype=dt,
-    )
-    our_w0 = ours.model.layers[0].self_attn.q_proj.weight.float().cpu().clone()
-    our_w15 = ours.model.layers[15].mlp.down_proj.weight.float().cpu().clone()
+    ours = AutoModelForCausalLM.from_pretrained(our_mcgill_dir, torch_dtype=dt)
+    our_w0 = ours.model.layers[0].self_attn.q_proj.weight.detach().float().cpu().clone()
+    our_w15 = ours.model.layers[15].mlp.down_proj.weight.detach().float().cpu().clone()
     del ours
-    _free("our-merged")
+    _free()
 
     d0 = (our_w0 - base_w0).abs()
     d15 = (our_w15 - base_w15).abs()
@@ -240,89 +278,81 @@ def test_merge_sanity(our_mcgill_dir: str, dtype: str) -> Dict[str, float]:
     }
     for k, v in info.items():
         print(f"[diag] (merge-check) {k} = {v:.4e}")
-    if info["layer0_q_proj_mean_abs"] < 1e-6:
-        print("[diag] (merge-check) WARNING: layer-0 q_proj barely changed — "
-              "MNTP merge may have silently failed.")
-    if info["layer15_down_proj_mean_abs"] < 1e-6:
-        print("[diag] (merge-check) WARNING: layer-15 down_proj barely "
-              "changed — SimCSE adapter may have silently failed.")
     return info
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def _print_summary(results: dict, paper_target: float = 0.79) -> None:
+def _print_summary(results: dict) -> None:
     print()
-    print("=" * 78)
+    print("=" * 82)
     print(" STS-B Spearman summary")
-    print("=" * 78)
-    print(f"{'route':<40s} {'no_inst':>12s} {'with_inst':>12s} {'Δ':>10s}")
-    print("-" * 78)
-    for route in ("official", "our_mcgill", "our_gemma"):
-        if route not in results or "error" in results[route]:
-            err = results.get(route, {}).get("error", "skipped")
-            print(f"{route:<40s} {'-':>12s} {'-':>12s}    ({err[:30]})")
+    print("=" * 82)
+    print(f"{'route':<32s} {'no_inst':>12s} {'naive_inst':>12s} {'proper_inst':>12s} {'Δ proper':>10s}")
+    print("-" * 82)
+    for route in ("our_mcgill", "our_gemma"):
+        r = results.get(route, {})
+        if "error" in r:
+            print(f"{route:<32s}    ({r['error'][:50]})")
             continue
-        r = results[route]
-        delta = r["with_inst"] - r["no_inst"]
-        print(f"{route:<40s} {r['no_inst']:>12.4f} {r['with_inst']:>12.4f} "
-              f"{delta:>+10.4f}")
+        delta = r["proper_inst"] - r["no_inst"]
+        print(f"{route:<32s} {r['no_inst']:>12.4f} {r['naive_inst']:>12.4f} "
+              f"{r['proper_inst']:>12.4f} {delta:>+10.4f}")
     print()
-    if "merge_check" in results and "error" not in results["merge_check"]:
-        m = results["merge_check"]
-        print(f"merge sanity (base Mistral → our merged ckpt):")
+    m = results.get("merge_check", {})
+    if "layer0_q_proj_mean_abs" in m:
+        print(f"merge sanity (Mistral base → our merged ckpt):")
         print(f"  layer-0  q_proj  Δ mean_abs = {m['layer0_q_proj_mean_abs']:.4e}")
         print(f"  layer-15 down_proj Δ mean_abs = {m['layer15_down_proj_mean_abs']:.4e}")
+        if m["layer0_q_proj_mean_abs"] > 1e-6 and m["layer15_down_proj_mean_abs"] > 1e-6:
+            print("  → BOTH adapter stages produced real weight changes (merge OK).")
     print()
 
 
 def _print_decision(results: dict) -> None:
-    print("=" * 78)
+    print("=" * 82)
     print(" Interpretation")
-    print("=" * 78)
-    off = results.get("official", {})
-    ours_m = results.get("our_mcgill", {})
+    print("=" * 82)
+    for label, key in [("McGill (Mistral-7B)", "our_mcgill"),
+                       ("our Gemma LoRA", "our_gemma")]:
+        r = results.get(key, {})
+        if "error" in r:
+            continue
+        no = r["no_inst"]; naive = r["naive_inst"]; proper = r["proper_inst"]
+        best = max(no, naive, proper)
+        delta_naive = naive - no
+        delta_proper = proper - no
+        print(f"\n  {label}:")
+        print(f"    best = {best:.4f}  (no={no:.4f}, naive={naive:.4f}, proper={proper:.4f})")
+        if proper - no > 0.10:
+            print("    → INSTRUCTION matters substantially. Add proper-mask "
+                  "instruction support to eval_llm2vec.py.")
+        elif proper - no > 0.03:
+            print("    → instruction helps modestly.")
+        elif abs(proper - no) <= 0.03:
+            print("    → instruction barely moves the needle for this ckpt.")
+        if proper - naive > 0.03:
+            print("    → masking the instruction out of the pool is also "
+                  "essential (naive prepend isn't enough).")
+        elif abs(proper - naive) <= 0.03:
+            print("    → masking detail doesn't matter; naive prepend suffices.")
 
-    if "no_inst" in off:
-        o_no = off["no_inst"]; o_w = off["with_inst"]
-        if o_no >= 0.75:
-            print(f"  * Official no-inst ({o_no:.3f}) reaches paper range — "
-                  "instruction is NOT essential.")
-            if "no_inst" in ours_m:
-                m_no = ours_m["no_inst"]
-                if m_no < o_no - 0.10:
-                    print(f"  * Our pipeline gives {m_no:.3f} for the SAME "
-                          f"merged ckpt while official gives {o_no:.3f}.")
-                    print("    → OUR PIPELINE IS BROKEN. Bug is in "
-                          "LLM2VecEncoder.encode / pooling / bidir-patch / "
-                          "tokenizer setup.")
-                else:
-                    print(f"  * Our pipeline gives {m_no:.3f} ≈ official "
-                          f"{o_no:.3f} → eval pipeline is fine.")
-        elif o_w >= 0.75 and o_no < 0.65:
-            print(f"  * Official no-inst {o_no:.3f} ≪ with-inst {o_w:.3f}: "
-                  "INSTRUCTION IS ESSENTIAL.")
-            print("    → Add instruction support to eval_llm2vec.py "
-                  "(tokenize instruction separately, mask out instruction "
-                  "tokens during pooling).")
-        elif o_no < 0.65 and o_w < 0.65:
-            print(f"  * Official no-inst {o_no:.3f} AND with-inst "
-                  f"{o_w:.3f} are both below paper. McGill ckpt may not "
-                  "reach the paper 0.79 without supervised fine-tuning.")
-            print("    → Our LoRA recipe ≈ McGill's published quality.")
-        else:
-            print(f"  * Official no-inst {o_no:.3f}, with-inst {o_w:.3f} — "
-                  "ambiguous; manual interpretation needed.")
-    else:
-        print("  (skipped official llm2vec test — decision tree limited)")
-
-    if "merge_check" in results and "error" not in results["merge_check"]:
-        m = results["merge_check"]
-        if m["layer0_q_proj_mean_abs"] < 1e-6:
-            print("  * Merge sanity says MNTP adapter didn't change weights.")
-        if m["layer15_down_proj_mean_abs"] < 1e-6:
-            print("  * Merge sanity says SimCSE adapter didn't change weights.")
+    # Cross-model interpretation
+    rm = results.get("our_mcgill", {})
+    rg = results.get("our_gemma", {})
+    if "proper_inst" in rm and "proper_inst" in rg:
+        print()
+        print(f"  Cross-model (best-of-three):")
+        print(f"    McGill ckpt = {max(rm['no_inst'], rm['naive_inst'], rm['proper_inst']):.4f}")
+        print(f"    our Gemma   = {max(rg['no_inst'], rg['naive_inst'], rg['proper_inst']):.4f}")
+        if max(rm.values()) >= 0.75:
+            print("    → McGill reaches paper range under proper encoding. "
+                  "If our Gemma is materially lower, our recipe needs work.")
+        elif max(rm.values()) < 0.65:
+            print("    → Even McGill's official ckpt doesn't reach 0.79 with "
+                  "non-supervised eval. Our Gemma in the same range is fine; "
+                  "downstream-quality is the actual gate.")
     print()
 
 
@@ -335,53 +365,30 @@ def main():
 
     results: dict = {}
 
-    # ----- Merge sanity (cheapest; only loads weights, no inference) -----
     if not args.skip_merge_check:
         try:
             results["merge_check"] = test_merge_sanity(args.our_mcgill_dir, args.dtype)
         except Exception as e:
             print(f"[diag] (merge-check) failed: {type(e).__name__}: {e}")
             results["merge_check"] = {"error": str(e)}
-    else:
-        results["merge_check"] = {"error": "skipped"}
 
-    # ----- Test 1+2: official llm2vec on McGill -----
-    if not args.skip_official:
-        try:
-            results["official"] = test_official_llm2vec(s1, s2, gold, args)
-        except ImportError:
-            msg = "llm2vec library not installed — `pip install llm2vec`"
-            print(f"[diag] (official) {msg}")
-            results["official"] = {"error": msg}
-        except Exception as e:
-            print(f"[diag] (official) failed: {type(e).__name__}: {e}")
-            results["official"] = {"error": str(e)}
-    else:
-        results["official"] = {"error": "skipped"}
-
-    # ----- Test 3+4: our encoder on our merged McGill -----
     if not args.skip_our_mcgill:
         try:
-            results["our_mcgill"] = test_our_encoder(
+            results["our_mcgill"] = test_route(
                 args.our_mcgill_dir, "our-mcgill", s1, s2, gold, args,
             )
         except Exception as e:
             print(f"[diag] (our-mcgill) failed: {type(e).__name__}: {e}")
             results["our_mcgill"] = {"error": str(e)}
-    else:
-        results["our_mcgill"] = {"error": "skipped"}
 
-    # ----- Test 5+6: our encoder on our Gemma LoRA -----
     if not args.skip_our_gemma:
         try:
-            results["our_gemma"] = test_our_encoder(
+            results["our_gemma"] = test_route(
                 args.our_gemma_dir, "our-gemma", s1, s2, gold, args,
             )
         except Exception as e:
             print(f"[diag] (our-gemma) failed: {type(e).__name__}: {e}")
             results["our_gemma"] = {"error": str(e)}
-    else:
-        results["our_gemma"] = {"error": "skipped"}
 
     _print_summary(results)
     _print_decision(results)
