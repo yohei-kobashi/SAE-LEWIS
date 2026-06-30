@@ -209,7 +209,22 @@ def collect_sentences(args, tokenizer) -> List[str]:
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def eval_mntp_loss(model, tokenizer, sents, args) -> dict:
-    """Average MNTP cross-entropy over a held-out slice."""
+    """Average MNTP cross-entropy over a held-out slice.
+
+    Requires `tokenizer.mask_token`. Returns a {skipped: <reason>} stub
+    when the tokenizer has no mask token — e.g. McGill's public LLM2Vec
+    checkpoints are built on Mistral-7B-Instruct-v0.2, whose tokenizer
+    has none and the canonical recipe uses an existing token instead.
+    Eval 2/3/5 don't depend on mask_token and still run.
+    """
+    if tokenizer.mask_token is None:
+        msg = ("tokenizer has no mask_token — skipping MNTP eval. Pass "
+               "a checkpoint whose tokenizer was trained with `[MASK]` "
+               "added, or assign tokenizer.mask_token externally before "
+               "calling.")
+        print(f"[eval]   {msg}")
+        return {"loss": float("nan"), "perplexity": float("nan"),
+                "n_tokens": 0, "n_sequences": 0, "skipped": msg}
     collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,
@@ -821,19 +836,23 @@ def render_report(args, metrics: dict, out_path: Path):
     L.append("## 1. MNTP held-out loss / perplexity")
     L.append("")
     m1 = metrics["mntp"]
-    L.append("Loss is averaged over non-ignored labels; ppl = exp(loss).")
-    L.append("")
-    L.append("| Metric | Value |")
-    L.append("|---|---|")
-    L.append(f"| MNTP loss     | {m1['loss']:.4f} |")
-    L.append(f"| MNTP ppl      | {m1['perplexity']:.3f} |")
-    L.append(f"| # tokens      | {m1['n_tokens']} |")
-    L.append(f"| # sequences   | {m1['n_sequences']} |")
-    L.append("")
-    L.append("Interpretation: random-init loss ≈ log(V) ≈ 12. Healthy MNTP")
-    L.append("typically lands in the 2-6 range on Dolma after several thousand")
-    L.append("steps. A value > 8 suggests the model barely trained.")
-    L.append("")
+    if m1.get("skipped"):
+        L.append(f"Skipped: {m1['skipped']}")
+        L.append("")
+    else:
+        L.append("Loss is averaged over non-ignored labels; ppl = exp(loss).")
+        L.append("")
+        L.append("| Metric | Value |")
+        L.append("|---|---|")
+        L.append(f"| MNTP loss     | {m1['loss']:.4f} |")
+        L.append(f"| MNTP ppl      | {m1['perplexity']:.3f} |")
+        L.append(f"| # tokens      | {m1['n_tokens']} |")
+        L.append(f"| # sequences   | {m1['n_sequences']} |")
+        L.append("")
+        L.append("Interpretation: random-init loss ≈ log(V) ≈ 12. Healthy MNTP")
+        L.append("typically lands in the 2-6 range on Dolma after several thousand")
+        L.append("steps. A value > 8 suggests the model barely trained.")
+        L.append("")
 
     # ---- Eval 2: causal PPL drift -------------------------------------------
     L.append("## 2. Causal PPL drift vs base LLM")
@@ -1029,9 +1048,10 @@ def main():
     print("[eval] (1/5) MNTP held-out loss / perplexity")
     set_seed(args.seed)  # deterministic masking across model swaps
     metrics["mntp"] = eval_mntp_loss(model_bidir, tokenizer, sents, args)
-    print(f"        loss = {metrics['mntp']['loss']:.4f}  "
-          f"ppl = {metrics['mntp']['perplexity']:.2f}  "
-          f"({metrics['mntp']['n_tokens']} tokens)")
+    if not metrics["mntp"].get("skipped"):
+        print(f"        loss = {metrics['mntp']['loss']:.4f}  "
+              f"ppl = {metrics['mntp']['perplexity']:.2f}  "
+              f"({metrics['mntp']['n_tokens']} tokens)")
 
     # ---- Eval 2: Causal PPL drift ------------------------------------------
     print("[eval] (2/5) Causal PPL (this ckpt, no patch)")
