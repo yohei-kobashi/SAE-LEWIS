@@ -608,7 +608,18 @@ def _write_final(out_dir, model, tokenizer, args, final_step: int):
         "weight_decay": float(args.weight_decay),
         "loss": "nt_xent (symmetric, in-batch negatives)",
         "augmentation": "dropout-as-augmentation (two stochastic forwards)",
+        "dolma_max_files": (int(args.max_files) if args.max_files is not None else None),
     }
+    # Track the largest shard range consumed by any training stage so
+    # eval_llm2vec can pick `start_index = dolma_max_files` and read held-out
+    # shards. None at the top level means *some* stage streamed every shard,
+    # in which case strict shard-level holdout is impossible.
+    prev = meta.get("dolma_max_files")
+    this = args.max_files
+    if prev is None or this is None:
+        meta["dolma_max_files"] = None
+    else:
+        meta["dolma_max_files"] = max(int(prev), int(this))
     (out_dir / "llm2vec_meta.json").write_text(json.dumps(meta, indent=2))
 
 

@@ -301,6 +301,12 @@ def main():
         "ins_token_id": tokenizer.convert_tokens_to_ids("[INS]"),
         "del_token_id": tokenizer.convert_tokens_to_ids("[DEL]"),
         "seed": args.seed,
+        # # of Dolma shards (from URL-list head) consumed by training. Used
+        # by `eval_llm2vec.py` to choose held-out shards via
+        # `start_index=dolma_max_files`. `None` = streamed every available
+        # shard, in which case eval cannot be strictly held-out at the
+        # shard level.
+        "dolma_max_files": (int(args.max_files) if args.max_files is not None else None),
     }, indent=2))
     print(f"[llm2vec] saved to {out_dir}")
 

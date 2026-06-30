@@ -35,7 +35,21 @@ DOLMA_URL_LIST = "https://huggingface.co/datasets/allenai/dolma/raw/main/urls/v1
 # ---------------------------------------------------------------------------
 # Dolma raw-shard streaming
 # ---------------------------------------------------------------------------
-def download_dolma_shards(cache_dir: str, max_files: Optional[int] = None) -> List[str]:
+def download_dolma_shards(
+    cache_dir: str,
+    max_files: Optional[int] = None,
+    start_index: int = 0,
+) -> List[str]:
+    """Download (or reuse-cached) Dolma sample shards in URL-list order.
+
+    Parameters
+    ----------
+    start_index : int
+        Skip the first `start_index` shards from the URL list before applying
+        `max_files`. Used by `eval_llm2vec` to read shards strictly outside
+        the training range, so eval sentences are genuinely held-out from
+        the training stream (which always starts at index 0).
+    """
     cdir = Path(cache_dir)
     cdir.mkdir(parents=True, exist_ok=True)
     url_list_path = cdir / "v1_6-sample.txt"
@@ -44,6 +58,8 @@ def download_dolma_shards(cache_dir: str, max_files: Optional[int] = None) -> Li
         r.raise_for_status()
         url_list_path.write_text(r.text)
     urls = [u.strip() for u in url_list_path.read_text().splitlines() if u.strip()]
+    if start_index > 0:
+        urls = urls[start_index:]
     if max_files is not None:
         urls = urls[:max_files]
     local_paths: List[str] = []
