@@ -192,12 +192,40 @@ fi
 python scripts/mcgill_merge_and_expand.py "${MERGE_ARGS[@]}"
 
 # --------------------------------------------------------------------------- #
+# Stage 4: STS-B eval on the merged checkpoint (paper number comparison)
+# --------------------------------------------------------------------------- #
+# Runs in the SAME isolated venv (still active). Uses the official llm2vec
+# library's LLM2Vec.from_pretrained on the merged HF dir, computes cosine
+# Spearman on the mteb/stsbenchmark-sts test split, and prints Δ vs the
+# paper number for whatever base LLM this checkpoint was trained on.
+#
+# Set SKIP_EVAL=1 to disable (e.g. if you want to do a longer eval sweep
+# separately).
+if [[ "${SKIP_EVAL:-0}" -eq 1 ]]; then
+    banner "[train-mcgill] eval SKIPPED (SKIP_EVAL=1)"
+elif [[ ! -f "$FINAL_DIR/config.json" ]]; then
+    banner "[train-mcgill] eval SKIPPED (no merged ckpt at $FINAL_DIR)"
+else
+    banner "[train-mcgill] eval — STS-B on merged ckpt"
+    EVAL_JSON="$RUN_ROOT/eval_stsb.json"
+    python scripts/llm2vec_repro_eval.py \
+        --from-dir "$FINAL_DIR" \
+        --label "$(basename "$RUN_ROOT")" \
+        --tasks STSBenchmark \
+        --output-json "$EVAL_JSON" \
+        --no-mteb
+fi
+
+# --------------------------------------------------------------------------- #
 # Done
 # --------------------------------------------------------------------------- #
 banner "[train-mcgill] DONE"
 echo "  MNTP adapter    : $MNTP_OUT"
 echo "  SimCSE adapter  : $SIMCSE_OUT"
 echo "  Merged ckpt     : $FINAL_DIR"
+if [[ -f "$RUN_ROOT/eval_stsb.json" ]]; then
+    echo "  STS-B eval json : $RUN_ROOT/eval_stsb.json"
+fi
 echo
 echo "Next: point SAE-LEWIS downstream at $FINAL_DIR"
 echo
@@ -205,9 +233,3 @@ echo "  LLM2VEC_DIR=$FINAL_DIR \\"
 echo "  SIMCSE_DIR=$FINAL_DIR \\"
 echo "  RUN_DIR=./runs/prod_mcgill_gemma \\"
 echo "    bash scripts/run_production.sh"
-echo
-echo "or run eval first:"
-echo "  SKIP_TRAIN=1 SIMCSE_DIR=$FINAL_DIR \\"
-echo "  EVAL_DIR=$FINAL_DIR/eval \\"
-echo "  RUN_DIR=$FINAL_DIR \\"
-echo "    bash scripts/train_eval_llm2vec.sh"

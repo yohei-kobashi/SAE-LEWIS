@@ -79,7 +79,31 @@ def parse_args():
     p.add_argument("--output-json", default="./runs/llm2vec_repro/results.json")
     p.add_argument("--no-mteb", action="store_true",
                    help="Skip mteb-routed tasks even if mteb is installed.")
+
+    # --- Own-training checkpoint mode ------------------------------------
+    # Bypass VARIANT_TO_PEFT and load a locally-merged HF checkpoint (the
+    # output of scripts/mcgill_merge_and_expand.py). Used to eval our own
+    # train_mcgill_llm2vec.sh outputs.
+    p.add_argument("--from-dir", default=None,
+                   help="Local HF checkpoint dir (merged Bi+MNTP+SimCSE). "
+                        "When set, --variants is ignored. Paper reference is "
+                        "auto-guessed from llm2vec_meta.json['base_llm'] so "
+                        "the summary Δ column stays meaningful.")
+    p.add_argument("--label", default=None,
+                   help="Display label for --from-dir. Defaults to the last "
+                        "path segment.")
     return p.parse_args()
+
+
+# Paper STSBenchmark numbers per base LLM for the Bi+MNTP+SimCSE (unsup)
+# recipe. Used ONLY when --from-dir is set and the meta identifies the base.
+# 0-100 scale (Spearman × 100), same as PAPER_REFERENCE above.
+BASE_LLM_TO_PAPER_STSB = {
+    "princeton-nlp/Sheared-LLaMA-1.3B":     73.72,
+    "mistralai/Mistral-7B-Instruct-v0.2":   78.75,   # approximate, MTEB LB
+    "meta-llama/Meta-Llama-3-8B-Instruct":  76.62,   # approximate, MTEB LB
+    "google/gemma-2-2b":                    None,    # untested by paper
+}
 
 
 def _dtype(s: str) -> torch.dtype:
@@ -112,6 +136,50 @@ def _load_l2v(variant: str, args):
     )
     print(f"[repro]   loaded in {time.time() - t0:.1f}s")
     return l2v
+
+
+def _load_from_dir(ckpt_dir: str, args):
+    """Load a locally-merged HF checkpoint (output of mcgill_merge_and_expand.py).
+
+    The merged checkpoint has no PEFT adapter file — everything is baked in —
+    so we just point LLM2Vec at the directory and rely on `enable_bidirectional`
+    to re-apply the paper's attention subclass. Only works when the base
+    architecture is one llm2vec's `_get_model_class` recognises (Llama /
+    Mistral / Gemma-v1 / Qwen2). Merged Gemma-2 checkpoints fail here — you
+    need to either patch llm2vec first or eval them via our SAE-LEWIS eval
+    pipeline instead.
+    """
+    from llm2vec import LLM2Vec  # type: ignore
+
+    print(f"[repro] loading merged ckpt from {ckpt_dir}")
+    t0 = time.time()
+    l2v = LLM2Vec.from_pretrained(
+        ckpt_dir,
+        peft_model_name_or_path=None,   # already merged
+        merge_peft=False,               # nothing to merge
+        enable_bidirectional=True,      # re-apply the paper's bidir subclass
+        device_map=args.device,
+        torch_dtype=_dtype(args.dtype),
+        max_length=args.max_seq_length,
+    )
+    print(f"[repro]   loaded in {time.time() - t0:.1f}s")
+    return l2v
+
+
+def _paper_ref_for_dir(ckpt_dir: str) -> Dict[str, float]:
+    """Look up paper STS-B for the base LLM this checkpoint was trained on."""
+    meta_path = Path(ckpt_dir) / "llm2vec_meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        meta = json.loads(meta_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    base = meta.get("base_llm")
+    stsb = BASE_LLM_TO_PAPER_STSB.get(base)
+    if stsb is None:
+        return {}
+    return {"STSBenchmark": stsb}
 
 
 def _eval_stsb_direct(l2v, batch_size: int) -> Dict[str, float]:
@@ -197,34 +265,42 @@ def _eval_via_mteb(l2v, task_names: List[str]) -> Dict[str, Dict]:
     return results
 
 
-def _print_summary(all_results: Dict[str, Dict]) -> None:
+def _print_summary(all_results: Dict[str, Dict],
+                   paper_ref_override: Optional[Dict[str, Dict[str, float]]] = None) -> None:
     print()
     print("=" * 78)
-    print(" LLM2Vec reproduction summary (Sheared-LLaMA-1.3B)")
+    print(" LLM2Vec reproduction summary")
     print("=" * 78)
-    print(f"{'variant':<18s} {'task':<20s} {'ours':>10s} "
+    print(f"{'variant':<28s} {'task':<20s} {'ours':>10s} "
           f"{'paper':>10s} {'Δ':>10s}")
     print("-" * 78)
+
+    def _ref_for(variant: str) -> Dict[str, float]:
+        # Own-training entry: paper number came from the base_llm lookup.
+        if paper_ref_override and variant in paper_ref_override:
+            return paper_ref_override[variant]
+        return PAPER_REFERENCE.get(variant, {})
+
     for variant, tasks in all_results.items():
-        ref = PAPER_REFERENCE.get(variant, {})
+        ref = _ref_for(variant)
         for task, val in tasks.items():
             if isinstance(val, dict) and "cosine_spearman" in val:
                 ours = val["cosine_spearman"] * 100      # to 0-100 scale
             elif isinstance(val, dict) and "main_score" in val:
                 ours = float(val["main_score"]) * 100
             else:
-                print(f"{variant:<18s} {task:<20s} {'(no score)':>10s}")
+                print(f"{variant:<28s} {task:<20s} {'(no score)':>10s}")
                 continue
             paper = ref.get(task)
             paper_s = f"{paper:.2f}" if paper is not None else "    -"
             delta_s = f"{(ours - paper):+.2f}" if paper is not None else "    -"
-            print(f"{variant:<18s} {task:<20s} {ours:>10.2f} "
+            print(f"{variant:<28s} {task:<20s} {ours:>10.2f} "
                   f"{paper_s:>10s} {delta_s:>10s}")
     print()
     # Verdict.
     failures = []
     for variant, tasks in all_results.items():
-        ref = PAPER_REFERENCE.get(variant, {})
+        ref = _ref_for(variant)
         for task, val in tasks.items():
             if isinstance(val, dict) and "cosine_spearman" in val:
                 ours = val["cosine_spearman"] * 100
@@ -258,31 +334,61 @@ def main():
                  "source ~/venvs/llm2vec_repro/bin/activate")
 
     print(f"[repro] using python {sys.executable}")
-    print(f"[repro] variants: {args.variants}")
+    if args.from_dir:
+        print(f"[repro] mode    : own-training (from --from-dir)")
+        print(f"[repro] ckpt    : {args.from_dir}")
+    else:
+        print(f"[repro] mode    : McGill published chain")
+        print(f"[repro] variants: {args.variants}")
     print(f"[repro] tasks   : {args.tasks}")
 
     all_results: Dict[str, Dict] = {}
-    for variant in args.variants:
-        l2v = _load_l2v(variant, args)
+    paper_ref_override: Dict[str, Dict[str, float]] = {}
+
+    if args.from_dir:
+        # ---- Own-training path -------------------------------------------
+        label = args.label or Path(args.from_dir).resolve().name
+        l2v = _load_from_dir(args.from_dir, args)
         variant_results: Dict = {}
 
-        # STSBenchmark via direct path.
         if "STSBenchmark" in args.tasks:
             res = _eval_stsb_direct(l2v, args.batch_size)
             variant_results["STSBenchmark"] = res
-            print(f"[repro] {variant} STSBenchmark cosine_spearman = "
+            print(f"[repro] {label} STSBenchmark cosine_spearman = "
                   f"{res['cosine_spearman']:.4f}")
 
-        # Other tasks via mteb (if available).
         other_tasks = [t for t in args.tasks if t != "STSBenchmark"]
         if other_tasks and not args.no_mteb:
-            mteb_res = _eval_via_mteb(l2v, other_tasks)
-            variant_results.update(mteb_res)
+            variant_results.update(_eval_via_mteb(l2v, other_tasks))
 
-        all_results[variant] = variant_results
+        all_results[label] = variant_results
+        paper_ref_override[label] = _paper_ref_for_dir(args.from_dir)
 
         del l2v
         _free()
+    else:
+        # ---- Existing McGill-published path -----------------------------
+        for variant in args.variants:
+            l2v = _load_l2v(variant, args)
+            variant_results: Dict = {}
+
+            # STSBenchmark via direct path.
+            if "STSBenchmark" in args.tasks:
+                res = _eval_stsb_direct(l2v, args.batch_size)
+                variant_results["STSBenchmark"] = res
+                print(f"[repro] {variant} STSBenchmark cosine_spearman = "
+                      f"{res['cosine_spearman']:.4f}")
+
+            # Other tasks via mteb (if available).
+            other_tasks = [t for t in args.tasks if t != "STSBenchmark"]
+            if other_tasks and not args.no_mteb:
+                mteb_res = _eval_via_mteb(l2v, other_tasks)
+                variant_results.update(mteb_res)
+
+            all_results[variant] = variant_results
+
+            del l2v
+            _free()
 
     out_path = Path(args.output_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,7 +397,8 @@ def main():
         "reference": PAPER_REFERENCE,
         "config": vars(args),
     }, indent=2, default=str))
-    _print_summary(all_results)
+    _print_summary(all_results,
+                   paper_ref_override=paper_ref_override or None)
     print(f"\n[repro] wrote {out_path}")
 
 
