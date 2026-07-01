@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,18 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+
+# Prefer the vendored + Gemma-2-patched llm2vec over any pip-installed one.
+# The isolated venv inherits openr1's site-packages via a .pth file, so an
+# unpatched `pip install llm2vec` from openr1 would otherwise win the import
+# and raise "Gemma2Config is not supported yet with bidirectional models."
+# on our merged Gemma-2-2b checkpoint. patch_mcgill_gemma2.py has already
+# added the Gemma-2 branch inside the vendored copy — putting that copy
+# first on sys.path makes the eval use it.
+_VENDORED_LLM2VEC = Path(__file__).resolve().parent.parent / "vendored" / "mcgill_llm2vec"
+if _VENDORED_LLM2VEC.is_dir() and str(_VENDORED_LLM2VEC) not in sys.path:
+    sys.path.insert(0, str(_VENDORED_LLM2VEC))
 
 
 # Reference values pulled from LLM2Vec paper Table 1 and the public MTEB
