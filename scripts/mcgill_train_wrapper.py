@@ -40,11 +40,80 @@ VENDOR_DIR = Path(__file__).resolve().parent.parent / "vendored" / "mcgill_llm2v
 
 
 def _install_auto_resume_patch():
-    """Wrap Trainer.train so it auto-resumes when checkpoint-N/ exists."""
-    from transformers import Trainer  # imported here so the patch is
-    # applied to the singleton class before McGill's script imports it.
+    """Wrap Trainer so it auto-resumes when checkpoint-N/ exists.
+
+    Two patches:
+
+      * Trainer.train — if the caller didn't pass resume_from_checkpoint,
+        set it to True whenever a checkpoint-*/ dir already exists under
+        args.output_dir. HF Trainer then picks the latest and calls
+        _load_from_checkpoint.
+
+      * Trainer._load_from_checkpoint — HF Trainer 4.44's implementation
+        doesn't recognise peft-only checkpoints (adapter_model.safetensors
+        + adapter_config.json with nothing else); it falls through to
+        load_sharded_checkpoint which errors with "Can't find a
+        checkpoint index". We catch that specific failure and manually
+        load the adapter into whichever inner module actually exposes
+        load_adapter (base_model on PeftModel, .model on our LLM2Vec-style
+        wrappers, or the top-level model itself).
+    """
+    from transformers import Trainer
 
     _original_train = Trainer.train
+    _original_load_from_checkpoint = Trainer._load_from_checkpoint
+
+    def _peft_fallback_load(target_dir, model):
+        """Try every plausible path from `model` down to a load_adapter-capable
+        submodule and use it. Returns True on success, False otherwise."""
+        candidates = []
+        seen = set()
+        for m in (model,
+                  getattr(model, "model", None),
+                  getattr(model, "base_model", None),
+                  getattr(getattr(model, "model", None), "model", None)):
+            if m is None or id(m) in seen:
+                continue
+            seen.add(id(m))
+            candidates.append(m)
+
+        for cand in candidates:
+            if not hasattr(cand, "load_adapter"):
+                continue
+            adapter_name = (getattr(cand, "active_adapter", None)
+                            or "default")
+            try:
+                cand.load_adapter(target_dir, adapter_name=adapter_name)
+                print(f"[wrapper]   loaded adapter via "
+                      f"{type(cand).__name__}.load_adapter"
+                      f"(adapter={adapter_name!r})", flush=True)
+                return True
+            except Exception as ex:
+                print(f"[wrapper]   {type(cand).__name__}.load_adapter "
+                      f"failed: {ex}", flush=True)
+                continue
+        return False
+
+    def _patched_load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        try:
+            return _original_load_from_checkpoint(
+                self, resume_from_checkpoint, model=model
+            )
+        except ValueError as e:
+            msg = str(e)
+            if ("Can't find a checkpoint index" not in msg
+                    and "Can't find a valid checkpoint" not in msg):
+                raise
+            # We're in the peft-only checkpoint fallback path.
+            print(f"[wrapper] HF Trainer full-model resume failed:", flush=True)
+            print(f"[wrapper]   {msg}", flush=True)
+            print(f"[wrapper] falling back to peft adapter load from "
+                  f"{resume_from_checkpoint}", flush=True)
+            target = model if model is not None else self.model
+            if _peft_fallback_load(resume_from_checkpoint, target):
+                return  # HF Trainer will handle optimizer/scheduler/rng next
+            # Nothing to try — re-raise the original.
+            raise
 
     def _patched_train(self, resume_from_checkpoint=None, *args, **kwargs):
         if resume_from_checkpoint is None or resume_from_checkpoint is False:
@@ -56,8 +125,9 @@ def _install_auto_resume_patch():
                     ):
                         resume_from_checkpoint = True
                         print(
-                            f"[wrapper] auto-resume ENABLED: found checkpoint(s) "
-                            f"under {out_dir}, HF Trainer will pick the latest",
+                            f"[wrapper] auto-resume ENABLED: found "
+                            f"checkpoint(s) under {out_dir}, HF Trainer "
+                            f"will pick the latest",
                             flush=True,
                         )
                         break
@@ -72,7 +142,9 @@ def _install_auto_resume_patch():
         )
 
     Trainer.train = _patched_train
-    print("[wrapper] Trainer.train patched for auto-resume", flush=True)
+    Trainer._load_from_checkpoint = _patched_load_from_checkpoint
+    print("[wrapper] Trainer patched (auto-resume + peft-only fallback)",
+          flush=True)
 
 
 def main():
