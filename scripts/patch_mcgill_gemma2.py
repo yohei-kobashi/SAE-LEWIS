@@ -375,6 +375,117 @@ def _write_bidir_gemma2(check_only: bool) -> bool:
     return True
 
 
+def _patch_experiments_script(script_path: Path, check_only: bool,
+                              needs_get_model_class: bool) -> bool:
+    """Patch experiments/run_{mntp,simcse}.py to know about Gemma-2.
+
+    Both scripts carry their own `initialize_peft` (a `config.__class__
+    .__name__ in [...]` allow-list). run_mntp.py additionally defines a
+    top-level `get_model_class` that returns the *BiForMNTP class per
+    config. We extend both, and inject a top-level import for
+    Gemma2BiForMNTP so the returned class is in scope.
+    """
+    if not script_path.exists():
+        print(f"[patch] SKIP {script_path.name}: not found")
+        return True
+
+    text = script_path.read_text()
+    already = ("Gemma2Config" in text) and ("Gemma2BiForMNTP" in text or
+                                            not needs_get_model_class)
+    if already:
+        print(f"[patch] ✓ experiments/{script_path.name} already has Gemma-2")
+        return True
+    if check_only:
+        print(f"[patch] ✗ experiments/{script_path.name} missing Gemma-2")
+        return False
+
+    # 1. Inject a Gemma2BiForMNTP import once, right below the last
+    #    top-level `import` / `from ... import` line — dodges the
+    #    multi-line `from transformers import (` block and lands
+    #    somewhere unambiguous.
+    if needs_get_model_class and "Gemma2BiForMNTP" not in text:
+        import_stub = "from llm2vec.models import Gemma2BiForMNTP\n"
+        # Find the last non-continuation `from ... import ...` line in
+        # the top ~120 lines that isn't inside a paren block.
+        lines = text.splitlines(keepends=True)
+        insert_idx = None
+        depth = 0
+        for i, line in enumerate(lines[:150]):
+            stripped = line.strip()
+            depth += line.count("(") - line.count(")")
+            if depth == 0 and (stripped.startswith("from ") or
+                               stripped.startswith("import ")):
+                insert_idx = i + 1
+        if insert_idx is None:
+            print(f"[patch] FATAL: no import-block anchor in {script_path.name}")
+            sys.exit(3)
+        lines.insert(insert_idx, import_stub)
+        text = "".join(lines)
+
+    # 2. Extend get_model_class if this script has one.
+    if needs_get_model_class:
+        old_branch = (
+            '    elif config_class_name == "GemmaConfig":\n'
+            '        return GemmaBiForMNTP\n'
+        )
+        new_branch = (
+            '    elif config_class_name == "GemmaConfig":\n'
+            '        return GemmaBiForMNTP\n'
+            '    elif config_class_name == "Gemma2Config":\n'
+            '        return Gemma2BiForMNTP\n'
+        )
+        if old_branch not in text:
+            print(f"[patch] FATAL: no GemmaBiForMNTP branch in "
+                  f"{script_path.name}'s get_model_class")
+            sys.exit(3)
+        text = text.replace(old_branch, new_branch, 1)
+
+    # 3. Extend the `if config.__class__.__name__ in [...]` allow-list
+    #    that gates LoRA target-module defaults inside initialize_peft.
+    old_list = (
+        '        "LlamaConfig",\n'
+        '        "MistralConfig",\n'
+        '        "GemmaConfig",\n'
+        '        "Qwen2Config",\n'
+    )
+    new_list = (
+        '        "LlamaConfig",\n'
+        '        "MistralConfig",\n'
+        '        "GemmaConfig",\n'
+        '        "Gemma2Config",\n'
+        '        "Qwen2Config",\n'
+    )
+    if old_list in text:
+        text = text.replace(old_list, new_list, 1)
+    else:
+        # Not fatal — maybe the list is formatted differently on newer
+        # upstream commits. Leave a warning; get_model_class alone often
+        # unblocks training, and any lora-target fallback issue will
+        # surface with a clear error.
+        print(f"[patch] WARN: initialize_peft config allow-list not found "
+              f"in {script_path.name} — LoRA defaults may fall through")
+
+    script_path.write_text(text)
+    print(f"[patch] patched experiments/{script_path.name}")
+    return True
+
+
+def _patch_run_mntp(check_only: bool) -> bool:
+    return _patch_experiments_script(
+        VENDOR_DIR / "experiments" / "run_mntp.py",
+        check_only,
+        needs_get_model_class=True,
+    )
+
+
+def _patch_run_simcse(check_only: bool) -> bool:
+    return _patch_experiments_script(
+        VENDOR_DIR / "experiments" / "run_simcse.py",
+        check_only,
+        needs_get_model_class=False,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--check", action="store_true",
@@ -392,6 +503,8 @@ def main():
     ok &= _write_bidir_gemma2(args.check)
     ok &= _patch_init_py(args.check)
     ok &= _patch_llm2vec_py(args.check)
+    ok &= _patch_run_mntp(args.check)
+    ok &= _patch_run_simcse(args.check)
 
     if args.check and not ok:
         print("[patch] some patches missing — re-run without --check to apply")
