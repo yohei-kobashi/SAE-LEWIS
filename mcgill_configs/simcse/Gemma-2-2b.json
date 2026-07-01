@@ -1,5 +1,4 @@
 {
-    "_comment_recipe": "SimCSE training config for Gemma-2-2b, adapted from McGill-NLP/llm2vec/train_configs/simcse/Sheared-Llama.json. Deviations: attn_implementation=sdpa; peft_model_name_or_path points at the LOCAL MNTP output (run this AFTER MNTP training completes). simcse_dropout 0.3 matches paper (was 0.1 in our earlier attempt — too low).",
     "model_name_or_path": "google/gemma-2-2b",
     "peft_model_name_or_path": "runs/mcgill_gemma_repro/mntp",
     "simcse_dropout": 0.3,

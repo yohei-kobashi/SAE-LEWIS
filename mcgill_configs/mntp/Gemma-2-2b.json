@@ -1,5 +1,4 @@
 {
-    "_comment_recipe": "MNTP training config for Gemma-2-2b, adapted from McGill-NLP/llm2vec/train_configs/mntp/Sheared-Llama.json (the same-scale published recipe). Deviations from upstream: attn_implementation switched to sdpa (flash_attention_2 requires a build we don't have on the HPC ARM stack; SDPA is the same math, just slower).",
     "model_name_or_path": "google/gemma-2-2b",
     "dataset_name": "wikitext",
     "dataset_config_name": "wikitext-103-raw-v1",
