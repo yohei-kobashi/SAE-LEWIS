@@ -138,6 +138,10 @@ elif [[ -f "$MNTP_OUT/adapter_config.json" ]]; then
 else
     banner "[train-mcgill] MNTP"
     # Copy the config into RUN_ROOT with output_dir rewritten to match RUN_ROOT.
+    # Also auto-enable HF Trainer resume when we detect partial checkpoint
+    # dirs left over from a previous interrupted invocation, so re-running
+    # the same command after e.g. an HPC walltime kill picks up from the
+    # last save (save_steps: 200 in the config = at most 200 steps re-done).
     STAGE_CFG="$RUN_ROOT/_mntp_config.json"
     python - <<PYEOF
 import json, pathlib
@@ -146,6 +150,13 @@ cfg = json.loads(src.read_text())
 cfg["output_dir"] = "$MNTP_OUT"
 # Ensure model path is what we asked for at the shell level.
 cfg["model_name_or_path"] = "$BASE_MODEL"
+# HF Trainer accepts True (auto-detect latest checkpoint) or a specific path.
+mntp_out = pathlib.Path("$MNTP_OUT")
+if mntp_out.exists() and any(mntp_out.glob("checkpoint-*")):
+    cfg["resume_from_checkpoint"] = True
+    print(f"[stage-cfg] MNTP resume ENABLED (existing checkpoints found in {mntp_out})")
+else:
+    print("[stage-cfg] MNTP starting fresh (no prior checkpoints)")
 pathlib.Path("$STAGE_CFG").write_text(json.dumps(cfg, indent=2))
 PYEOF
     # Run McGill's training script from the vendored dir so relative paths
@@ -174,6 +185,13 @@ cfg["output_dir"] = "$SIMCSE_OUT"
 cfg["model_name_or_path"] = "$BASE_MODEL"
 cfg["peft_model_name_or_path"] = "$MNTP_OUT"
 cfg["dataset_file_path"] = "$WIKI1M_PATH"
+# Same resume plumbing as MNTP stage.
+simcse_out = pathlib.Path("$SIMCSE_OUT")
+if simcse_out.exists() and any(simcse_out.glob("checkpoint-*")):
+    cfg["resume_from_checkpoint"] = True
+    print(f"[stage-cfg] SimCSE resume ENABLED (existing checkpoints found in {simcse_out})")
+else:
+    print("[stage-cfg] SimCSE starting fresh (no prior checkpoints)")
 pathlib.Path("$STAGE_CFG").write_text(json.dumps(cfg, indent=2))
 PYEOF
     cd "$VENDOR_DIR"
