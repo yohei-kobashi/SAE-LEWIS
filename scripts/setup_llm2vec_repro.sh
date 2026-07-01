@@ -122,6 +122,18 @@ pip install --quiet llm2vec
 echo "[setup] installing mteb < 2 (older API expected by llm2vec docs)..."
 pip install --quiet "mteb<2"
 
+# llm2vec only requires peft >= 0.7, so pip's resolver accepted openr1's
+# inherited peft 0.19.1 (via our .pth) without installing a venv-local
+# copy. But peft 0.19 references torch.distributed.tensor.DTensor at
+# import-time of certain LoRA layer code, and openr1's torch 2.11 build
+# doesn't expose that submodule — every LLM2Vec.from_pretrained() call
+# then dies with `AttributeError: module 'torch.distributed' has no
+# attribute 'tensor'`. The check was added in peft 0.13; older versions
+# don't reach that code path. Force-install peft<0.13 in venv-local so
+# it shadows the openr1 one.
+echo "[setup] force-installing older peft (< 0.13) compatible with torch 2.11..."
+pip install --quiet --force-reinstall --no-deps "peft>=0.10,<0.13"
+
 echo "[setup] installing eval extras..."
 pip install --quiet seqeval scipy
 
