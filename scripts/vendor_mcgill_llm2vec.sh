@@ -95,13 +95,23 @@ if [[ -d "$VENDOR_DIR/llm2vec/models" ]]; then
         awk '{print "    llm2vec/models/" $0}'
 fi
 
+echo
+echo "===================================================================="
+echo " Applying Gemma-2 bidirectional patch"
+echo "===================================================================="
+# McGill upstream doesn't support Gemma2Config in _get_model_class;
+# scripts/patch_mcgill_gemma2.py adds bidirectional_gemma2.py and
+# wires it into llm2vec.py's registry. Idempotent, so safe to run
+# unconditionally on every vendor.
+python "$REPO_ROOT/scripts/patch_mcgill_gemma2.py"
+
 cat <<EOF
 
 Next: inspect the Gemma-2 pieces we'll build on top of.
 
     ls -la $VENDOR_DIR/train_configs/mntp/     # to find the closest Gemma config
     less $VENDOR_DIR/experiments/run_mntp.py    # to understand CLI
-    less $VENDOR_DIR/llm2vec/models/bidirectional_gemma.py   # bidir subclass
+    less $VENDOR_DIR/llm2vec/models/bidirectional_gemma2.py  # our patched Gemma-2 bidir
 
 Once we know the config shape, the next script (train_mcgill_llm2vec.sh)
 runs the vendored training pipeline against a Gemma-2-2b config in the
