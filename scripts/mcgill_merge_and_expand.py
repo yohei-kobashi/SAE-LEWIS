@@ -9,14 +9,33 @@ in — plus a tokenizer that has `[INS]`, `[DEL]`, `[MASK]` in the vocabulary.
 
 This script bridges the two:
 
-  1. Load the base model.
-  2. Stack the MNTP LoRA, merge_and_unload().
-  3. Stack the SimCSE LoRA, merge_and_unload().
+  1. Load the base model (LlamaForCausalLM etc.).
+  2. Manually apply the MNTP LoRA delta to each targeted linear layer.
+  3. Manually apply the SimCSE LoRA delta.
   4. Add `[INS]`, `[DEL]`, `[MASK]` to the tokenizer if missing.
   5. resize_token_embeddings() so the new rows are initialised via the
      mean-of-existing trick (same as `train_llm2vec.py`).
   6. Save the merged + expanded model + tokenizer as a drop-in
      `--llm2vec-dir` for downstream.
+
+Why manual merge and not peft.PeftModel.from_pretrained().merge_and_unload():
+
+  McGill trains its LoRA on top of an *inner* model class (LlamaBiForMNTP /
+  LlamaBiForSimCSE) that inherits from LlamaModel, not LlamaForCausalLM. So
+  the adapter tensor keys look like
+      base_model.model.layers.X.self_attn.q_proj.lora_B.weight
+  whereas peft, given a LlamaForCausalLM base, expects
+      base_model.model.model.layers.X.self_attn.q_proj.lora_B.weight
+  (note the extra `.model.` — LlamaForCausalLM has its layers under an inner
+  LlamaModel). peft's load_state_dict runs with strict=False and silently
+  ignores every mismatched key, so `PeftModel.from_pretrained` returns without
+  loading any adapter weights. The subsequent merge_and_unload therefore adds
+  `alpha/r · B_init · A_init = 0` and the base is unchanged. Diagnosed via
+  scripts/diagnose_mcgill_adapter.py, which showed the adapter file *did*
+  have well-trained lora_B tensors (max_norm ~1.5 for MNTP, ~0.53 for SimCSE).
+
+  Manual merge sidesteps the key mismatch entirely: we read A / B, compute
+  the delta ourselves, and write it directly to base.model.layers[i]... .
 
 The expanded rows are NOT trained here (McGill's training didn't see them
 either); they'll get trained in the editor/tagger stage. This matches our
@@ -61,16 +80,107 @@ def _dtype(s: str) -> torch.dtype:
             "float32": torch.float32}[s]
 
 
-def _sample_weight(model) -> torch.Tensor:
-    """Snapshot a q_proj row so we can verify each merge produced a real delta."""
-    return model.model.layers[0].self_attn.q_proj.weight.detach().float().clone()
+def _load_adapter_tensors(adapter_dir: Path) -> dict[str, torch.Tensor]:
+    for name in ("adapter_model.safetensors", "adapter_model.bin"):
+        p = adapter_dir / name
+        if not p.exists():
+            continue
+        if p.suffix == ".safetensors":
+            from safetensors.torch import load_file
+            return load_file(str(p))
+        return torch.load(p, map_location="cpu", weights_only=True)
+    raise SystemExit(f"[bridge] no adapter_model.{{safetensors,bin}} at {adapter_dir}")
+
+
+def _apply_lora_delta(base, adapter_dir: str, name: str) -> None:
+    """Read a peft LoRA adapter and merge its delta directly into `base`.
+
+    See the module docstring for why we don't use peft.merge_and_unload here.
+
+    Iterates over the adapter's (A, B) tensor pairs, computes the low-rank
+    delta `scaling · B @ A` for each targeted linear layer, resolves the
+    matching submodule in the CausalLM base (probing both the McGill
+    LlamaModel-flavoured path and the standard LlamaForCausalLM
+    `.model.…` path), and adds the delta to that submodule's weight in
+    place. Raises SystemExit if nothing merged, which strictly beats
+    peft's silent no-op behaviour.
+    """
+    ad = Path(adapter_dir)
+    cfg = json.loads((ad / "adapter_config.json").read_text())
+    r = cfg["r"]
+    alpha = cfg["lora_alpha"]
+    scaling = alpha / r
+    print(f"[{name}] adapter r={r}, lora_alpha={alpha}, scaling={scaling:.3f}")
+
+    tensors = _load_adapter_tensors(ad)
+
+    # Group by module_path (the tensor key without the trailing .lora_{A,B}.weight)
+    groups: dict[str, dict[str, torch.Tensor]] = {}
+    for k, v in tensors.items():
+        if ".lora_A.weight" in k:
+            groups.setdefault(k.replace(".lora_A.weight", ""), {})["A"] = v
+        elif ".lora_B.weight" in k:
+            groups.setdefault(k.replace(".lora_B.weight", ""), {})["B"] = v
+
+    n_applied = 0
+    n_missing_pair = 0
+    n_no_submodule = 0
+    n_shape_mismatch = 0
+    delta_norms: list[float] = []
+
+    for path, ab in groups.items():
+        if "A" not in ab or "B" not in ab:
+            n_missing_pair += 1
+            continue
+
+        # Strip peft's "base_model.model." wrapping prefix — everything after
+        # that is the path into the inner training-time model class.
+        clean_path = path
+        for prefix in ("base_model.model.", "base_model."):
+            if clean_path.startswith(prefix):
+                clean_path = clean_path[len(prefix):]
+                break
+
+        # Try the inner path as-is (works if base is a LlamaModel-flavoured
+        # class, matching McGill's training-time class), then fall back to
+        # `model.<inner_path>` (standard LlamaForCausalLM).
+        target = None
+        for cand in (clean_path, f"model.{clean_path}"):
+            try:
+                target = base.get_submodule(cand)
+                break
+            except AttributeError:
+                continue
+        if target is None:
+            n_no_submodule += 1
+            continue
+
+        A = ab["A"].to(torch.float32)  # (r, in)
+        B = ab["B"].to(torch.float32)  # (out, r)
+        delta = scaling * (B @ A)  # (out, in)
+
+        if delta.shape != target.weight.shape:
+            n_shape_mismatch += 1
+            continue
+
+        target.weight.data.add_(delta.to(target.weight.dtype))
+        delta_norms.append(delta.norm().item())
+        n_applied += 1
+
+    print(f"[{name}] merged {n_applied} LoRA-wrapped modules "
+          f"(skipped: missing_pair={n_missing_pair}, "
+          f"no_submodule={n_no_submodule}, shape_mismatch={n_shape_mismatch})")
+    if n_applied == 0:
+        raise SystemExit(f"[{name}] FATAL: no LoRA deltas applied. "
+                         "Check adapter file layout vs. base model structure.")
+    print(f"[{name}]   delta L2 norms: "
+          f"min={min(delta_norms):.4e} "
+          f"max={max(delta_norms):.4e} "
+          f"mean={sum(delta_norms)/len(delta_norms):.4e}")
 
 
 def main():
     args = parse_args()
-
-    # peft is only needed here — the downstream stages don't touch it.
-    from peft import PeftModel
 
     dtype = _dtype(args.dtype)
     out_dir = Path(args.output_dir)
@@ -91,27 +201,12 @@ def main():
 
     # ---- 2. Merge MNTP adapter -------------------------------------------
     print(f"[bridge] applying MNTP adapter {args.mntp_adapter}")
-    pre_mntp = _sample_weight(base)
-    peft_mntp = PeftModel.from_pretrained(base, args.mntp_adapter)
-    print("[bridge]   merging MNTP → base")
-    base = peft_mntp.merge_and_unload()
-    delta_mntp = (_sample_weight(base) - pre_mntp).abs().mean().item()
-    print(f"[bridge]   layer-0 q_proj delta (MNTP): {delta_mntp:.4e}")
-    if delta_mntp < 1e-8:
-        raise SystemExit("[bridge] FATAL: MNTP merge produced no weight change. "
-                         "Adapter path may be wrong or weights zeroed.")
+    _apply_lora_delta(base, args.mntp_adapter, name="MNTP")
 
     # ---- 3. Merge SimCSE adapter (optional) ------------------------------
     if args.simcse_adapter is not None:
         print(f"[bridge] applying SimCSE adapter {args.simcse_adapter}")
-        pre_simcse = _sample_weight(base)
-        peft_simcse = PeftModel.from_pretrained(base, args.simcse_adapter)
-        print("[bridge]   merging SimCSE → base")
-        base = peft_simcse.merge_and_unload()
-        delta_simcse = (_sample_weight(base) - pre_simcse).abs().mean().item()
-        print(f"[bridge]   layer-0 q_proj delta (SimCSE): {delta_simcse:.4e}")
-        if delta_simcse < 1e-8:
-            print("[bridge] WARNING: SimCSE merge produced no weight change.")
+        _apply_lora_delta(base, args.simcse_adapter, name="SimCSE")
 
     # ---- 4. Add SAE-LEWIS-specific tokens --------------------------------
     print(f"[bridge] adding special tokens: {args.add_special_tokens}")
