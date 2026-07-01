@@ -205,14 +205,58 @@ fi
 FINAL_DIR="$RUN_ROOT/final"
 banner "[train-mcgill] merging LoRA + adding special tokens → $FINAL_DIR"
 
+# McGill's run_mntp.py / run_simcse.py write two kinds of adapter dirs:
+#
+#   $OUT/checkpoint-N/         ← trainer's save_steps + save-on-stop path.
+#                                Guaranteed to contain the trained LoRA
+#                                (adapter_config.json + adapter_model.safetensors)
+#                                after each save_steps trigger.
+#   $OUT/                      ← trainer.save_model(output_dir) at the end.
+#                                Empirically unreliable when StopTrainingCallback
+#                                interrupts the loop: MNTP writes a stale/zero
+#                                adapter here (merge delta = 0.0e+00); SimCSE
+#                                skips this save entirely so nothing lands here.
+#
+# So: prefer the highest-N checkpoint dir. Fall back to $OUT only if no
+# checkpoint dir exists (should never happen after a full run, but keeps
+# the flow correct if someone hand-crafts an adapter dir).
+select_adapter_dir() {
+    local base="$1"
+    [[ -d "$base" ]] || { echo ""; return; }
+    local best_ck="" best_n=-1
+    for ck in "$base"/checkpoint-*; do
+        [[ -d "$ck" ]] || continue
+        local n="${ck##*checkpoint-}"
+        [[ "$n" =~ ^[0-9]+$ ]] || continue
+        if (( n > best_n )) && [[ -f "$ck/adapter_config.json" ]]; then
+            best_ck="$ck"; best_n=$n
+        fi
+    done
+    if [[ -n "$best_ck" ]]; then
+        echo "$best_ck"
+    elif [[ -f "$base/adapter_config.json" ]]; then
+        echo "$base"
+    fi
+}
+
+MNTP_ADAPTER=$(select_adapter_dir "$MNTP_OUT")
+SIMCSE_ADAPTER=$(select_adapter_dir "$SIMCSE_OUT")
+
+if [[ -z "$MNTP_ADAPTER" ]]; then
+    echo "[train-mcgill] FATAL: no MNTP adapter found under $MNTP_OUT" >&2
+    exit 1
+fi
+echo "[train-mcgill] MNTP adapter    : $MNTP_ADAPTER"
+echo "[train-mcgill] SimCSE adapter  : ${SIMCSE_ADAPTER:-<none>}"
+
 MERGE_ARGS=(
     --base-model "$BASE_MODEL"
-    --mntp-adapter "$MNTP_OUT"
+    --mntp-adapter "$MNTP_ADAPTER"
     --output-dir "$FINAL_DIR"
     --dtype bfloat16
 )
-if [[ "$SKIP_SIMCSE" -eq 0 && -f "$SIMCSE_OUT/adapter_config.json" ]]; then
-    MERGE_ARGS+=(--simcse-adapter "$SIMCSE_OUT")
+if [[ "$SKIP_SIMCSE" -eq 0 && -n "$SIMCSE_ADAPTER" ]]; then
+    MERGE_ARGS+=(--simcse-adapter "$SIMCSE_ADAPTER")
 else
     echo "[train-mcgill] (SimCSE adapter absent; saving Bi+MNTP only)"
 fi
