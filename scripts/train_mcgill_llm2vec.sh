@@ -255,7 +255,11 @@ MERGE_ARGS=(
     --output-dir "$FINAL_DIR"
     --dtype bfloat16
 )
-if [[ "$SKIP_SIMCSE" -eq 0 && -n "$SIMCSE_ADAPTER" ]]; then
+# --skip-simcse controls whether the training stage runs, not whether we
+# merge SimCSE. If a SimCSE adapter exists on disk (from a prior run) it
+# gets merged; only if the adapter dir truly has nothing do we fall
+# back to a Bi+MNTP-only checkpoint.
+if [[ -n "$SIMCSE_ADAPTER" ]]; then
     MERGE_ARGS+=(--simcse-adapter "$SIMCSE_ADAPTER")
 else
     echo "[train-mcgill] (SimCSE adapter absent; saving Bi+MNTP only)"
