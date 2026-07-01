@@ -39,3 +39,30 @@ HfArgumentParser rejects unknown keys with
 `ValueError: Some keys are not used by the HfArgumentParser: ['...']`.
 So the configs themselves must stay strictly recipe-only. All
 prose about the recipe lives in this README.
+
+## Sheared-LLaMA-1.3B configs (infrastructure validation)
+
+`mntp/Sheared-LLaMA.json` and `simcse/Sheared-LLaMA.json` are
+essentially verbatim copies of the McGill upstream
+`train_configs/{mntp,simcse}/Sheared-Llama.json`, with the same
+attn_implementation=sdpa override.
+
+Purpose: validate that our training infrastructure (isolated venv,
+orchestration, data loading) actually reproduces paper-level
+STS-B (~70+) on the exact base LLM the paper used.
+
+Why we run this before touching Gemma-2 subclass writing:
+- McGill code natively supports Sheared-LLaMA-1.3B, so training
+  runs without any subclass modifications on our side.
+- If we get STS-B ~70+, we know the pipeline is healthy — then
+  the only remaining work for Gemma-2 is writing the subclass
+  itself.
+- If STS-B < 60, there's a pipeline bug we need to find BEFORE
+  writing new code that would depend on it.
+
+Invocation:
+    MNTP_CONFIG=mcgill_configs/mntp/Sheared-LLaMA.json \
+    SIMCSE_CONFIG=mcgill_configs/simcse/Sheared-LLaMA.json \
+    BASE_MODEL=princeton-nlp/Sheared-LLaMA-1.3B \
+    RUN_ROOT=./runs/mcgill_sheared_repro \
+      bash scripts/train_mcgill_llm2vec.sh
