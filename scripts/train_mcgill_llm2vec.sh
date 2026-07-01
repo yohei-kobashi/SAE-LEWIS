@@ -35,6 +35,16 @@ MNTP_CONFIG=${MNTP_CONFIG:-"$REPO_ROOT/mcgill_configs/mntp/Gemma-2-2b.json"}
 SIMCSE_CONFIG=${SIMCSE_CONFIG:-"$REPO_ROOT/mcgill_configs/simcse/Gemma-2-2b.json"}
 BASE_MODEL=${BASE_MODEL:-"google/gemma-2-2b"}
 
+# The training script `cd`s into $VENDOR_DIR so it can find its own
+# `cache/wiki1m_for_simcse.txt` on relative paths. That breaks any
+# relative paths the caller passed in — a `./runs/mcgill_sheared_repro`
+# gets reinterpreted as `$VENDOR_DIR/runs/mcgill_sheared_repro`. Convert
+# everything user-facing to absolute NOW, before we touch anything else.
+mkdir -p "$RUN_ROOT"
+RUN_ROOT=$(cd "$RUN_ROOT" && pwd)
+MNTP_CONFIG=$(cd "$(dirname "$MNTP_CONFIG")" && pwd)/$(basename "$MNTP_CONFIG")
+SIMCSE_CONFIG=$(cd "$(dirname "$SIMCSE_CONFIG")" && pwd)/$(basename "$SIMCSE_CONFIG")
+
 WIKI1M_URL=${WIKI1M_URL:-"https://huggingface.co/datasets/princeton-nlp/datasets-for-simcse/resolve/main/wiki1m_for_simcse.txt"}
 WIKI1M_PATH=${WIKI1M_PATH:-"$VENDOR_DIR/cache/wiki1m_for_simcse.txt"}
 
