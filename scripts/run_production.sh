@@ -194,8 +194,11 @@ _SAE_PATH_SLUG="$(dirname "$SAE_PATH" | tr '/' '-')"
 SAE_CACHE_KEY="${_LLM_SLUG}_${_SAE_PATH_SLUG}_n${SAE_MAX_SENTS}"
 SAE_CACHE=${SAE_CACHE:-"$SHARED_CACHE_ROOT/sae/$SAE_CACHE_KEY"}
 
-LLM2VEC_DIR="$RUN_DIR/llm2vec"
-SIMCSE_DIR="$RUN_DIR/llm2vec_simcse"
+# Overridable so an externally-trained LLM2Vec checkpoint (e.g. the McGill
+# vendored route's merged output, train_mcgill_llm2vec.sh → $RUN_ROOT/final)
+# can be dropped in: its llm2vec_meta.json makes stages 01/01b skip.
+LLM2VEC_DIR=${LLM2VEC_DIR:-"$RUN_DIR/llm2vec"}
+SIMCSE_DIR=${SIMCSE_DIR:-"$RUN_DIR/llm2vec_simcse"}
 CORRUPTION_DIR="$RUN_DIR/corruption"
 TAGGER_DIR="$RUN_DIR/tagger"
 EDITOR_DIR="$RUN_DIR/editor"
