@@ -349,15 +349,25 @@ class CorruptionDataset(IterableDataset):
 
     def _iter_shard(self, path: Path) -> Iterator[Dict]:
         opener = gzip.open if str(path).endswith(".gz") else open
-        with opener(path, "rt", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        # A walltime kill during corruption.py can leave the last shard as a
+        # truncated gzip (no end-of-stream trailer). corruption.py's own
+        # resume tolerates this (it counts the readable lines and keeps the
+        # file); mirror that here — yield what is readable, then stop —
+        # instead of crashing mid-training with EOFError.
+        try:
+            with opener(path, "rt", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+        except (OSError, EOFError, gzip.BadGzipFile):
+            print(f"[CorruptionDataset] {path.name} is truncated "
+                  f"(interrupted corruption run?) — using the readable "
+                  f"prefix and continuing.")
 
     def __iter__(self) -> Iterator[Dict]:
         worker = get_worker_info()
