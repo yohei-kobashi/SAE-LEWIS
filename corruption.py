@@ -1694,6 +1694,27 @@ def main():
     ).to(args.device)
     extractor.eval()
 
+    # The SAE reads hidden_states[layer_idx] — the raw residual ENTERING
+    # layer `layer_idx`, recorded before that layer runs. Layers at or above
+    # layer_idx contribute nothing to it, so drop them: the kept prefix
+    # computes bit-identical activations while skipping ~half the forward
+    # (and freeing the dropped layers' weights on the GPU). The extractor's
+    # LLM is used solely for this hidden state (sae_encode_with_offsets);
+    # SLOR / PPL scoring runs on the separate full `causal_llm`.
+    _inner = extractor.llm
+    if hasattr(_inner, "layers"):
+        _n_full = len(_inner.layers)
+        # hidden_states[i] is recorded as the INPUT to layer i just before it
+        # runs, so layer `layer_idx` itself must stay in the loop for index
+        # `layer_idx` to hold the raw (pre-norm) residual.
+        _n_keep = int(extractor.layer_idx) + 1
+        if _n_keep < _n_full:
+            _inner.layers = _inner.layers[:_n_keep]
+            _inner.config.num_hidden_layers = _n_keep
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            print(f"[corruption] SAE forward truncated to {_n_keep}/{_n_full} "
+                  f"layers (hidden_states[{extractor.layer_idx}] is unchanged)")
+
     print(f"[corruption] loading corruption MLM: {args.mlm_model}")
     mlm = MLMProvider(args.mlm_model, dtype=_str_dtype(args.mlm_dtype)).to(args.device)
     print(f"[corruption] resolved MLM: {mlm.resolved_name}  mask={mlm.mask_token!r}")
