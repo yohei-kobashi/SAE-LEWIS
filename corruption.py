@@ -364,14 +364,19 @@ def find_token_at_char(
     offsets: List[Tuple[int, int]],
     char_pos: int,
 ) -> Optional[int]:
-    """Return the index of the token whose char range starts at or after `char_pos`.
+    """Return the index of the first token whose char range extends past
+    `char_pos` — the token covering `char_pos`, or the first one after it.
 
     Used for finding the INS gap marker position (zero-width gap in xp_text).
+    SentencePiece tokens absorb the preceding space, so the token following
+    a deletion gap typically STARTS one char before the gap (at the space);
+    matching on `s >= char_pos` would skip it and return the token one
+    position too far right, misaligning the INS gold.
     """
     for i, (s, e) in enumerate(offsets):
         if s == 0 and e == 0:
             continue
-        if s >= char_pos:
+        if e > char_pos:
             return i
     return None  # gap at end of sequence
 
