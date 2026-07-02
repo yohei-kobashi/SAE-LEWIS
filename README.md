@@ -421,9 +421,12 @@ Compound corruption layers multiple ops on a single clean sentence by composing 
 1. Sample clean sentence X.
 2. Sample N ~ truncated geometric (p ≈ 0.4), capped at N_MAX (default 5).
    N=0 is identity. N=1 is single-op. N ≥ 2 is multi-op compound.
-3. Sample op types op_1..op_N i.i.d. from {REPL, INS, DEL} with weights
-   (0.70, 0.18, 0.12) — calibrated to the LinguaLens English op-type
-   ratio (see `runs/lingualens_token_diff.md`).
+3. Sample op types op_1..op_N i.i.d. from {REPL, INS, DEL} with the
+   PROPOSAL weights (default 0.60, 0.34, 0.06). These are pre-gate
+   sampling weights, calibrated so the ACCEPTED op-type mix matches the
+   LinguaLens English ratio (REPL 0.70 / INS 0.18 / DEL 0.12;
+   `runs/lingualens_token_diff.md`) after the non-op-type-neutral gates
+   of §6.2.6 — see §6.2.7.
 4. Assign each op a non-overlapping word span on X. INS spans are drawn
    with the priority bias of §6.2.3. REPL and DEL spans use uniform
    random word positions (REPL relies on MLM top-K for substitution
@@ -484,6 +487,40 @@ The calibration is **self-consistent on the same Dolma + MLM compound distributi
 
 The expected per-attempt yield after calibration is ~50% at the chosen percentiles, keeping `K_BUDGET = 6` adequate for almost all source sentences.
 
+#### 6.2.7 Op-type proposal weights — gate-aware calibration
+
+The op-type ratio that matters is the one the editor and tagger actually train on: the **accepted** distribution, after the rejection-sampling gates of §6.2.6. Our target for that accepted distribution is the LinguaLens English op-type histogram (REPL 70.0% / INS 18.2% / DEL 11.8%; `runs/lingualens_token_diff.md`).
+
+The gates are **not op-type-neutral**, so sampling op *proposals* directly at the target ratio does not reproduce it after gating. The dominant gate is the SLOR fluency bound, and the three op types load it very differently *by construction*:
+
+- **INS** deletes real words — modifiers, function words, sentence-initial tokens (§6.2.3) — with **no MLM recoverability gate**: the span is chosen for syntactic role, not for how fluent the residue reads. Its X′ therefore incurs the largest average SLOR drop and is rejected most often.
+- **DEL** inserts words the MLM judges **plausible at that position** (§6.2.4), so X′ stays fluent by construction and is rejected least often.
+- **REPL** substitutes via MLM top-K (§6.2.2), a moderate fluency perturbation, and is accepted at close to its proposal rate.
+
+Concretely, with op gold-alignment correct, sampling proposals at the target weights `p⁰ = (REPL 0.70, INS 0.18, DEL 0.12)` yields an accepted mix of `q ≈ (REPL 0.69, INS 0.06, DEL 0.25)` measured over ~2.7k accepted ops on a pilot shard — INS undershoots the target by ≈3× and DEL overshoots by ≈2×, exactly matching the mechanism above.
+
+We therefore treat the proposal weights as free parameters and calibrate them so the **accepted** mix matches the target. From the pilot, define the effective per-op acceptance factor
+
+```
+a_op = q_op / p⁰_op          →   a_REPL ≈ 0.98,  a_INS ≈ 0.33,  a_DEL ≈ 2.09
+```
+
+and set the proposal weights to the damped inverse-acceptance reweighting of the target `t = (0.70, 0.18, 0.12)`:
+
+```
+w_op ∝ t_op / a_op^γ ,   renormalised to sum 1,     γ ∈ (0, 1]
+```
+
+The damping exponent `γ` trades exactness against robustness. Full inversion (`γ = 1`) drives the accepted mix onto the target *in expectation* but overfits a single pilot shard's finite-sample acceptance estimate (and would swing DEL down to ≈0.04, where ordinary sampling noise across shards becomes large relative to the weight). We use `γ ≈ 0.65`, giving
+
+```
+w = (REPL 0.60, INS 0.34, DEL 0.06)
+```
+
+which is the default in `corruption.py` and the `OP_WEIGHT_{REPL,INS,DEL}` default in `scripts/corruption_parallel.sh`. The exact weights are not load-bearing: what matters is that the *accepted* mix approaches the LinguaLens target. Because the acceptance factors `a_op` depend on the gate threshold, the corruption MLM, and the SAE/encoder, the weights are **re-verified on the first pilot shard of any run** and re-tuned if a configuration change shifts `a_op` — the same self-consistency principle as the SLOR calibration in §6.2.6.
+
+This calibration is orthogonal to the two other distributional controls: §6.2.6 sets *how many* compounds pass at each N (per-N yield), §6.3.1 sets the *N* distribution (op-count per sample), and this step sets the op-*type* distribution within accepted compounds. All three are calibrated on the same Dolma + MLM source the editor trains on.
+
 ### 6.3 Phase A — Unified Corruption Pretraining (`train_editor_phaseA.py`)
 
 A single end-to-end training phase trains the editor and the tagger on the same corruption stream.
@@ -506,7 +543,7 @@ Bucket selection is implemented as **rejection on N after sampling**: a fresh se
 | Variable | Range | Distribution |
 | --- | --- | --- |
 | `N_total` per sample | 0..N_MAX (default 5) | truncated geometric, p ≈ 0.4 |
-| op type within compound | {REPL, INS, DEL} | (0.70, 0.18, 0.12) — calibrated to LinguaLens English op-type ratio |
+| op type within compound (proposal) | {REPL, INS, DEL} | (0.60, 0.34, 0.06) — pre-gate weights; accepted mix ≈ LinguaLens 0.70 / 0.18 / 0.12 (§6.2.7) |
 | `p_high` (INS HIGH-priority bias) | 0.85 | flat |
 | `ins_span_length` per INS op | 1..L_MAX | log-uniform |
 | `del_span_length` per DEL op | 1..L_MAX_DEL | log-uniform (typically L_MAX_DEL ≤ L_MAX) |
@@ -783,12 +820,15 @@ sample_buckets:
 compound:
   n_max:                 5        # cap on op count per sample
   n_distribution_p:      0.4      # truncated geometric over {0..N_MAX}
-  op_weights:                     # per-op type within a compound
-    # Calibrated to LinguaLens English op-type ratio (REPL 70.0% /
-    # INS 18.2% / DEL 11.8%).
-    repl:                0.70
-    ins:                 0.18
-    del:                 0.12
+  op_weights:                     # PROPOSAL weights (pre-gate). The gates
+    # of §6.2.6 are not op-type-neutral (SLOR rejects INS's natural-word
+    # deletions hardest, passes DEL's MLM-plausible insertions easiest), so
+    # these differ from the TARGET accepted mix. Calibrated per §6.2.7 so
+    # the ACCEPTED op-type ratio matches LinguaLens English (REPL 70.0% /
+    # INS 18.2% / DEL 11.8%). Override via OP_WEIGHT_{REPL,INS,DEL}.
+    repl:                0.60     # accepted ≈ 0.70
+    ins:                 0.34     # accepted ≈ 0.18
+    del:                 0.06     # accepted ≈ 0.12
   k_budget:              6        # first-accept rejection attempts per source sentence
   apply_order:           "right_to_left"
 

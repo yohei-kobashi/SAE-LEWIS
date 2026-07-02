@@ -63,9 +63,9 @@ SEED=${SEED:-42}
 # Acceptance is not type-neutral (e.g. the SLOR gate hits INS's natural-word
 # deletions harder than MLM-proposed REPL/DEL edits), so bump a type's weight
 # to compensate when its ACCEPTED share lands below the calibrated target.
-OP_WEIGHT_REPL=${OP_WEIGHT_REPL:-0.70}
-OP_WEIGHT_INS=${OP_WEIGHT_INS:-0.18}
-OP_WEIGHT_DEL=${OP_WEIGHT_DEL:-0.12}
+OP_WEIGHT_REPL=${OP_WEIGHT_REPL:-0.60}
+OP_WEIGHT_INS=${OP_WEIGHT_INS:-0.34}
+OP_WEIGHT_DEL=${OP_WEIGHT_DEL:-0.06}
 
 mkdir -p "$OUT_DIR"
 

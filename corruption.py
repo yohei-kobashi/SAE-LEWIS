@@ -168,14 +168,18 @@ def parse_args():
                    help="Cap on op count per compound sample.")
     p.add_argument("--n-distribution-p", type=float, default=0.4,
                    help="Truncated geometric parameter for N over {0..N_MAX}.")
-    # Op weights calibrated to the LinguaLens English op-type histogram
-    # (REPL 70.0% / INS 18.2% / DEL 11.8%). Minimal-pair edits skew
-    # toward word substitutions (passivisation, synonym swap, etc.);
-    # INS / DEL are less common than the previous (0.55, 0.25, 0.20)
-    # default assumed.
-    p.add_argument("--op-weight-repl", type=float, default=0.70)
-    p.add_argument("--op-weight-ins",  type=float, default=0.18)
-    p.add_argument("--op-weight-del",  type=float, default=0.12)
+    # PROPOSAL weights (pre-gate), calibrated so the ACCEPTED op-type mix
+    # matches the LinguaLens English histogram (REPL 70.0% / INS 18.2% /
+    # DEL 11.8%). The gates (§6.2.6) are not op-type-neutral: the SLOR
+    # fluency bound rejects INS's natural-word deletions hardest and passes
+    # DEL's MLM-plausible insertions easiest, so proposing at the target
+    # ratio undershoots INS by ~3x and overshoots DEL by ~2x. The weights
+    # below are the damped inverse-acceptance reweighting of the target
+    # (README §6.2.7); re-verify the accepted mix on a pilot shard if the
+    # gate / MLM / SAE / encoder changes.
+    p.add_argument("--op-weight-repl", type=float, default=0.60)
+    p.add_argument("--op-weight-ins",  type=float, default=0.34)
+    p.add_argument("--op-weight-del",  type=float, default=0.06)
     p.add_argument("--op-position-max-retries", type=int, default=20,
                    help="Per-op attempts to find a non-conflicting position "
                         "before giving up on the compound.")
