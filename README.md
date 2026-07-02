@@ -690,6 +690,7 @@ A sharded JSON-lines (or binary) file with one record per training sample:
 | `ranker.py` | SAE align + fluency + content + length penalty |
 | `evaluate_intervention.py` | end-to-end inference + metrics |
 | `eval_llm2vec.py` | standalone evaluation of an MNTP'd checkpoint along 5 axes (§13.3); writes `eval_report.md` + `eval_metrics.json` |
+| `eval_tagger_editor.py` | held-out evaluation of the trained tagger + editor on a dev corruption cache: per-class P/R/F1 + confusion + span IoU (tagger), per-position-type accuracy + [DEL]-logit separation (editor), and the 3-condition (true / empty / random) conditioning-causality probe (§13.5) |
 | `model.py` | shared model classes (incl. `_patch_attention_bidirectional`, `BidirectionalLLM`, `MLMProvider`, `SAEFeatureExtractor`) |
 | `intervene.py` | intervention spec helpers |
 | `data.py` | data loading utilities |
@@ -955,6 +956,39 @@ Artifacts (`$RUN_DIR/measure_n/`):
 - `n{N}/calibration.jsonl` per-attempt records
 - `report.tsv` per-N percentile + per-grid yield summary
 - `report.md` human-readable version
+
+### 13.5 Tagger / editor held-out evaluation
+
+`eval_tagger_editor.py` runs the per-stage metrics of §13.1 plus a conditioning-causality probe on a **dev corruption cache** — generated from Dolma sentences disjoint from the training cache:
+
+```bash
+# 1. Dev cache: same seed as training (identical stream order), skipping
+#    past the sentences training consumed (meta.json / "sentences_seen").
+SEEN=$(python -c "import json;print(json.load(open('runs/prod/corruption/meta.json'))['sentences_seen'])")
+python corruption.py --out-dir runs/prod/corruption_dev \
+    --llm2vec-dir <merged ckpt> --target-samples 3000 \
+    --seed 42 --skip-sentences "$SEEN"
+
+# 2. Evaluate both models (either ckpt can be omitted)
+python eval_tagger_editor.py \
+    --corruption-dir runs/prod/corruption_dev \
+    --llm2vec-dir <merged ckpt> \
+    --tagger-ckpt runs/prod/tagger/tagger-final.pt \
+    --editor-ckpt runs/prod/editor/editor-final.pt \
+    --output-dir runs/prod/eval_tagger_editor
+```
+
+**Level 1 (held-out accuracy).** Tagger: per-class P/R/F1, confusion matrix, macro-F1 against the all-KEEP baseline (which the tagger must beat — plain accuracy is dominated by KEEP), edit-span IoU. Editor: argmax accuracy split by position type (KEEP identity, REPL/INS restoration top-1/5, DEL → `[DEL]`), overgenerate / undergenerate rates, and the `[DEL]`-logit separation between DEL and KEEP positions — the direct health check for the tied output-column delta (§4.3).
+
+**Level 2 (conditioning causality).** Every sample is evaluated under three paired conditions: `true` (diff-based z, as trained, empty-prob 0), `empty` (z = 0), and `random` (same k and same magnitudes as `true` at random feature indices). Verdicts per probe:
+
+| Signal | Reading |
+| --- | --- |
+| Δ(true − empty) ≈ 0 | conditioning IGNORED — check `cond_scale` (→0 = model muted the prefix), Proj_A, or over-strong sub-sampling (C11) |
+| Δ(true − random) ≪ Δ(true − empty) | OPAQUE-FLAG warning — conditioning works as a generic "something changed" cue, not SAE feature identity; the `random-conditioning` ablation (§13.2) would fail |
+| both gaps clearly positive | conditioning is used AND SAE-grounded |
+
+Diagnostics reported alongside: `cond_scale`, `‖Proj_A.W‖`, and per-token `delta_emb` norms. Outputs `eval_report.md` + `eval_metrics.json`.
 
 ## 14. References
 

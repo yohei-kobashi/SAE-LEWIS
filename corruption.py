@@ -269,6 +269,13 @@ def parse_args():
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--skip-sentences", type=int, default=0,
+                   help="Skip the first N Dolma sentences before sampling. "
+                        "Use this to generate a held-out DEV cache disjoint "
+                        "from a training cache: pass the training run's "
+                        "`sentences_seen` (from its meta.json) with the SAME "
+                        "--seed so the sentence stream order matches and the "
+                        "dev sources start where training stopped.")
     # Resume: default ON. Counts samples in existing shards under --out-dir,
     # advances the Dolma stream past the source_sent_id of the last written
     # sample, and continues writing until target_samples is reached. RNG
@@ -1824,6 +1831,14 @@ def main():
                   f"{written} >= target {args.target_samples}; nothing to do")
             return
         sent_idx = last_sent_idx
+
+    # Held-out (dev) generation: start the stream past the sentences a
+    # training cache consumed. Resume skip takes precedence when larger.
+    if args.skip_sentences > skip_n_sentences:
+        skip_n_sentences = args.skip_sentences
+        sent_idx = args.skip_sentences
+        print(f"[corruption] --skip-sentences: starting at Dolma sentence "
+              f"{args.skip_sentences}")
 
     calibration_writer_mode = "at" if args.resume and written > 0 else "wt"
     calibration_writer = None
