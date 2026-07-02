@@ -130,8 +130,12 @@ class SAEEditor(nn.Module):
 
     def _calibrate_cond(self, x: torch.Tensor) -> torch.Tensor:
         """RMS-normalize a (B, d_model) cond vector to the calibrated target."""
-        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
-        return x / (rms + 1e-6) * (self.cond_target_rms * self.cond_scale)
+        # eps INSIDE the sqrt: empty-conditioning samples (z all-zero) give
+        # x == 0, and sqrt'(0) is infinite. With eps added after the sqrt the
+        # gradient still blows up the instant Proj_A is unfrozen, NaN-ing the
+        # whole run. Folding eps under the sqrt keeps the gradient finite.
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        return x / rms * (self.cond_target_rms * self.cond_scale)
 
     def cond_embeds(self, z_amp: torch.Tensor, z_sup: torch.Tensor) -> torch.Tensor:
         """Build the (B, 2, d_model) prefix conditioning tensor."""
