@@ -68,15 +68,25 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.llm2vec_dir)
     ins_id = tokenizer.convert_tokens_to_ids("[INS]")
     del_id = tokenizer.convert_tokens_to_ids("[DEL]")
+    mask_id = tokenizer.mask_token_id
+    if mask_id is None or ins_id is None or del_id is None:
+        raise SystemExit(
+            f"[phase-a] tokenizer at {args.llm2vec_dir} lacks the special "
+            f"tokens (mask={mask_id}, ins={ins_id}, del={del_id}) — is this "
+            f"a merged+expanded checkpoint (mcgill_merge_and_expand.py)?")
 
     meta = json.loads((Path(args.corruption_dir) / "meta.json").read_text())
     d_sae = int(meta["d_sae"])
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
              "float32": torch.float32}[args.llm_dtype]
+    # [MASK] is trainable too: with the McGill LLM2Vec route the special
+    # tokens are added AFTER MNTP/SimCSE by mcgill_merge_and_expand.py
+    # (mean-init, never seen a gradient), so unlike the old train_llm2vec.py
+    # route there is no "MNTP-trained [MASK] row" to inherit.
     editor = SAEEditor(
         args.llm2vec_dir, d_sae=d_sae, dtype=dtype,
-        train_token_ids={"[INS]": ins_id, "[DEL]": del_id},
+        train_token_ids={"[INS]": ins_id, "[DEL]": del_id, "[MASK]": mask_id},
     ).to(args.device)
 
     # Initial freeze of Proj_A

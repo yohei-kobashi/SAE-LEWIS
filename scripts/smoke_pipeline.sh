@@ -443,35 +443,12 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# Stage 3: tagger
-# --------------------------------------------------------------------------- #
-if [[ -f "$TAGGER_CKPT" ]]; then
-    skip_stage "03_train_tagger" "exists at $TAGGER_CKPT"
-else
-    run_stage "03_train_tagger" \
-        python train_tagger.py \
-            --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
-            --output-dir "$TAGGER_DIR" \
-            --max-steps "$TAGGER_STEPS" \
-            --warmup-steps 20 \
-            --proj-a-freeze-steps 50 \
-            --batch-size "$BATCH_SIZE" \
-            --num-workers "$NUM_WORKERS" \
-            --save-steps "$TAGGER_STEPS" \
-            --logging-steps 20 \
-            --estimate-class-weights-batches 50 \
-            --device "$DEVICE" \
-            --seed "$SEED"
-fi
-
-# --------------------------------------------------------------------------- #
-# Stage 4: editor phase A
+# Stage 3: editor phase A (before the tagger — it warm-starts from this ckpt)
 # --------------------------------------------------------------------------- #
 if [[ -f "$EDITOR_CKPT" ]]; then
-    skip_stage "04_train_editor_phaseA" "exists at $EDITOR_CKPT"
+    skip_stage "03_train_editor_phaseA" "exists at $EDITOR_CKPT"
 else
-    run_stage "04_train_editor_phaseA" \
+    run_stage "03_train_editor_phaseA" \
         python train_editor_phaseA.py \
             --corruption-dir "$CORRUPTION_DIR" \
             --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
@@ -483,6 +460,30 @@ else
             --num-workers "$NUM_WORKERS" \
             --save-steps "$EDITOR_STEPS" \
             --logging-steps 20 \
+            --device "$DEVICE" \
+            --seed "$SEED"
+fi
+
+# --------------------------------------------------------------------------- #
+# Stage 4: tagger (warm-starts Proj_A / type_emb / cond_scale from the editor)
+# --------------------------------------------------------------------------- #
+if [[ -f "$TAGGER_CKPT" ]]; then
+    skip_stage "04_train_tagger" "exists at $TAGGER_CKPT"
+else
+    run_stage "04_train_tagger" \
+        python train_tagger.py \
+            --corruption-dir "$CORRUPTION_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
+            --output-dir "$TAGGER_DIR" \
+            --init-proj-a-from "$EDITOR_CKPT" \
+            --max-steps "$TAGGER_STEPS" \
+            --warmup-steps 20 \
+            --proj-a-freeze-steps 50 \
+            --batch-size "$BATCH_SIZE" \
+            --num-workers "$NUM_WORKERS" \
+            --save-steps "$TAGGER_STEPS" \
+            --logging-steps 20 \
+            --estimate-class-weights-batches 50 \
             --device "$DEVICE" \
             --seed "$SEED"
 fi
@@ -646,8 +647,8 @@ echo
 llm2vec_sec=$(elapsed_of "01_train_llm2vec")
 simcse_sec=$(elapsed_of  "01b_train_simcse")
 corr_sec=$(elapsed_of    "02_corruption")
-tag_sec=$(elapsed_of     "03_train_tagger")
-ed_sec=$(elapsed_of      "04_train_editor_phaseA")
+ed_sec=$(elapsed_of      "03_train_editor_phaseA")
+tag_sec=$(elapsed_of     "04_train_tagger")
 len_sec=$(elapsed_of     "05_train_length_head")
 
 llm2vec_ratio=$(awk -v ps="$PROD_LLM2VEC_STEPS" -v pb="$PROD_LLM2VEC_BATCH" \
@@ -672,8 +673,8 @@ len_ratio=$(awk     -v ps="$PROD_LENGTH_STEPS"  -v pb="$PROD_LENGTH_BATCH" \
 extrap_row "01_train_llm2vec"       "$llm2vec_sec" "$llm2vec_ratio"
 extrap_row "01b_train_simcse"       "$simcse_sec"  "$simcse_ratio"
 extrap_row "02_corruption"          "$corr_sec"    "$corr_ratio"
-extrap_row "03_train_tagger"        "$tag_sec"     "$tag_ratio"
-extrap_row "04_train_editor_phaseA" "$ed_sec"      "$ed_ratio"
+extrap_row "03_train_editor_phaseA" "$ed_sec"      "$ed_ratio"
+extrap_row "04_train_tagger"        "$tag_sec"     "$tag_ratio"
 extrap_row "05_train_length_head"   "$len_sec"     "$len_ratio"
 
 prod_total=$(awk -v a="$llm2vec_sec" -v ar="$llm2vec_ratio" \
@@ -747,8 +748,8 @@ if [[ "$GPU_AVAILABLE" -eq 1 ]] && [[ "$(wc -l < "$GPU_TSV")" -gt 1 ]]; then
     banner "[smoke] recommended batch sizes for production"
     recommend_batch "01_train_llm2vec"       "$LLM2VEC_BATCH" "LLM2Vec MNTP (per-device)"
     recommend_batch "01b_train_simcse"       "$SIMCSE_BATCH"  "SimCSE (per-device)"
-    recommend_batch "03_train_tagger"        "$BATCH_SIZE"    "Tagger"
-    recommend_batch "04_train_editor_phaseA" "$BATCH_SIZE"    "Editor (Phase A)"
+    recommend_batch "03_train_editor_phaseA" "$BATCH_SIZE"    "Editor (Phase A)"
+    recommend_batch "04_train_tagger"        "$BATCH_SIZE"    "Tagger"
     recommend_batch "05_train_length_head"   "$BATCH_SIZE"    "Length head"
 
     cat <<'NOTE'

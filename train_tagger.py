@@ -48,6 +48,13 @@ def parse_args():
                    help="Number of warmup batches used to estimate inverse-freq class weights.")
     p.add_argument("--class-weight-smoothing", type=float, default=0.5)
 
+    p.add_argument("--init-proj-a-from", default=None,
+                   help="Editor checkpoint (.pt from train_editor_phaseA.py) "
+                        "whose trained Proj_A / type_emb / cond_scale warm-"
+                        "start the tagger (README C2: shared conditioning "
+                        "interface). Train the editor first, then pass its "
+                        "editor-final.pt here.")
+
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
@@ -86,6 +93,21 @@ def main():
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
              "float32": torch.float32}[args.llm_dtype]
     tagger = SAETagger(args.llm2vec_dir, d_sae=d_sae, dtype=dtype).to(args.device)
+
+    # Warm-start the conditioning interface from the trained editor. The
+    # editor's all-position CE through the LM head gives Proj_A a much
+    # richer gradient than the 4-class tagger loss, so we train the editor
+    # first and initialize the tagger's copy from it.
+    if args.init_proj_a_from:
+        blob = torch.load(args.init_proj_a_from, map_location="cpu", weights_only=False)
+        sd = blob["trainable"]
+        tagger.proj_a.weight.data.copy_(sd["proj_a.weight"].to(tagger.proj_a.weight.dtype))
+        tagger.proj_a.bias.data.copy_(sd["proj_a.bias"].to(tagger.proj_a.bias.dtype))
+        tagger.type_emb.weight.data.copy_(sd["type_emb.weight"].to(tagger.type_emb.weight.dtype))
+        if "cond_scale" in sd:
+            tagger.cond_scale.data.copy_(sd["cond_scale"].to(tagger.cond_scale.dtype))
+        print(f"[tagger] warm-started Proj_A / type_emb / cond_scale "
+              f"from {args.init_proj_a_from}")
 
     for p in tagger.proj_a.parameters():
         p.requires_grad_(False)

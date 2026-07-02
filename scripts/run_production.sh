@@ -473,36 +473,15 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# Stage 3: tagger — per-token KEEP/REPL/INS/DEL classifier
-# --------------------------------------------------------------------------- #
-if [[ -f "$TAGGER_CKPT" ]]; then
-    skip_stage "03_train_tagger" "exists at $TAGGER_CKPT"
-else
-    run_stage "03_train_tagger" \
-        python train_tagger.py \
-            --corruption-dir "$CORRUPTION_DIR" \
-            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
-            --output-dir "$TAGGER_DIR" \
-            --max-steps "$TAGGER_STEPS" \
-            --warmup-steps 500 \
-            --proj-a-freeze-steps 500 \
-            --batch-size "$TAGGER_BATCH" \
-            --num-workers "$NUM_WORKERS" \
-            --save-steps 2000 \
-            --logging-steps 50 \
-            --estimate-class-weights-batches 200 \
-            --device "$DEVICE" \
-            --seed "$SEED" \
-            $RESUME_FLAG
-fi
-
-# --------------------------------------------------------------------------- #
-# Stage 4: editor (Phase A) — unified corruption pretraining
+# Stage 3: editor (Phase A) — unified corruption pretraining
+#   Runs BEFORE the tagger: the editor's all-position CE gives Proj_A the
+#   richest gradient, and the tagger warm-starts its conditioning interface
+#   (Proj_A / type_emb / cond_scale) from editor-final.pt (README C2).
 # --------------------------------------------------------------------------- #
 if [[ -f "$EDITOR_CKPT" ]]; then
-    skip_stage "04_train_editor_phaseA" "exists at $EDITOR_CKPT"
+    skip_stage "03_train_editor_phaseA" "exists at $EDITOR_CKPT"
 else
-    run_stage "04_train_editor_phaseA" \
+    run_stage "03_train_editor_phaseA" \
         python train_editor_phaseA.py \
             --corruption-dir "$CORRUPTION_DIR" \
             --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
@@ -514,6 +493,31 @@ else
             --num-workers "$NUM_WORKERS" \
             --save-steps 2000 \
             --logging-steps 50 \
+            --device "$DEVICE" \
+            --seed "$SEED" \
+            $RESUME_FLAG
+fi
+
+# --------------------------------------------------------------------------- #
+# Stage 4: tagger — per-token KEEP/REPL/INS/DEL classifier
+# --------------------------------------------------------------------------- #
+if [[ -f "$TAGGER_CKPT" ]]; then
+    skip_stage "04_train_tagger" "exists at $TAGGER_CKPT"
+else
+    run_stage "04_train_tagger" \
+        python train_tagger.py \
+            --corruption-dir "$CORRUPTION_DIR" \
+            --llm2vec-dir "$DOWNSTREAM_LLM2VEC_DIR" \
+            --output-dir "$TAGGER_DIR" \
+            --init-proj-a-from "$EDITOR_CKPT" \
+            --max-steps "$TAGGER_STEPS" \
+            --warmup-steps 500 \
+            --proj-a-freeze-steps 500 \
+            --batch-size "$TAGGER_BATCH" \
+            --num-workers "$NUM_WORKERS" \
+            --save-steps 2000 \
+            --logging-steps 50 \
+            --estimate-class-weights-batches 200 \
             --device "$DEVICE" \
             --seed "$SEED" \
             $RESUME_FLAG

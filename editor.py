@@ -78,6 +78,20 @@ class SAEEditor(nn.Module):
         self.type_emb = nn.Embedding(3, d_model)
         nn.init.normal_(self.type_emb.weight, std=0.02)
 
+        # Conditioning scale calibration. Gemma multiplies inputs_embeds by
+        # sqrt(hidden_size) internally, and z values are raw SAE activation
+        # deltas whose magnitude varies per feature by orders of magnitude.
+        # Each cond vector is RMS-normalized to the median token-embedding
+        # row RMS so the prefix neither vanishes against type_emb nor pushes
+        # the frozen encoder off distribution. cond_scale is a learnable
+        # global gain on top (init 1.0).
+        with torch.no_grad():
+            emb_w = self.encoder.get_input_embeddings().weight
+            row_rms = emb_w.float().pow(2).mean(dim=-1).sqrt()
+            target_rms = row_rms.median()
+        self.register_buffer("cond_target_rms", target_rms.to(torch.float32))
+        self.cond_scale = nn.Parameter(torch.ones(1))
+
         # Trainable rows for [INS] and [DEL] embeddings within the encoder's
         # input embedding. We carry a parameter slice that is added at the
         # right token-id rows during forward — keeps the encoder frozen
@@ -114,11 +128,16 @@ class SAEEditor(nn.Module):
                 emb = emb + d_add * mask.unsqueeze(-1).to(emb.dtype)
         return emb
 
+    def _calibrate_cond(self, x: torch.Tensor) -> torch.Tensor:
+        """RMS-normalize a (B, d_model) cond vector to the calibrated target."""
+        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return x / (rms + 1e-6) * (self.cond_target_rms * self.cond_scale)
+
     def cond_embeds(self, z_amp: torch.Tensor, z_sup: torch.Tensor) -> torch.Tensor:
         """Build the (B, 2, d_model) prefix conditioning tensor."""
         # Proj_A in float32; cast back to encoder dtype at the boundary.
-        amp = self.proj_a(z_amp.to(self.proj_a.weight.dtype))  # (B, d_model)
-        sup = self.proj_a(z_sup.to(self.proj_a.weight.dtype))
+        amp = self._calibrate_cond(self.proj_a(z_amp.to(self.proj_a.weight.dtype)))  # (B, d_model)
+        sup = self._calibrate_cond(self.proj_a(z_sup.to(self.proj_a.weight.dtype)))
         # Add type embeddings
         type_amp = self.type_emb(torch.full((amp.shape[0],), 1, device=amp.device, dtype=torch.long))
         type_sup = self.type_emb(torch.full((sup.shape[0],), 2, device=sup.device, dtype=torch.long))
@@ -157,6 +176,19 @@ class SAEEditor(nn.Module):
         h_text = h[:, 2:, :]                                    # (B, T, d_model)
         logits = self.lm_head(h_text.to(self.lm_head.weight.dtype))
 
+        # Tied output-side correction for the trainable special tokens.
+        # The McGill-merged checkpoint's [MASK]/[INS]/[DEL] rows are
+        # mean-init and frozen inside the LM head, so [DEL] could never win
+        # an argmax through the frozen column alone. Reuse the input-side
+        # delta rows as logit-column deltas (Gemma ties embed_tokens and
+        # lm_head, so input row == output column for every real token too).
+        if self._delta_slots:
+            tids = list(self._delta_slots.keys())
+            slots = list(self._delta_slots.values())
+            delta_cols = self.delta_emb[slots]                          # (k, d_model)
+            extra = h_text.to(delta_cols.dtype) @ delta_cols.t()        # (B, T, k)
+            logits[..., tids] = logits[..., tids] + extra.to(logits.dtype)
+
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
@@ -175,6 +207,7 @@ class SAEEditor(nn.Module):
             "proj_a.weight": self.proj_a.weight.detach().cpu(),
             "proj_a.bias": self.proj_a.bias.detach().cpu(),
             "type_emb.weight": self.type_emb.weight.detach().cpu(),
+            "cond_scale": self.cond_scale.detach().cpu(),
         }
         if self.delta_emb.numel() > 0:
             sd["delta_emb"] = self.delta_emb.detach().cpu()
@@ -184,6 +217,8 @@ class SAEEditor(nn.Module):
         self.proj_a.weight.data.copy_(state_dict["proj_a.weight"])
         self.proj_a.bias.data.copy_(state_dict["proj_a.bias"])
         self.type_emb.weight.data.copy_(state_dict["type_emb.weight"])
+        if "cond_scale" in state_dict:  # absent in pre-calibration checkpoints
+            self.cond_scale.data.copy_(state_dict["cond_scale"])
         if "delta_emb" in state_dict and self.delta_emb.numel() > 0:
             self.delta_emb.data.copy_(state_dict["delta_emb"])
 

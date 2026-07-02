@@ -59,15 +59,32 @@ class SAETagger(nn.Module):
         self.type_emb = nn.Embedding(3, d_model)
         nn.init.normal_(self.type_emb.weight, std=0.02)
 
+        # Conditioning scale calibration — same scheme as SAEEditor: RMS-
+        # normalize each cond vector to the median token-embedding row RMS
+        # (Gemma multiplies inputs_embeds by sqrt(hidden_size); z values are
+        # raw SAE deltas of wildly varying magnitude). cond_scale is a
+        # learnable global gain (init 1.0).
+        with torch.no_grad():
+            emb_w = self.encoder.get_input_embeddings().weight
+            row_rms = emb_w.float().pow(2).mean(dim=-1).sqrt()
+            target_rms = row_rms.median()
+        self.register_buffer("cond_target_rms", target_rms.to(torch.float32))
+        self.cond_scale = nn.Parameter(torch.ones(1))
+
         self.head = nn.Sequential(
             nn.Linear(d_model, head_hidden),
             nn.GELU(),
             nn.Linear(head_hidden, NUM_OPS),
         )
 
+    def _calibrate_cond(self, x: torch.Tensor) -> torch.Tensor:
+        """RMS-normalize a (B, d_model) cond vector to the calibrated target."""
+        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        return x / (rms + 1e-6) * (self.cond_target_rms * self.cond_scale)
+
     def cond_embeds(self, z_amp: torch.Tensor, z_sup: torch.Tensor) -> torch.Tensor:
-        amp = self.proj_a(z_amp.to(self.proj_a.weight.dtype))
-        sup = self.proj_a(z_sup.to(self.proj_a.weight.dtype))
+        amp = self._calibrate_cond(self.proj_a(z_amp.to(self.proj_a.weight.dtype)))
+        sup = self._calibrate_cond(self.proj_a(z_sup.to(self.proj_a.weight.dtype)))
         amp = amp + self.type_emb(torch.full((amp.shape[0],), 1, device=amp.device, dtype=torch.long))
         sup = sup + self.type_emb(torch.full((sup.shape[0],), 2, device=sup.device, dtype=torch.long))
         return torch.stack([amp, sup], dim=1)
@@ -125,6 +142,7 @@ class SAETagger(nn.Module):
             "proj_a.weight": self.proj_a.weight.detach().cpu(),
             "proj_a.bias": self.proj_a.bias.detach().cpu(),
             "type_emb.weight": self.type_emb.weight.detach().cpu(),
+            "cond_scale": self.cond_scale.detach().cpu(),
         }
         for k, v in self.head.state_dict().items():
             sd[f"head.{k}"] = v.detach().cpu()
@@ -134,6 +152,8 @@ class SAETagger(nn.Module):
         self.proj_a.weight.data.copy_(sd["proj_a.weight"])
         self.proj_a.bias.data.copy_(sd["proj_a.bias"])
         self.type_emb.weight.data.copy_(sd["type_emb.weight"])
+        if "cond_scale" in sd:  # absent in pre-calibration checkpoints
+            self.cond_scale.data.copy_(sd["cond_scale"])
         head_sd = {k[len("head."):]: v for k, v in sd.items() if k.startswith("head.")}
         self.head.load_state_dict(head_sd)
 
