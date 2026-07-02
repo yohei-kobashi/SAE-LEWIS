@@ -59,6 +59,13 @@ MLM_MODEL=${MLM_MODEL:-"modernbert-base"}
 SPACY_MODEL=${SPACY_MODEL:-"en_core_web_sm"}
 DEVICE=${DEVICE:-cuda}
 SEED=${SEED:-42}
+# Per-op-type PROPOSAL weights (defaults match corruption.py argparse).
+# Acceptance is not type-neutral (e.g. the SLOR gate hits INS's natural-word
+# deletions harder than MLM-proposed REPL/DEL edits), so bump a type's weight
+# to compensate when its ACCEPTED share lands below the calibrated target.
+OP_WEIGHT_REPL=${OP_WEIGHT_REPL:-0.70}
+OP_WEIGHT_INS=${OP_WEIGHT_INS:-0.18}
+OP_WEIGHT_DEL=${OP_WEIGHT_DEL:-0.12}
 
 mkdir -p "$OUT_DIR"
 
@@ -131,6 +138,9 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --sae-layer "$SAE_LAYER" \
         --mlm-model "$MLM_MODEL" \
         --spacy-model "$SPACY_MODEL" \
+        --op-weight-repl "$OP_WEIGHT_REPL" \
+        --op-weight-ins "$OP_WEIGHT_INS" \
+        --op-weight-del "$OP_WEIGHT_DEL" \
         --target-samples "$PER_WORKER" \
         --samples-per-shard "$CORRUPTION_SHARD" \
         --sentence-stride "$WORKERS" \
