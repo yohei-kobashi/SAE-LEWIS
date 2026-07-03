@@ -45,7 +45,17 @@ def parse_args():
 
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--learning-rate", type=float, default=3e-4)
+    p.add_argument("--learning-rate", type=float, default=3e-4,
+                   help="LR for the small trainables (Proj_A, type_emb, "
+                        "cond_scale, delta rows).")
+    # LEWIS fine-tunes its generator's backbone; LoRA is the same adaptation
+    # style the LLM2Vec checkpoint itself was built with (MNTP + SimCSE are
+    # LoRA stages). --lora-r 0 reverts to the frozen-backbone ablation.
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=float, default=32.0)
+    p.add_argument("--lora-dropout", type=float, default=0.05)
+    p.add_argument("--backbone-lr", type=float, default=1e-4,
+                   help="LR for the backbone LoRA parameter group.")
     p.add_argument("--max-steps", type=int, default=20000)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--proj-a-freeze-steps", type=int, default=1000,
@@ -107,19 +117,26 @@ def main():
     editor = SAEEditor(
         args.llm2vec_dir, d_sae=d_sae, dtype=dtype,
         train_token_ids={"[INS]": ins_id, "[SEP]": sep_id, "[MASK]": mask_id},
+        lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
     ).to(args.device)
 
     # Initial freeze of Proj_A
     for p in editor.proj_a.parameters():
         p.requires_grad_(False)
 
-    trainables = [p for p in editor.parameters() if p.requires_grad]
-    print(f"[phase-a] trainable params (warmup): "
-          f"{sum(p.numel() for p in trainables):,}")
+    lora_params = [p for n, p in editor.named_parameters() if "lora_" in n]
+    small_params = [p for n, p in editor.named_parameters() if "lora_" not in n]
+    print(f"[phase-a] trainable params: small="
+          f"{sum(p.numel() for p in small_params if p.requires_grad):,} "
+          f"(+ Proj_A after step {args.proj_a_freeze_steps}), "
+          f"lora={sum(p.numel() for p in lora_params):,} "
+          f"@ backbone_lr={args.backbone_lr:g}")
 
-    optim = torch.optim.AdamW(
-        [p for p in editor.parameters()], lr=args.learning_rate,
-    )
+    optim = torch.optim.AdamW([
+        {"params": small_params, "lr": args.learning_rate},
+        {"params": lora_params, "lr": args.backbone_lr},
+    ])
     sched = get_linear_schedule_with_warmup(
         optim, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps,
     )

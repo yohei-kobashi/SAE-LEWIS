@@ -19,8 +19,11 @@ the source word entirely and the conditioning probe came out IGNORED.
 Deletion is the tagger's decision alone (as in LEWIS, where BART never sees
 deleted tokens); the editor no longer emits a [DEL] marker.
 
-Trainable: Proj_A (d_sae → d_model), type_emb[0..2], cond_scale, and
-embedding-delta rows for [MASK] / [INS] / [SEP]. Everything else is frozen.
+Trainable: Proj_A (d_sae → d_model), type_emb[0..2], cond_scale,
+embedding-delta rows for [MASK] / [INS] / [SEP], and — when lora_r > 0
+(the LEWIS-faithful default in train_editor_phaseA.py) — LoRA adapters on
+the backbone's attention/MLP projections (lora.py). Embedding table and
+LM head are always frozen.
 
 At inference, template enumeration sets [INS] slot counts per gap; the
 ranker then scores each template's argmax output.
@@ -36,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from lora import apply_lora, load_lora_state_dict, lora_state_dict
 from model import BidirectionalLLM
 
 
@@ -46,6 +50,9 @@ class SAEEditor(nn.Module):
         d_sae: int,
         dtype: torch.dtype = torch.bfloat16,
         train_token_ids: Optional[Dict[str, int]] = None,
+        lora_r: int = 0,
+        lora_alpha: float = 32.0,
+        lora_dropout: float = 0.05,
     ):
         """
         Parameters
@@ -58,12 +65,24 @@ class SAEEditor(nn.Module):
             Optional dict of {token_name: id} for tokens whose embedding rows
             should be trained (v2: [MASK], [INS], [SEP] — the markers that
             appear in the editor input; the editor emits no special tokens).
+        lora_r : int
+            LoRA rank for backbone adaptation (attention + MLP projections;
+            embeddings and LM head stay frozen). 0 disables LoRA — the
+            frozen-backbone ablation. LEWIS fine-tunes its generator's
+            backbone; see lora.py.
         """
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
         self.encoder.eval()
         for p in self.encoder.parameters():
             p.requires_grad_(False)
+        self.lora_cfg = None
+        if lora_r > 0:
+            n_wrapped = apply_lora(self.encoder.backbone, r=lora_r,
+                                   alpha=lora_alpha, dropout=lora_dropout)
+            self.lora_cfg = {"r": int(lora_r), "alpha": float(lora_alpha),
+                             "dropout": float(lora_dropout)}
+            print(f"[editor] LoRA r={lora_r} on {n_wrapped} backbone modules")
 
         # LM head is the causal Gemma's output projection. We load the
         # causal model only to grab its LM head module — frozen.
@@ -237,6 +256,9 @@ class SAEEditor(nn.Module):
         }
         if self.delta_emb.numel() > 0:
             sd["delta_emb"] = self.delta_emb.detach().cpu()
+        if self.lora_cfg is not None:
+            for n, t in lora_state_dict(self.encoder.backbone).items():
+                sd[f"lora::{n}"] = t
         return sd
 
     def load_trainable(self, state_dict: Dict[str, torch.Tensor]):
@@ -247,6 +269,15 @@ class SAEEditor(nn.Module):
             self.cond_scale.data.copy_(state_dict["cond_scale"])
         if "delta_emb" in state_dict and self.delta_emb.numel() > 0:
             self.delta_emb.data.copy_(state_dict["delta_emb"])
+        lora_sd = {k[len("lora::"):]: v for k, v in state_dict.items()
+                   if k.startswith("lora::")}
+        if lora_sd and self.lora_cfg is None:
+            raise ValueError(
+                "checkpoint contains LoRA adapters but the model was built "
+                "with lora_r=0 — use load_editor_from_checkpoint, which "
+                "reads the checkpoint's lora config")
+        if self.lora_cfg is not None:
+            load_lora_state_dict(self.encoder.backbone, lora_sd)
 
     def save(self, path: str):
         path = Path(path)
@@ -256,6 +287,7 @@ class SAEEditor(nn.Module):
             "d_sae": int(self.d_sae),
             "d_model": int(self.d_model),
             "train_token_ids": self.train_token_ids,
+            "lora": self.lora_cfg,
         }, path)
 
 
@@ -264,9 +296,13 @@ def load_editor_from_checkpoint(
     dtype: torch.dtype = torch.bfloat16,
 ) -> SAEEditor:
     blob = torch.load(ckpt_path, map_location="cpu")
+    lora = blob.get("lora") or {}
     editor = SAEEditor(
         llm2vec_dir, d_sae=d_sae, dtype=dtype,
         train_token_ids=blob.get("train_token_ids", {}),
+        lora_r=int(lora.get("r", 0)),
+        lora_alpha=float(lora.get("alpha", 32.0)),
+        lora_dropout=float(lora.get("dropout", 0.05)),
     )
     editor.load_trainable(blob["trainable"])
     return editor

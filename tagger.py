@@ -22,7 +22,10 @@ gap-adjacent token whose content is unchanged (i.e. a KEEP-looking token),
 and held-out INS F1 was exactly 0.
 
 Trainable: Proj_A (shared signature with editor), type_emb[0..2],
-cond_scale, and the two small heads.
+cond_scale, the two small heads, and — when lora_r > 0 (the
+LEWIS-faithful default in train_tagger.py) — a fresh LoRA adapter on the
+backbone's attention/MLP projections (LEWIS fine-tunes its RoBERTa
+tagger; the tagger's adapter is independent of the editor's).
 
 The tagger does not need [INS]/[DEL]/[SEP] embedding deltas because its
 input is the user-provided (or corrupted) text and never contains those
@@ -39,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lewis_ops import NUM_OPS3
+from lora import apply_lora, load_lora_state_dict, lora_state_dict
 from model import BidirectionalLLM
 
 
@@ -49,12 +53,25 @@ class SAETagger(nn.Module):
         d_sae: int,
         head_hidden: int = 256,
         dtype: torch.dtype = torch.bfloat16,
+        lora_r: int = 0,
+        lora_alpha: float = 32.0,
+        lora_dropout: float = 0.05,
     ):
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
         self.encoder.eval()
         for p in self.encoder.parameters():
             p.requires_grad_(False)
+        # LEWIS fine-tunes its RoBERTa tagger; lora_r > 0 is the faithful
+        # setting (each model gets its OWN fresh adapter — LEWIS's tagger
+        # and generator are separate networks). 0 = frozen ablation.
+        self.lora_cfg = None
+        if lora_r > 0:
+            n_wrapped = apply_lora(self.encoder.backbone, r=lora_r,
+                                   alpha=lora_alpha, dropout=lora_dropout)
+            self.lora_cfg = {"r": int(lora_r), "alpha": float(lora_alpha),
+                             "dropout": float(lora_dropout)}
+            print(f"[tagger] LoRA r={lora_r} on {n_wrapped} backbone modules")
 
         d_model = self.encoder.config.hidden_size
         self.d_model = int(d_model)
@@ -186,6 +203,9 @@ class SAETagger(nn.Module):
             sd[f"op_head.{k}"] = v.detach().cpu()
         for k, v in self.ins_head.state_dict().items():
             sd[f"ins_head.{k}"] = v.detach().cpu()
+        if self.lora_cfg is not None:
+            for n, t in lora_state_dict(self.encoder.backbone).items():
+                sd[f"lora::{n}"] = t
         return sd
 
     def load_trainable(self, sd: Dict[str, torch.Tensor]):
@@ -202,6 +222,15 @@ class SAETagger(nn.Module):
         self.op_head.load_state_dict(op_sd)
         ins_sd = {k[len("ins_head."):]: v for k, v in sd.items() if k.startswith("ins_head.")}
         self.ins_head.load_state_dict(ins_sd)
+        lora_sd = {k[len("lora::"):]: v for k, v in sd.items()
+                   if k.startswith("lora::")}
+        if lora_sd and self.lora_cfg is None:
+            raise ValueError(
+                "checkpoint contains LoRA adapters but the model was built "
+                "with lora_r=0 — use load_tagger_from_checkpoint, which "
+                "reads the checkpoint's lora config")
+        if self.lora_cfg is not None:
+            load_lora_state_dict(self.encoder.backbone, lora_sd)
 
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -209,6 +238,7 @@ class SAETagger(nn.Module):
             "trainable": self.trainable_state_dict(),
             "d_sae": int(self.d_sae),
             "d_model": int(self.d_model),
+            "lora": self.lora_cfg,
         }, path)
 
 
@@ -217,6 +247,12 @@ def load_tagger_from_checkpoint(
     dtype: torch.dtype = torch.bfloat16,
 ) -> SAETagger:
     blob = torch.load(ckpt_path, map_location="cpu")
-    tagger = SAETagger(llm2vec_dir, d_sae=d_sae, dtype=dtype)
+    lora = blob.get("lora") or {}
+    tagger = SAETagger(
+        llm2vec_dir, d_sae=d_sae, dtype=dtype,
+        lora_r=int(lora.get("r", 0)),
+        lora_alpha=float(lora.get("alpha", 32.0)),
+        lora_dropout=float(lora.get("dropout", 0.05)),
+    )
     tagger.load_trainable(blob["trainable"])
     return tagger
