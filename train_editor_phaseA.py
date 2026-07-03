@@ -51,7 +51,14 @@ def parse_args():
 
     # Conditioning sub-sampling
     p.add_argument("--k-top", type=int, default=8)
-    p.add_argument("--empty-cond-prob", type=float, default=0.15)
+    # 0.15 left the editor conditioning-IGNORED for REPL (held-out probe
+    # Δ(true−empty) ≈ 0): together with k_amp/k_sup allowing 0, the model
+    # saw weak-or-empty conditioning often enough to learn to ignore it.
+    p.add_argument("--empty-cond-prob", type=float, default=0.05)
+    # CE weight on copy positions (label == input). Uniform CE (1.0) spends
+    # ~95% of the gradient on copying, starving Proj_A; edit positions
+    # ([MASK]/[INS] slots, [DEL] targets) always keep weight 1.
+    p.add_argument("--keep-loss-weight", type=float, default=0.2)
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -156,8 +163,11 @@ def main():
         z_amp = torch.zeros_like(z_X)
         z_sup = torch.zeros_like(z_X)
         for b in range(B):
-            k_amp = int(rng.integers(0, 4))
-            k_sup = int(rng.integers(0, 4))
+            # {1..4}, not {0..3}: the fully-empty case is handled by
+            # --empty-cond-prob alone, so every non-empty conditioning
+            # carries at least one amplified and one suppressed feature.
+            k_amp = int(rng.integers(1, 5))
+            k_sup = int(rng.integers(1, 5))
             a, s = diff_to_sparse(
                 z_X[b], z_X_prime[b],
                 k_top=args.k_top,
@@ -174,6 +184,7 @@ def main():
             z_amp=z_amp.to(args.device),
             z_sup=z_sup.to(args.device),
             labels=batch["editor_target_ids"].to(args.device),
+            keep_loss_weight=args.keep_loss_weight,
         )
         loss = out["loss"] / args.grad_accum_steps
         loss.backward()
@@ -187,7 +198,13 @@ def main():
         loss_window.append(float(loss.item()) * args.grad_accum_steps)
         if step % args.logging_steps == 0:
             avg = sum(loss_window[-args.logging_steps:]) / max(1, min(len(loss_window), args.logging_steps))
-            print(f"[phase-a] step={step} loss={avg:.4f} lr={sched.get_last_lr()[0]:.2e}")
+            # cond_scale drifting toward 0 means the model is muting the
+            # conditioning prefix — the precursor of a conditioning=IGNORED
+            # eval verdict. Watch it recover toward ~1 once edit positions
+            # dominate the loss.
+            cs = float(editor.cond_scale.detach().float())
+            print(f"[phase-a] step={step} loss={avg:.4f} "
+                  f"cond_scale={cs:.4f} lr={sched.get_last_lr()[0]:.2e}")
 
         if step > 0 and step % args.save_steps == 0:
             ckpt = out_dir / f"editor-step{step}.pt"

@@ -159,6 +159,7 @@ class SAEEditor(nn.Module):
         z_amp: torch.Tensor,               # (B, d_sae)
         z_sup: torch.Tensor,               # (B, d_sae)
         labels: Optional[torch.Tensor] = None,   # (B, T) -100 = ignore
+        keep_loss_weight: float = 1.0,     # CE weight on copy positions (label == input)
     ) -> Dict[str, torch.Tensor]:
         B, T = input_ids.shape
         device = input_ids.device
@@ -195,11 +196,32 @@ class SAEEditor(nn.Module):
 
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1).long(),
-                ignore_index=-100,
-            )
+            if keep_loss_weight != 1.0:
+                # Copy positions (label == input token) dominate the target
+                # ~20:1 over edit positions ([MASK]/[INS] slots, [DEL]
+                # targets), so uniform CE mostly trains copying and starves
+                # Proj_A of the gradient that maps SAE diff features to
+                # lexical identity. Down-weight copies; edit positions
+                # stay at weight 1.
+                per_tok = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1).long(),
+                    ignore_index=-100,
+                    reduction="none",
+                )
+                flat_labels = labels.reshape(-1)
+                valid = flat_labels != -100
+                copy_pos = valid & (flat_labels == input_ids.reshape(-1))
+                w = torch.ones_like(per_tok)
+                w[copy_pos] = keep_loss_weight
+                w[~valid] = 0.0
+                loss = (per_tok * w).sum() / w.sum().clamp_min(1.0)
+            else:
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1).long(),
+                    ignore_index=-100,
+                )
 
         return {"loss": loss, "logits": logits, "hidden_states": h_text}
 

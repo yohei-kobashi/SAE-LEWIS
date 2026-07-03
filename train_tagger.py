@@ -46,7 +46,12 @@ def parse_args():
 
     p.add_argument("--estimate-class-weights-batches", type=int, default=200,
                    help="Number of warmup batches used to estimate inverse-freq class weights.")
-    p.add_argument("--class-weight-smoothing", type=float, default=0.5)
+    # 0.5 capped the raw rare-class weight at 2.0, so INS (~1.3% of tokens,
+    # ~67x rarer than KEEP) got only ~2.7x KEEP's weight and the CE optimum
+    # was to never predict it (held-out INS F1 = 0.0 at support 297). 0.05
+    # keeps the cap at 20x — INS lands ~15x KEEP — while still bounding the
+    # weight against warmup-sample noise in the frequency estimate.
+    p.add_argument("--class-weight-smoothing", type=float, default=0.05)
 
     p.add_argument("--init-proj-a-from", default=None,
                    help="Editor checkpoint (.pt from train_editor_phaseA.py) "
