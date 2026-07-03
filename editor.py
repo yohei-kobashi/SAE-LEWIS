@@ -1,9 +1,9 @@
 """
-SAE-LEWIS bidirectional editor.
+SAE-LEWIS bidirectional editor (v2 — LEWIS-faithful `x' [SEP] x'_c` input).
 
 Forward (see README §4.3):
 
-    [INT_amp, INT_sup, e(editor_input_1), …, e(editor_input_{T'})]
+    [INT_amp, INT_sup, e(x'_1..T), e([SEP]), e(x'_c_1..T_c)]
             │                                       │
             └── LLM2Vec'd Gemma (frozen) ──────────►│
                                                     │
@@ -11,8 +11,16 @@ Forward (see README §4.3):
                                                     │
                                             token logits per position
 
-Trainable: Proj_A (d_sae → d_model), type_emb[0..2], embedding rows for
-[INS] and [DEL]. Everything else is frozen.
+Following LEWIS (Reid & Zhong 2021, eq. 2), the editor sees BOTH the source
+text x' and the edit template x'_c (REPL → [MASK], insertion gaps → [INS]
+slots, DEL tokens removed). Seeing the pre-edit words turns REPL filling
+from unconstrained recovery into conditioned choice — in v1 the [MASK] hid
+the source word entirely and the conditioning probe came out IGNORED.
+Deletion is the tagger's decision alone (as in LEWIS, where BART never sees
+deleted tokens); the editor no longer emits a [DEL] marker.
+
+Trainable: Proj_A (d_sae → d_model), type_emb[0..2], cond_scale, and
+embedding-delta rows for [MASK] / [INS] / [SEP]. Everything else is frozen.
 
 At inference, template enumeration sets [INS] slot counts per gap; the
 ranker then scores each template's argmax output.
@@ -48,7 +56,8 @@ class SAEEditor(nn.Module):
             SAE feature dimension.
         train_token_ids : Optional[Dict[str, int]]
             Optional dict of {token_name: id} for tokens whose embedding rows
-            should be trained. By default we unfreeze [INS] and [DEL] rows.
+            should be trained (v2: [MASK], [INS], [SEP] — the markers that
+            appear in the editor input; the editor emits no special tokens).
         """
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
@@ -180,29 +189,20 @@ class SAEEditor(nn.Module):
         # Drop the 2 prefix positions before projecting to logits
         h_text = h[:, 2:, :]                                    # (B, T, d_model)
         logits = self.lm_head(h_text.to(self.lm_head.weight.dtype))
-
-        # Tied output-side correction for the trainable special tokens.
-        # The McGill-merged checkpoint's [MASK]/[INS]/[DEL] rows are
-        # mean-init and frozen inside the LM head, so [DEL] could never win
-        # an argmax through the frozen column alone. Reuse the input-side
-        # delta rows as logit-column deltas (Gemma ties embed_tokens and
-        # lm_head, so input row == output column for every real token too).
-        if self._delta_slots:
-            tids = list(self._delta_slots.keys())
-            slots = list(self._delta_slots.values())
-            delta_cols = self.delta_emb[slots]                          # (k, d_model)
-            extra = h_text.to(delta_cols.dtype) @ delta_cols.t()        # (B, T, k)
-            logits[..., tids] = logits[..., tids] + extra.to(logits.dtype)
+        # (No output-side logit correction: since v2 the editor never emits
+        # a special token — [DEL] output is gone, deletion being the
+        # tagger's decision — so the delta rows only shape the INPUT
+        # embeddings of [MASK]/[INS]/[SEP].)
 
         loss = None
         if labels is not None:
             if keep_loss_weight != 1.0:
                 # Copy positions (label == input token) dominate the target
-                # ~20:1 over edit positions ([MASK]/[INS] slots, [DEL]
-                # targets), so uniform CE mostly trains copying and starves
-                # Proj_A of the gradient that maps SAE diff features to
-                # lexical identity. Down-weight copies; edit positions
-                # stay at weight 1.
+                # ~20:1 over edit positions ([MASK]/[INS] slots), so uniform
+                # CE mostly trains copying and starves Proj_A of the
+                # gradient that maps SAE diff features to lexical identity.
+                # Down-weight copies; edit positions stay at weight 1.
+                # (The x' [SEP] prefix carries label -100 → weight 0.)
                 per_tok = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     labels.reshape(-1).long(),

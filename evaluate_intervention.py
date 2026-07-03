@@ -1,13 +1,18 @@
 """
-End-to-end SAE-LEWIS inference and a thin metrics layer.
+End-to-end SAE-LEWIS inference and a thin metrics layer (v2).
 
   edit(text, spec, strength):
     1. tokenize
-    2. tagger.predict_ops
-    3. apply_ops_for_editor → build base editor input
+    2. tagger.predict_ops → (op3, ins_before)  [two-tag, LEWIS §2.1]
+    3. apply_ops_for_editor → edit template x'_c (DEL tokens removed)
     4. enumerate INS slot counts in {1..L_MAX}^G
-    5. editor forward per template → argmax decode
+    5. editor forward on `x' [SEP] x'_c` per template → argmax decode over
+       the template segment (special-token logits suppressed)
     6. ranker → top-1
+
+Deletion is realised entirely by the tagger: DEL-tagged tokens never enter
+the editor template, exactly as in LEWIS where the BART generator does not
+see deleted tokens.
 
 Usage:
     python evaluate_intervention.py \
@@ -33,10 +38,9 @@ from transformers import AutoTokenizer
 from editor import load_editor_from_checkpoint
 from intervene import FeatureSpec, build_intervention_vectors
 from lewis_ops import (
-    OP_INS,
-    EditorInputs,
+    OP3_KEEP,
     apply_ops_for_editor,
-    decode_with_op_mask,
+    decode_editor_output,
     expand_ins_gap,
 )
 from model import BidirectionalLLM, SAEFeatureExtractor, load_causal_gemma
@@ -70,23 +74,6 @@ def parse_args():
     return p.parse_args()
 
 
-def find_ins_gaps(op_per_pos: np.ndarray) -> List[Tuple[int, int]]:
-    """Identify (start, length) of consecutive OP_INS runs."""
-    gaps: List[Tuple[int, int]] = []
-    n = len(op_per_pos)
-    i = 0
-    while i < n:
-        if int(op_per_pos[i]) == OP_INS:
-            j = i
-            while j < n and int(op_per_pos[j]) == OP_INS:
-                j += 1
-            gaps.append((i, j - i))
-            i = j
-        else:
-            i += 1
-    return gaps
-
-
 @torch.no_grad()
 def edit_once(
     *,
@@ -110,17 +97,28 @@ def edit_once(
     z_amp_dev = z_amp_full.unsqueeze(0).to(device)
     z_sup_dev = z_sup_full.unsqueeze(0).to(device)
 
-    # 1. Tagger
-    ops = tagger.predict_ops(input_ids, attn, z_amp_dev, z_sup_dev)[0].cpu().tolist()
-    token_ids = input_ids[0].cpu().tolist()
+    mask_id = int(tokenizer.mask_token_id)
+    ins_id = int(tokenizer.convert_tokens_to_ids("[INS]"))
+    sep_id = int(tokenizer.convert_tokens_to_ids("[SEP]"))
+    del_id = int(tokenizer.convert_tokens_to_ids("[DEL]"))
+    bos_id = tokenizer.bos_token_id
 
-    # 2. apply_ops_for_editor
+    # 1. Tagger — two tags per token (LEWIS §2.1)
+    op3_t, ins_t = tagger.predict_ops(input_ids, attn, z_amp_dev, z_sup_dev)
+    op3 = op3_t[0].cpu().tolist()
+    ins_before = ins_t[0].cpu().tolist()
+    token_ids = input_ids[0].cpu().tolist()
+    # <bos> is structural: never delete/replace it or insert before it
+    # (sentence-initial insertion is ins_before on the first real token).
+    if bos_id is not None and token_ids and token_ids[0] == bos_id:
+        op3[0] = OP3_KEEP
+        ins_before[0] = 0
+
+    # 2. Build the edit template x'_c (DEL tokens removed)
     ed_in = apply_ops_for_editor(
-        token_ids, ops,
-        mask_token_id=tokenizer.mask_token_id,
-        ins_token_id=tokenizer.convert_tokens_to_ids("[INS]"),
+        token_ids, op3, ins_before,
+        mask_token_id=mask_id, ins_token_id=ins_id,
     )
-    del_id = tokenizer.convert_tokens_to_ids("[DEL]")
 
     # 3. enumerate INS slot counts
     G = len(ed_in.ins_gaps)
@@ -129,23 +127,39 @@ def edit_once(
     else:
         slot_choices = list(itertools.product(range(1, l_max + 1), repeat=G))
 
+    # The template duplicates x'’s leading <bos>; the editor input keeps
+    # only the copy inside x' (matches CorruptionCollator).
+    marker_ids = [mask_id, ins_id, sep_id, del_id]
+
     candidates: List[List[int]] = []
     ins_counts: List[int] = []
     for choice in slot_choices:
         cur = ed_in
         for gi, k in enumerate(choice):
-            cur = expand_ins_gap(cur, gi, k, tokenizer.convert_tokens_to_ids("[INS]"))
-        # Editor forward
-        ids = torch.tensor([cur.input_ids.tolist()], dtype=torch.long, device=device)
+            cur = expand_ins_gap(cur, gi, k, ins_id)
+        tpl_ids = cur.input_ids.tolist()
+        tpl_ops = cur.op_per_pos
+        offset = 0
+        if bos_id is not None and tpl_ids and tpl_ids[0] == bos_id:
+            offset = 1  # skip the duplicated <bos> in the template segment
+        full = token_ids + [sep_id] + tpl_ids[offset:]
+        tpl_start = len(token_ids) + 1
+
+        ids = torch.tensor([full], dtype=torch.long, device=device)
         mask = torch.ones_like(ids)
         out = editor(
             input_ids=ids, attention_mask=mask,
             z_amp=z_amp_dev, z_sup=z_sup_dev,
         )
-        argmax = out["logits"][0].argmax(dim=-1).cpu().numpy()
-        decoded = decode_with_op_mask(
-            cur.input_ids, argmax, cur.op_per_pos, del_token_id=del_id,
+        logits = out["logits"][0, tpl_start:]           # template segment
+        logits[:, marker_ids] = float("-inf")           # never emit markers
+        argmax = logits.argmax(dim=-1).cpu().numpy()
+        decoded = decode_editor_output(
+            np.asarray(tpl_ids[offset:], dtype=np.int64), argmax,
+            tpl_ops[offset:],
         )
+        if offset:
+            decoded = [bos_id] + decoded
         candidates.append(decoded)
         ins_counts.append(sum(choice) if choice else 0)
 

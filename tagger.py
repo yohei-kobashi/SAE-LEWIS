@@ -1,5 +1,5 @@
 """
-SAE-conditioned 4-class tagger.
+SAE-conditioned two-tag tagger (v2 — LEWIS-faithful).
 
 Forward (see README §4.2):
 
@@ -9,27 +9,36 @@ Forward (see README §4.2):
                                                 │
                                          drop conditioning prefix
                                                 │
-                                    per-token 4-class MLP head
-                                                │
-                                 op ∈ {KEEP, REPL, INS, DEL}
+                              ┌─────────────────┴──────────────────┐
+                    per-token 3-class op head          per-token binary ins head
+                              │                                    │
+                    op ∈ {KEEP, REPL, DEL}          "insert phrase before this token?"
 
-Trainable: Proj_A (shared signature with editor; trained jointly or
-independently), type_emb[0..2], a small 4-class head.
+Following LEWIS (Reid & Zhong 2021, §2.1), each token carries TWO tags: a
+binary insertion indicator for the boundary to its left and a 3-class
+non-insertion op for the token itself. Insertion therefore never competes
+with KEEP inside a softmax — in the v1 4-class design the INS tag sat on a
+gap-adjacent token whose content is unchanged (i.e. a KEEP-looking token),
+and held-out INS F1 was exactly 0.
 
-The tagger does not need [INS] or [DEL] embedding deltas because its input
-is the user-provided (or corrupted) text and never contains those markers.
+Trainable: Proj_A (shared signature with editor), type_emb[0..2],
+cond_scale, and the two small heads.
+
+The tagger does not need [INS]/[DEL]/[SEP] embedding deltas because its
+input is the user-provided (or corrupted) text and never contains those
+markers.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lewis_ops import NUM_OPS
+from lewis_ops import NUM_OPS3
 from model import BidirectionalLLM
 
 
@@ -71,16 +80,22 @@ class SAETagger(nn.Module):
         self.register_buffer("cond_target_rms", target_rms.to(torch.float32))
         self.cond_scale = nn.Parameter(torch.ones(1))
 
-        self.head = nn.Sequential(
+        self.op_head = nn.Sequential(
             nn.Linear(d_model, head_hidden),
             nn.GELU(),
-            nn.Linear(head_hidden, NUM_OPS),
+            nn.Linear(head_hidden, NUM_OPS3),
+        )
+        self.ins_head = nn.Sequential(
+            nn.Linear(d_model, head_hidden),
+            nn.GELU(),
+            nn.Linear(head_hidden, 1),
         )
 
     def _calibrate_cond(self, x: torch.Tensor) -> torch.Tensor:
         """RMS-normalize a (B, d_model) cond vector to the calibrated target."""
-        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
-        return x / (rms + 1e-6) * (self.cond_target_rms * self.cond_scale)
+        # eps inside the sqrt — same NaN guard as SAEEditor._calibrate_cond.
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+        return x / rms * (self.cond_target_rms * self.cond_scale)
 
     def cond_embeds(self, z_amp: torch.Tensor, z_sup: torch.Tensor) -> torch.Tensor:
         amp = self._calibrate_cond(self.proj_a(z_amp.to(self.proj_a.weight.dtype)))
@@ -95,8 +110,11 @@ class SAETagger(nn.Module):
         attention_mask: torch.Tensor,      # (B, T)
         z_amp: torch.Tensor,               # (B, d_sae)
         z_sup: torch.Tensor,               # (B, d_sae)
-        labels: Optional[torch.Tensor] = None,  # (B, T) -100 = ignore
-        class_weights: Optional[torch.Tensor] = None,  # (NUM_OPS,)
+        op_labels: Optional[torch.Tensor] = None,   # (B, T) 3-class; -100 = ignore
+        ins_labels: Optional[torch.Tensor] = None,  # (B, T) {0,1}; -100 = ignore
+        class_weights: Optional[torch.Tensor] = None,   # (NUM_OPS3,)
+        ins_pos_weight: Optional[torch.Tensor] = None,  # scalar tensor
+        ins_loss_weight: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         B, T = input_ids.shape
         with torch.no_grad():
@@ -112,17 +130,34 @@ class SAETagger(nn.Module):
             inputs_embeds=full_embs, attention_mask=full_mask,
         ).last_hidden_state                       # (B, T+2, d_model)
         h_text = h[:, 2:, :]                       # (B, T, d_model)
-        logits = self.head(h_text.to(self.head[0].weight.dtype))   # (B, T, NUM_OPS)
+        h_text = h_text.to(self.op_head[0].weight.dtype)
+        op_logits = self.op_head(h_text)                    # (B, T, NUM_OPS3)
+        ins_logits = self.ins_head(h_text).squeeze(-1)      # (B, T)
 
         loss = None
-        if labels is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, NUM_OPS),
-                labels.reshape(-1).long(),
+        op_loss = None
+        ins_loss = None
+        if op_labels is not None:
+            op_loss = F.cross_entropy(
+                op_logits.reshape(-1, NUM_OPS3),
+                op_labels.reshape(-1).long(),
                 ignore_index=-100,
-                weight=class_weights.to(logits.dtype) if class_weights is not None else None,
+                weight=class_weights.to(op_logits.dtype) if class_weights is not None else None,
             )
-        return {"loss": loss, "logits": logits}
+            loss = op_loss
+        if ins_labels is not None:
+            flat_logits = ins_logits.reshape(-1)
+            flat_labels = ins_labels.reshape(-1)
+            valid = flat_labels != -100
+            if valid.any():
+                ins_loss = F.binary_cross_entropy_with_logits(
+                    flat_logits[valid].float(),
+                    flat_labels[valid].float(),
+                    pos_weight=ins_pos_weight.float() if ins_pos_weight is not None else None,
+                )
+                loss = ins_loss * ins_loss_weight if loss is None else loss + ins_loss * ins_loss_weight
+        return {"loss": loss, "op_loss": op_loss, "ins_loss": ins_loss,
+                "op_logits": op_logits, "ins_logits": ins_logits}
 
     def predict_ops(
         self,
@@ -130,11 +165,14 @@ class SAETagger(nn.Module):
         attention_mask: torch.Tensor,
         z_amp: torch.Tensor,
         z_sup: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return argmax ops (B, T) long."""
+        ins_threshold: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (op3, ins_before), both (B, T) long."""
         with torch.no_grad():
             out = self.forward(input_ids, attention_mask, z_amp, z_sup)
-        return out["logits"].argmax(dim=-1)
+        op3 = out["op_logits"].argmax(dim=-1)
+        ins = (torch.sigmoid(out["ins_logits"].float()) >= ins_threshold).long()
+        return op3, ins
 
     # ------------------------------------------------------------------
     def trainable_state_dict(self) -> Dict[str, torch.Tensor]:
@@ -144,18 +182,26 @@ class SAETagger(nn.Module):
             "type_emb.weight": self.type_emb.weight.detach().cpu(),
             "cond_scale": self.cond_scale.detach().cpu(),
         }
-        for k, v in self.head.state_dict().items():
-            sd[f"head.{k}"] = v.detach().cpu()
+        for k, v in self.op_head.state_dict().items():
+            sd[f"op_head.{k}"] = v.detach().cpu()
+        for k, v in self.ins_head.state_dict().items():
+            sd[f"ins_head.{k}"] = v.detach().cpu()
         return sd
 
     def load_trainable(self, sd: Dict[str, torch.Tensor]):
+        if any(k.startswith("head.") for k in sd):
+            raise ValueError(
+                "checkpoint uses the v1 4-class head — retrain the tagger "
+                "with the v2 two-tag scheme (op_head + ins_head)")
         self.proj_a.weight.data.copy_(sd["proj_a.weight"])
         self.proj_a.bias.data.copy_(sd["proj_a.bias"])
         self.type_emb.weight.data.copy_(sd["type_emb.weight"])
         if "cond_scale" in sd:  # absent in pre-calibration checkpoints
             self.cond_scale.data.copy_(sd["cond_scale"])
-        head_sd = {k[len("head."):]: v for k, v in sd.items() if k.startswith("head.")}
-        self.head.load_state_dict(head_sd)
+        op_sd = {k[len("op_head."):]: v for k, v in sd.items() if k.startswith("op_head.")}
+        self.op_head.load_state_dict(op_sd)
+        ins_sd = {k[len("ins_head."):]: v for k, v in sd.items() if k.startswith("ins_head.")}
+        self.ins_head.load_state_dict(ins_sd)
 
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)

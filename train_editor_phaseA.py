@@ -7,8 +7,13 @@ Per-batch:
   3. Editor forward with cross-entropy at every editor-input position.
   4. Optimizer step.
 
-Trainable parameters: Proj_A, type_emb[0..2], [INS]/[DEL] embedding deltas.
-Frozen: encoder, LM head, original input embeddings.
+Editor input is the LEWIS-faithful concatenation `x' [SEP] x'_c` (built by
+CorruptionCollator from the v1 cache); loss is CE over the template segment
+only, with copy positions down-weighted (--keep-loss-weight).
+
+Trainable parameters: Proj_A, type_emb[0..2], cond_scale, and the
+[MASK]/[INS]/[SEP] embedding deltas. Frozen: encoder, LM head, original
+input embeddings.
 """
 
 from __future__ import annotations
@@ -57,7 +62,7 @@ def parse_args():
     p.add_argument("--empty-cond-prob", type=float, default=0.05)
     # CE weight on copy positions (label == input). Uniform CE (1.0) spends
     # ~95% of the gradient on copying, starving Proj_A; edit positions
-    # ([MASK]/[INS] slots, [DEL] targets) always keep weight 1.
+    # ([MASK]/[INS] slots) always keep weight 1.
     p.add_argument("--keep-loss-weight", type=float, default=0.2)
 
     p.add_argument("--device", default="cuda")
@@ -75,12 +80,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.llm2vec_dir)
     ins_id = tokenizer.convert_tokens_to_ids("[INS]")
     del_id = tokenizer.convert_tokens_to_ids("[DEL]")
+    sep_id = tokenizer.convert_tokens_to_ids("[SEP]")
     mask_id = tokenizer.mask_token_id
-    if mask_id is None or ins_id is None or del_id is None:
+    unk_id = tokenizer.unk_token_id
+    if (mask_id is None or ins_id is None or del_id is None
+            or sep_id is None or sep_id == unk_id):
         raise SystemExit(
             f"[phase-a] tokenizer at {args.llm2vec_dir} lacks the special "
-            f"tokens (mask={mask_id}, ins={ins_id}, del={del_id}) — is this "
-            f"a merged+expanded checkpoint (mcgill_merge_and_expand.py)?")
+            f"tokens (mask={mask_id}, ins={ins_id}, del={del_id}, "
+            f"sep={sep_id}) — re-run scripts/mcgill_merge_and_expand.py "
+            f"(idempotent; it adds any missing specials, [SEP] included).")
 
     meta = json.loads((Path(args.corruption_dir) / "meta.json").read_text())
     d_sae = int(meta["d_sae"])
@@ -90,10 +99,14 @@ def main():
     # [MASK] is trainable too: with the McGill LLM2Vec route the special
     # tokens are added AFTER MNTP/SimCSE by mcgill_merge_and_expand.py
     # (mean-init, never seen a gradient), so unlike the old train_llm2vec.py
-    # route there is no "MNTP-trained [MASK] row" to inherit.
+    # route there is no "MNTP-trained [MASK] row" to inherit. [SEP] separates
+    # x' from the template x'_c (LEWIS's `x SEP x_c` input); [DEL] no longer
+    # appears anywhere in the editor's input or output (deletion is the
+    # tagger's decision; DEL tokens are removed from the template), so its
+    # delta row is gone.
     editor = SAEEditor(
         args.llm2vec_dir, d_sae=d_sae, dtype=dtype,
-        train_token_ids={"[INS]": ins_id, "[DEL]": del_id, "[MASK]": mask_id},
+        train_token_ids={"[INS]": ins_id, "[SEP]": sep_id, "[MASK]": mask_id},
     ).to(args.device)
 
     # Initial freeze of Proj_A
@@ -114,6 +127,8 @@ def main():
     dataset = CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed)
     collator = CorruptionCollator(
         d_sae=d_sae, pad_token_id=tokenizer.pad_token_id,
+        sep_token_id=sep_id, del_token_id=del_id,
+        bos_token_id=tokenizer.bos_token_id,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, num_workers=args.num_workers,

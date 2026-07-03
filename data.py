@@ -28,6 +28,8 @@ import requests
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
+from lewis_ops import split_cache_tags
+
 
 DOLMA_URL_LIST = "https://huggingface.co/datasets/allenai/dolma/raw/main/urls/v1_6-sample.txt"
 
@@ -425,16 +427,34 @@ def _dense_topk(records: List[Dict], d_sae: int) -> torch.Tensor:
 
 
 class CorruptionCollator:
-    """Pads a batch of corruption-cache records into editor/tagger inputs.
+    """Pads a batch of corruption-cache records into editor/tagger inputs
+    (v2 — LEWIS-faithful two-tag tagger + `x' [SEP] x'_c` editor input).
+
+    The cache stores the v1 artifacts (4-class tagger_gold; editor_input
+    with in-place DEL tokens and [DEL] targets). The collator derives the
+    v2 form at batch time, so no cache regeneration is needed:
+
+      tagger : op3 gold (KEEP/REPL/DEL) + binary ins gold, via
+               `split_cache_tags` (a cached INS tag always sits on an
+               otherwise-KEEP token).
+      editor : template x'_c = cached editor_input with DEL positions
+               (target == [DEL]) REMOVED — deletion is the tagger's
+               decision alone, as in LEWIS where BART never sees deleted
+               tokens. The full input is `x' [SEP] x'_c` (the template
+               segment drops its duplicated leading <bos>), so the editor
+               sees the pre-edit words it must replace or restore. Labels
+               are -100 over the x' [SEP] prefix.
 
     Output tensors:
       tagger_input_ids       (B, T_tag) long
       tagger_attention_mask  (B, T_tag) long
-      tagger_gold            (B, T_tag) long       -100 outside text
-      editor_input_ids       (B, T_ed) long
+      tagger_op3_gold        (B, T_tag) long       3-class; -100 outside text
+      tagger_ins_gold        (B, T_tag) long       {0,1}; -100 outside text
+      editor_input_ids       (B, T_ed) long        x' [SEP] x'_c
       editor_attention_mask  (B, T_ed) long
-      editor_target_ids      (B, T_ed) long       -100 = ignore
-      z_X                    (B, d_sae) float32   pool-max top-K_train
+      editor_target_ids      (B, T_ed) long        -100 = ignore (whole x' [SEP] prefix)
+      editor_template_start  (B,) long             index of the first x'_c position
+      z_X                    (B, d_sae) float32    pool-max top-K_train
       z_X_prime              (B, d_sae) float32
       ins_span_length        (B,) long
     """
@@ -443,25 +463,55 @@ class CorruptionCollator:
         self,
         d_sae: int,
         pad_token_id: int = 0,
+        sep_token_id: int = None,
+        del_token_id: int = None,
+        bos_token_id: int = None,
         ignore_index: int = -100,
     ):
+        if sep_token_id is None or del_token_id is None:
+            raise ValueError(
+                "CorruptionCollator v2 needs sep_token_id and del_token_id "
+                "(tokenizer.convert_tokens_to_ids('[SEP]') / ('[DEL]'))")
         self.d_sae = int(d_sae)
         self.pad_token_id = int(pad_token_id)
+        self.sep_token_id = int(sep_token_id)
+        self.del_token_id = int(del_token_id)
+        self.bos_token_id = int(bos_token_id) if bos_token_id is not None else None
         self.ignore_index = int(ignore_index)
+
+    def _editor_pair(self, r: Dict) -> tuple:
+        """Derive (input_ids, target_ids, template_start) for one record."""
+        xp = list(r["x_prime_token_ids"])
+        ei = r["editor_input_token_ids"]
+        et = r["editor_target_token_ids"]
+        # Drop DEL positions (v1 kept the spurious token in place and
+        # supervised a [DEL] output there).
+        xc = [int(ei[j]) for j in range(len(ei)) if int(et[j]) != self.del_token_id]
+        xt = [int(et[j]) for j in range(len(ei)) if int(et[j]) != self.del_token_id]
+        # The template duplicates x'’s leading <bos>; keep only the copy in x'.
+        if self.bos_token_id is not None and xc and xc[0] == self.bos_token_id:
+            xc, xt = xc[1:], xt[1:]
+        full_in = xp + [self.sep_token_id] + xc
+        template_start = len(xp) + 1
+        full_tgt = [self.ignore_index] * template_start + xt
+        return full_in, full_tgt, template_start
 
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         B = len(batch)
+        pairs = [self._editor_pair(r) for r in batch]
         # tagger side uses x_prime_token_ids as the visible input
         T_tag = max(len(r["x_prime_token_ids"]) for r in batch)
-        T_ed = max(len(r["editor_input_token_ids"]) for r in batch)
+        T_ed = max(len(p[0]) for p in pairs)
 
         tag_ids = np.full((B, T_tag), self.pad_token_id, dtype=np.int64)
         tag_attn = np.zeros((B, T_tag), dtype=np.int64)
-        tag_gold = np.full((B, T_tag), self.ignore_index, dtype=np.int64)
+        tag_op3 = np.full((B, T_tag), self.ignore_index, dtype=np.int64)
+        tag_ins = np.full((B, T_tag), self.ignore_index, dtype=np.int64)
 
         ed_ids = np.full((B, T_ed), self.pad_token_id, dtype=np.int64)
         ed_attn = np.zeros((B, T_ed), dtype=np.int64)
         ed_tgt = np.full((B, T_ed), self.ignore_index, dtype=np.int64)
+        template_start = torch.zeros(B, dtype=torch.long)
 
         z_X = torch.zeros(B, self.d_sae, dtype=torch.float32)
         z_X_prime = torch.zeros(B, self.d_sae, dtype=torch.float32)
@@ -471,14 +521,15 @@ class CorruptionCollator:
             xp = r["x_prime_token_ids"]
             tag_ids[b, :len(xp)] = xp
             tag_attn[b, :len(xp)] = 1
-            gold = r["tagger_gold"]
-            tag_gold[b, :len(gold)] = gold
+            op3, ins = split_cache_tags(r["tagger_gold"])
+            tag_op3[b, :len(op3)] = op3
+            tag_ins[b, :len(ins)] = ins
 
-            ei = r["editor_input_token_ids"]
-            ed_ids[b, :len(ei)] = ei
-            ed_attn[b, :len(ei)] = 1
-            et = r["editor_target_token_ids"]
-            ed_tgt[b, :len(et)] = et
+            full_in, full_tgt, ts = pairs[b]
+            ed_ids[b, :len(full_in)] = full_in
+            ed_attn[b, :len(full_in)] = 1
+            ed_tgt[b, :len(full_tgt)] = full_tgt
+            template_start[b] = ts
 
             z_X[b] = _dense_topk(r["z_X_topk"], self.d_sae)
             z_X_prime[b] = _dense_topk(r["z_X_prime_topk"], self.d_sae)
@@ -492,10 +543,12 @@ class CorruptionCollator:
         return {
             "tagger_input_ids": torch.from_numpy(tag_ids),
             "tagger_attention_mask": torch.from_numpy(tag_attn),
-            "tagger_gold": torch.from_numpy(tag_gold),
+            "tagger_op3_gold": torch.from_numpy(tag_op3),
+            "tagger_ins_gold": torch.from_numpy(tag_ins),
             "editor_input_ids": torch.from_numpy(ed_ids),
             "editor_attention_mask": torch.from_numpy(ed_attn),
             "editor_target_ids": torch.from_numpy(ed_tgt),
+            "editor_template_start": template_start,
             "z_X": z_X,
             "z_X_prime": z_X_prime,
             "ins_span_length": ins_span_length,

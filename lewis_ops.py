@@ -1,30 +1,40 @@
 """
-LEWIS-style op application for SAE-LEWIS.
+LEWIS-style op application for SAE-LEWIS (v2 — LEWIS-faithful two-tag scheme).
 
-The 4-class tagger predicts per-token ops over {KEEP, REPL, INS, DEL}. This
-module turns (token_ids, ops) into the editor's input sequence and tracks INS
-gaps so that template enumeration at inference can vary slot counts per gap.
+Following LEWIS (Reid & Zhong 2021, §2.1), the tagger produces TWO tags per
+source token:
 
-`apply_ops_for_editor` is purely deterministic given (token_ids, ops); it does
-not need access to the editor or tagger. At training time the corruption
-generator emits ops directly; at inference the tagger does.
+    1. `ins_before` — a binary indicator: should a phrase be inserted to the
+       LEFT of this token?  Insertion is a property of the token BOUNDARY,
+       not of the token itself (the token is otherwise kept/replaced/deleted
+       as usual), so it does not compete with KEEP in a softmax.
+    2. `op3`        — the non-insertion operation for the token itself:
+       KEEP / REPL / DEL (3-class).
 
-Op semantics (LEWIS-faithful, with [DEL] output marker for our bidirectional
-editor):
+This replaces the v1 4-class scheme, where the INS tag was assigned to the
+gap-adjacent token and therefore structurally collided with KEEP (the tagged
+token's content is unchanged), which showed up as INS F1 = 0 on held-out
+evaluation.
 
-    KEEP : retain the original token in the editor input; expect identity
+Editor-input semantics (LEWIS-faithful):
+
+    KEEP : retain the original token in the editor template; expect identity
            at the output.
-    REPL : replace the original token by [MASK] in the editor input; the
-           editor predicts the replacement at the output.
-    DEL  : keep the original token in the editor input ("in-place"); the
-           editor predicts [DEL] at the output (dropped in post-processing).
-    INS  : a [INS] slot is inserted to the LEFT of the next KEEP/REPL/DEL
-           position. The editor predicts the inserted token.
+    REPL : replace the original token by [MASK]; the editor predicts the
+           replacement.
+    DEL  : the token is REMOVED from the editor template — deletion is the
+           tagger's decision alone, exactly as in LEWIS where the BART
+           generator never sees deleted tokens. The editor does not emit a
+           [DEL] marker (the v1 [DEL]-output pathway is gone).
+    ins_before : one or more [INS] slots are inserted at the boundary; the
+           editor predicts the inserted tokens. Slot counts are set by
+           template enumeration at inference (expand_ins_gap).
 
-Conventions:
-- INS does not consume an original token; it expands the sequence.
-- Consecutive INS tags at training time mean a multi-token gap; one [INS]
-  token per gold INS tag.
+The corruption CACHE still stores the v1 4-class `tagger_gold`
+(KEEP/REPL/INS/DEL with INS on the gap-adjacent token); `split_cache_tags`
+converts it losslessly to the two-tag scheme (an INS cache tag always sits on
+an otherwise-KEEP token — corruption.py rejects INS gaps adjacent to
+REPL/DEL spans), so no cache regeneration is needed.
 """
 
 from __future__ import annotations
@@ -35,38 +45,73 @@ from typing import List, Sequence, Tuple
 import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# Cache-side (v1) op ids — the corruption cache stores these in tagger_gold.
+# ---------------------------------------------------------------------------
 OP_KEEP = 0
 OP_REPL = 1
 OP_INS = 2
 OP_DEL = 3
 NUM_OPS = 4
-
 OP_NAMES = ["KEEP", "REPL", "INS", "DEL"]
+
+# ---------------------------------------------------------------------------
+# Tagger-side (v2) op ids — 3-class head plus a separate binary insert head.
+# ---------------------------------------------------------------------------
+OP3_KEEP = 0
+OP3_REPL = 1
+OP3_DEL = 2
+NUM_OPS3 = 3
+OP3_NAMES = ["KEEP", "REPL", "DEL"]
+
+# cache 4-class id → tagger 3-class id (INS maps to KEEP: the gap-adjacent
+# token itself is unchanged; the insertion is carried by ins_before).
+_CACHE_TO_OP3 = {OP_KEEP: OP3_KEEP, OP_REPL: OP3_REPL,
+                 OP_INS: OP3_KEEP, OP_DEL: OP3_DEL}
 
 
 def op_name(op: int) -> str:
     return OP_NAMES[int(op)]
 
 
-def op_id(name: str) -> int:
-    return OP_NAMES.index(name)
+def op3_name(op: int) -> str:
+    return OP3_NAMES[int(op)]
+
+
+def split_cache_tags(tags: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert cached 4-class tagger_gold to the two-tag scheme.
+
+    Returns (op3, ins_before), both len(tags) arrays. Entries < 0 (ignore
+    index, e.g. -100 padding) are passed through unchanged in op3 and map to
+    -100 in ins_before as well.
+    """
+    op3 = np.full(len(tags), -100, dtype=np.int64)
+    ins = np.full(len(tags), -100, dtype=np.int64)
+    for i, t in enumerate(tags):
+        t = int(t)
+        if t < 0:
+            continue
+        op3[i] = _CACHE_TO_OP3[t]
+        ins[i] = 1 if t == OP_INS else 0
+    return op3, ins
 
 
 @dataclass
 class EditorInputs:
-    """Deterministic editor-side artifacts derived from (token_ids, ops).
+    """Deterministic editor-template artifacts derived from the tagger's
+    two-tag output.
 
     Attributes
     ----------
     input_ids : np.ndarray (T_out,) int32
-        The editor's input sequence — original tokens for KEEP/DEL, [MASK]
-        for REPL, [INS] for INS slots.
+        The editor template x'_c — original tokens for KEEP, [MASK] for
+        REPL, [INS] for insertion slots. DEL tokens are absent.
     op_per_pos : np.ndarray (T_out,) int8
-        Op assigned to each output position. INS positions carry OP_INS.
-        KEEP/REPL/DEL positions correspond to original tokens.
+        Op per template position: OP_KEEP / OP_REPL / OP_INS (cache ids;
+        OP_DEL never appears — deleted tokens are not emitted).
     source_pos : np.ndarray (T_out,) int32
-        Index into the source `token_ids` for each output position; -1 for
-        INS positions (no source token).
+        Index into the source `token_ids` for each template position; -1
+        for [INS] slots (no source token).
     ins_gaps : list of (start, length)
         Start position (in T_out) and slot count for each INS gap. Used by
         template enumeration at inference.
@@ -80,28 +125,24 @@ class EditorInputs:
 
 def apply_ops_for_editor(
     token_ids: Sequence[int],
-    ops: Sequence[int],
+    op3: Sequence[int],
+    ins_before: Sequence[int],
     mask_token_id: int,
     ins_token_id: int,
 ) -> EditorInputs:
-    """Build the editor's input sequence from (token_ids, ops).
+    """Build the editor template x'_c from the two-tag output.
 
-    `ops` has the SAME LENGTH AS `token_ids`. Each source position carries one
-    op; the source token at that position is implicitly preserved (KEEP) for
-    INS, replaced with [MASK] for REPL, dropped at output for DEL.
-
-    Semantics per op at source position i:
-      KEEP : emit token_ids[i]
-      REPL : emit [MASK] in place of token_ids[i]
-      DEL  : emit token_ids[i] in place; editor learns to output [DEL]
-      INS  : emit one [INS] slot, then emit token_ids[i] (implicit KEEP)
-
-    Multi-slot gaps are handled by `expand_ins_gap`, which is called by
-    template enumeration at inference.
+    `op3` and `ins_before` have the SAME LENGTH AS `token_ids`. Per source
+    position i:
+      1. if ins_before[i]: open a 1-slot INS gap (emit one [INS]);
+         enumeration resizes it later.
+      2. then emit per op3[i]:
+           KEEP → token_ids[i];  REPL → [MASK];  DEL → nothing.
     """
-    if len(token_ids) != len(ops):
+    if not (len(token_ids) == len(op3) == len(ins_before)):
         raise ValueError(
-            f"token_ids ({len(token_ids)}) and ops ({len(ops)}) length mismatch"
+            f"length mismatch: token_ids={len(token_ids)} op3={len(op3)} "
+            f"ins_before={len(ins_before)}"
         )
 
     out_ids: List[int] = []
@@ -110,29 +151,24 @@ def apply_ops_for_editor(
     ins_gaps: List[Tuple[int, int]] = []
 
     for i in range(len(token_ids)):
-        op = int(ops[i])
-        if op == OP_KEEP:
-            out_ids.append(int(token_ids[i]))
-            out_ops.append(OP_KEEP)
-            out_src.append(i)
-        elif op == OP_REPL:
-            out_ids.append(mask_token_id)
-            out_ops.append(OP_REPL)
-            out_src.append(i)
-        elif op == OP_DEL:
-            out_ids.append(int(token_ids[i]))
-            out_ops.append(OP_DEL)
-            out_src.append(i)
-        elif op == OP_INS:
+        if int(ins_before[i]) > 0:
             ins_gaps.append((len(out_ids), 1))
             out_ids.append(ins_token_id)
             out_ops.append(OP_INS)
             out_src.append(-1)
+        op = int(op3[i])
+        if op == OP3_KEEP:
             out_ids.append(int(token_ids[i]))
             out_ops.append(OP_KEEP)
             out_src.append(i)
+        elif op == OP3_REPL:
+            out_ids.append(mask_token_id)
+            out_ops.append(OP_REPL)
+            out_src.append(i)
+        elif op == OP3_DEL:
+            pass  # deleted tokens never enter the template (LEWIS-faithful)
         else:
-            raise ValueError(f"unknown op id {op} at position {i}")
+            raise ValueError(f"unknown op3 id {op} at position {i}")
 
     return EditorInputs(
         input_ids=np.asarray(out_ids, dtype=np.int32),
@@ -189,41 +225,34 @@ def expand_ins_gap(
     )
 
 
-def decode_with_op_mask(
+def decode_editor_output(
     input_ids: np.ndarray,
     argmax_ids: np.ndarray,
     op_per_pos: np.ndarray,
-    del_token_id: int,
 ) -> List[int]:
-    """Reduce editor (input_ids, argmax) using the op_per_pos op mask to a
-    list of output tokens. Drops every position whose final token is [DEL].
+    """Reduce editor (template_ids, argmax over the template segment) to the
+    final token list.
 
-    KEEP : output = input token (identity is enforced regardless of argmax)
-    REPL : output = argmax (unless argmax == [DEL], in which case dropped)
-    DEL  : output = [DEL] (dropped)
-    INS  : output = argmax (unless argmax == [DEL], in which case dropped)
+    KEEP : output = template token (identity enforced regardless of argmax)
+    REPL : output = argmax
+    INS  : output = argmax
 
-    Per the README, any other position whose argmax is [DEL] is dropped too.
+    Deletion needs no handling here: DEL tokens were removed from the
+    template by `apply_ops_for_editor`.
     """
     out: List[int] = []
     for pos in range(len(input_ids)):
         op = int(op_per_pos[pos])
         if op == OP_KEEP:
-            tok = int(input_ids[pos])
-        elif op == OP_REPL:
-            tok = int(argmax_ids[pos])
-        elif op == OP_DEL:
-            continue
-        else:  # OP_INS
-            tok = int(argmax_ids[pos])
-        if tok == del_token_id:
-            continue
-        out.append(tok)
+            out.append(int(input_ids[pos]))
+        else:  # OP_REPL / OP_INS
+            out.append(int(argmax_ids[pos]))
     return out
 
 
 def stats_ins_run_lengths(ops: Sequence[int]) -> List[int]:
-    """Return a list of INS-run lengths (consecutive OP_INS) in `ops`."""
+    """Return a list of INS-run lengths (consecutive OP_INS) in a cache-id
+    op sequence (used for cache-side statistics)."""
     out: List[int] = []
     i, n = 0, len(ops)
     while i < n:

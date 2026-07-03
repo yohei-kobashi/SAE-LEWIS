@@ -47,7 +47,7 @@ def parse_args():
     p.add_argument("--save-steps", type=int, default=1000)
 
     p.add_argument("--k-top", type=int, default=8)
-    p.add_argument("--empty-cond-prob", type=float, default=0.15)
+    p.add_argument("--empty-cond-prob", type=float, default=0.05)
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
@@ -68,6 +68,8 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.llm2vec_dir)
     ins_id = tokenizer.convert_tokens_to_ids("[INS]")
+    sep_id = tokenizer.convert_tokens_to_ids("[SEP]")
+    del_id = tokenizer.convert_tokens_to_ids("[DEL]")
     meta = json.loads((Path(args.corruption_dir) / "meta.json").read_text())
     d_sae = int(meta["d_sae"])
 
@@ -86,7 +88,11 @@ def main():
     )
 
     ds = CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed)
-    coll = CorruptionCollator(d_sae=d_sae, pad_token_id=tokenizer.pad_token_id)
+    coll = CorruptionCollator(
+        d_sae=d_sae, pad_token_id=tokenizer.pad_token_id,
+        sep_token_id=sep_id, del_token_id=del_id,
+        bos_token_id=tokenizer.bos_token_id,
+    )
     loader = DataLoader(
         ds, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=coll,
     )
@@ -147,8 +153,9 @@ def main():
         z_amp = torch.zeros_like(z_X)
         z_sup = torch.zeros_like(z_X)
         for b in range(B):
-            k_amp = int(rng.integers(0, 4))
-            k_sup = int(rng.integers(0, 4))
+            # {1..4} — match the editor/tagger conditioning distribution.
+            k_amp = int(rng.integers(1, 5))
+            k_sup = int(rng.integers(1, 5))
             a, s = diff_to_sparse(
                 z_X[b], z_X_prime[b],
                 k_top=args.k_top, k_amp=k_amp, k_sup=k_sup,

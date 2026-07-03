@@ -1,16 +1,19 @@
 """
-Held-out evaluation of the trained SAE-LEWIS tagger and editor.
+Held-out evaluation of the trained SAE-LEWIS tagger and editor (v2).
 
 Runs Level 1 (held-out accuracy) and Level 2 (conditioning causality) on a
 DEV corruption cache — a cache generated from Dolma sentences disjoint from
-the training cache (see `corruption.py --skip-sentences`).
+the training cache (see `corruption.py --skip-sentences`), or a set of
+shards held out from the training cache.
 
 Level 1 — per-stage metrics (README §13.1):
-  tagger : per-class P/R/F1 over KEEP/REPL/INS/DEL, confusion matrix,
-           macro-F1 vs the all-KEEP baseline, edit-span IoU
-  editor : per-position-type argmax accuracy (KEEP identity, REPL/INS
-           restoration top-1/top-5, DEL → [DEL]), overgenerate /
-           undergenerate rates, mean CE loss, [DEL]-logit separation
+  tagger : 3-class op head — per-class P/R/F1 over KEEP/REPL/DEL, confusion
+           matrix, macro-F1 vs the all-KEEP baseline;
+           binary insert head — P/R/F1 of "insert before this token";
+           edit-span IoU over the union of both heads' edit positions
+  editor : per-position-type argmax accuracy over the template segment of
+           the `x' [SEP] x'_c` input (KEEP identity, REPL/INS restoration
+           top-1/top-5), marker-emission rate, mean CE loss
 
 Level 2 — conditioning causality (the central SAE-LEWIS validity check):
   every sample is evaluated under three paired conditions —
@@ -52,7 +55,7 @@ from transformers import AutoTokenizer, set_seed
 from data import CorruptionCollator, CorruptionDataset
 from editor import load_editor_from_checkpoint
 from intervene import diff_to_sparse
-from lewis_ops import NUM_OPS, OP_NAMES
+from lewis_ops import NUM_OPS3, OP3_NAMES
 from tagger import load_tagger_from_checkpoint
 
 CONDITIONS = ["true", "empty", "random"]
@@ -74,6 +77,8 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--k-top", type=int, default=8,
                    help="Diff candidate pool size (match training).")
+    p.add_argument("--ins-threshold", type=float, default=0.5,
+                   help="Sigmoid threshold for the tagger's insert head.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
@@ -92,7 +97,7 @@ def build_conditions(
     """Build the three paired (z_amp, z_sup) variants for a batch.
 
     The per-sample k_amp / k_sup draw matches the training distribution
-    (uniform over {0..3}) but empty-conditioning is disabled so every
+    (uniform over {1..4}) and empty-conditioning is disabled so every
     sample carries signal under `true`. `random` reuses the exact nonzero
     counts and (permuted) magnitudes of `true` at uniformly random feature
     indices, so any accuracy gap vs `true` isolates feature IDENTITY.
@@ -104,8 +109,8 @@ def build_conditions(
     sup_r = torch.zeros_like(z_X)
 
     for b in range(B):
-        k_amp = int(rng.integers(0, 4))
-        k_sup = int(rng.integers(0, 4))
+        k_amp = int(rng.integers(1, 5))
+        k_sup = int(rng.integers(1, 5))
         a, s = diff_to_sparse(
             z_X[b], z_X_prime[b],
             k_top=k_top, k_amp=k_amp, k_sup=k_sup,
@@ -143,7 +148,8 @@ def eval_tagger(args, d_sae: int, loader) -> Dict:
     tagger.eval()
 
     rng = np.random.default_rng(args.seed)
-    conf = {c: np.zeros((NUM_OPS, NUM_OPS), dtype=np.int64) for c in CONDITIONS}
+    conf = {c: np.zeros((NUM_OPS3, NUM_OPS3), dtype=np.int64) for c in CONDITIONS}
+    ins_cnt = {c: defaultdict(int) for c in CONDITIONS}   # tp/fp/fn/tn
     iou_sum = {c: 0.0 for c in CONDITIONS}
     iou_n = {c: 0 for c in CONDITIONS}
     seen = 0
@@ -153,24 +159,39 @@ def eval_tagger(args, d_sae: int, loader) -> Dict:
                                  args.k_top, rng)
         ids = batch["tagger_input_ids"].to(args.device)
         attn = batch["tagger_attention_mask"].to(args.device)
-        gold = batch["tagger_gold"]
-        valid = gold != -100
+        op_gold = batch["tagger_op3_gold"]
+        ins_gold = batch["tagger_ins_gold"]
+        valid = op_gold != -100
 
         for c in CONDITIONS:
             z_amp, z_sup = conds[c]
             with torch.no_grad():
                 out = tagger(ids, attn,
                              z_amp.to(args.device), z_sup.to(args.device))
-            pred = out["logits"].argmax(dim=-1).cpu()
-            g = gold[valid].numpy()
-            p = pred[valid].numpy()
+            op_pred = out["op_logits"].argmax(dim=-1).cpu()
+            ins_pred = (torch.sigmoid(out["ins_logits"].float().cpu())
+                        >= args.ins_threshold).long()
+
+            g = op_gold[valid].numpy()
+            p = op_pred[valid].numpy()
             np.add.at(conf[c], (g, p), 1)
 
-            # Edit-span IoU per sample (gold vs predicted non-KEEP sets)
+            ig = ins_gold[valid]
+            ip = ins_pred[valid]
+            ic = ins_cnt[c]
+            ic["tp"] += int(((ig == 1) & (ip == 1)).sum())
+            ic["fp"] += int(((ig == 0) & (ip == 1)).sum())
+            ic["fn"] += int(((ig == 1) & (ip == 0)).sum())
+            ic["tn"] += int(((ig == 0) & (ip == 0)).sum())
+
+            # Edit-span IoU per sample: union of both heads' edit positions
+            # (op3 != KEEP or ins fired) vs the gold union.
             for b in range(ids.shape[0]):
                 v = valid[b]
-                ge = set((gold[b][v] > 0).nonzero(as_tuple=True)[0].tolist())
-                pe = set((pred[b][v] > 0).nonzero(as_tuple=True)[0].tolist())
+                ge = set(((op_gold[b][v] > 0) | (ins_gold[b][v] == 1))
+                         .nonzero(as_tuple=True)[0].tolist())
+                pe = set(((op_pred[b][v] > 0) | (ins_pred[b][v] == 1))
+                         .nonzero(as_tuple=True)[0].tolist())
                 union = ge | pe
                 if union:
                     iou_sum[c] += len(ge & pe) / len(union)
@@ -185,6 +206,7 @@ def eval_tagger(args, d_sae: int, loader) -> Dict:
         m = _prf_from_confusion(conf[c])
         m["span_iou"] = iou_sum[c] / max(1, iou_n[c])
         m["confusion"] = conf[c].tolist()
+        m["ins"] = _prf_binary(ins_cnt[c])
         metrics["conditions"][c] = m
 
     # All-KEEP baseline from the gold marginal (same for every condition)
@@ -204,10 +226,19 @@ def eval_tagger(args, d_sae: int, loader) -> Dict:
     return metrics
 
 
+def _prf_binary(cnt: Dict[str, int]) -> Dict:
+    tp, fp, fn = float(cnt["tp"]), float(cnt["fp"]), float(cnt["fn"])
+    prec = tp / (tp + fp) if tp + fp > 0 else 0.0
+    rec = tp / (tp + fn) if tp + fn > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
+    return {"precision": prec, "recall": rec, "f1": f1,
+            "support": int(cnt["tp"] + cnt["fn"])}
+
+
 def _prf_from_confusion(conf: np.ndarray) -> Dict:
     per_class = {}
     f1s = []
-    for i, name in enumerate(OP_NAMES):
+    for i, name in enumerate(OP3_NAMES):
         tp = float(conf[i, i])
         fp = float(conf[:, i].sum() - tp)
         fn = float(conf[i, :].sum() - tp)
@@ -240,7 +271,9 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
 
     mask_id = int(tok.mask_token_id)
     ins_id = int(tok.convert_tokens_to_ids("[INS]"))
+    sep_id = int(tok.convert_tokens_to_ids("[SEP]"))
     del_id = int(tok.convert_tokens_to_ids("[DEL]"))
+    marker_ids = torch.tensor([mask_id, ins_id, sep_id, del_id])
 
     rng = np.random.default_rng(args.seed)
     agg = {c: defaultdict(float) for c in CONDITIONS}
@@ -253,11 +286,12 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
         attn = batch["editor_attention_mask"].to(args.device)
         tgt = batch["editor_target_ids"]
 
+        # Labels are -100 over the x' [SEP] prefix, so `valid` selects the
+        # template segment only.
         valid = tgt != -100
         is_repl = (batch["editor_input_ids"] == mask_id) & valid
         is_ins = (batch["editor_input_ids"] == ins_id) & valid
-        is_del = (tgt == del_id) & valid
-        is_keep = valid & ~is_repl & ~is_ins & ~is_del
+        is_keep = valid & ~is_repl & ~is_ins
 
         for c in CONDITIONS:
             z_amp, z_sup = conds[c]
@@ -273,7 +307,7 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
 
             pred1 = logits.argmax(dim=-1)
             for key, m in (("keep", is_keep), ("repl", is_repl),
-                           ("ins", is_ins), ("del", is_del)):
+                           ("ins", is_ins)):
                 a[f"{key}_n"] += int(m.sum())
                 a[f"{key}_top1"] += int((pred1[m] == tgt[m]).sum())
             for key, m in (("repl", is_repl), ("ins", is_ins)):
@@ -281,13 +315,11 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
                     top5 = logits[m].topk(5, dim=-1).indices
                     a[f"{key}_top5"] += int(
                         (top5 == tgt[m].unsqueeze(-1)).any(dim=-1).sum())
-            # Overgeneration: [DEL] fired where the target is identity.
-            a["overgen"] += int((pred1[is_keep] == del_id).sum())
-            # [DEL]-logit separation (diagnoses the tied output-column delta)
-            if is_del.any():
-                a["del_logit_at_del"] += float(logits[is_del][:, del_id].sum())
-            if is_keep.any():
-                a["del_logit_at_keep"] += float(logits[is_keep][:, del_id].sum())
+            # Marker emission: a special token ([MASK]/[INS]/[SEP]/[DEL])
+            # winning the argmax anywhere in the template is always wrong —
+            # v2 targets contain no special tokens.
+            a["marker_emit"] += int(
+                torch.isin(pred1[valid], marker_ids).sum())
 
         seen += ids.shape[0]
         if seen >= args.max_samples:
@@ -297,16 +329,13 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
     for c in CONDITIONS:
         a = agg[c]
         m = {"mean_loss": a["loss_sum"] / max(1, a["loss_n"])}
-        for key in ("keep", "repl", "ins", "del"):
+        for key in ("keep", "repl", "ins"):
             n = max(1, int(a[f"{key}_n"]))
             m[f"{key}_positions"] = int(a[f"{key}_n"])
             m[f"{key}_top1_acc"] = a[f"{key}_top1"] / n
         for key in ("repl", "ins"):
             m[f"{key}_top5_acc"] = a[f"{key}_top5"] / max(1, int(a[f"{key}_n"]))
-        m["overgenerate_rate"] = a["overgen"] / max(1, int(a["keep_n"]))
-        m["undergenerate_rate"] = 1.0 - m["del_top1_acc"]
-        m["del_logit_mean_at_del"] = a["del_logit_at_del"] / max(1, int(a["del_n"]))
-        m["del_logit_mean_at_keep"] = a["del_logit_at_keep"] / max(1, int(a["keep_n"]))
+        m["marker_emission_rate"] = a["marker_emit"] / max(1, int(a["loss_n"]))
         metrics["conditions"][c] = m
 
     metrics["diagnostics"] = {
@@ -348,7 +377,7 @@ def build_verdicts(tagger_m: Optional[Dict], editor_m: Optional[Dict]) -> Dict:
     v = {}
     if tagger_m:
         f1 = {c: tagger_m["conditions"][c]["macro_f1"] for c in CONDITIONS}
-        v["tagger"] = {
+        v["tagger_op3"] = {
             "metric": "macro_f1",
             "true": f1["true"], "empty": f1["empty"], "random": f1["random"],
             "delta_true_empty": f1["true"] - f1["empty"],
@@ -356,8 +385,17 @@ def build_verdicts(tagger_m: Optional[Dict], editor_m: Optional[Dict]) -> Dict:
             **_verdict(f1["true"] - f1["empty"], f1["true"] - f1["random"],
                        used_thresh=0.02, weak_thresh=0.005),
         }
+        insf = {c: tagger_m["conditions"][c]["ins"]["f1"] for c in CONDITIONS}
+        v["tagger_ins"] = {
+            "metric": "ins_f1",
+            "true": insf["true"], "empty": insf["empty"], "random": insf["random"],
+            "delta_true_empty": insf["true"] - insf["empty"],
+            "delta_true_random": insf["true"] - insf["random"],
+            **_verdict(insf["true"] - insf["empty"], insf["true"] - insf["random"],
+                       used_thresh=0.02, weak_thresh=0.005),
+        }
     if editor_m:
-        for key, thresh in (("repl_top1_acc", 0.02), ("del_top1_acc", 0.02)):
+        for key, thresh in (("repl_top1_acc", 0.02), ("ins_top1_acc", 0.02)):
             acc = {c: editor_m["conditions"][c][key] for c in CONDITIONS}
             v[f"editor_{key}"] = {
                 "metric": key,
@@ -371,29 +409,35 @@ def build_verdicts(tagger_m: Optional[Dict], editor_m: Optional[Dict]) -> Dict:
 
 
 def write_report(out_dir: Path, tagger_m, editor_m, verdicts) -> None:
-    lines = ["# Tagger / Editor held-out evaluation", ""]
+    lines = ["# Tagger / Editor held-out evaluation (v2)", ""]
 
     if tagger_m:
         lines += ["## Tagger (Level 1)", "",
                   f"samples: {tagger_m['n_samples']}", ""]
         base = tagger_m["all_keep_baseline"]
         lines += ["| condition | acc | macro-F1 | span IoU | "
-                  + " | ".join(f"{n} F1" for n in OP_NAMES) + " |",
-                  "|---|---|---|---|" + "---|" * NUM_OPS]
+                  + " | ".join(f"{n} F1" for n in OP3_NAMES)
+                  + " | INS-before F1 |",
+                  "|---|---|---|---|" + "---|" * (NUM_OPS3 + 1)]
         for c in CONDITIONS:
             m = tagger_m["conditions"][c]
             row = (f"| {c} | {m['accuracy']:.4f} | {m['macro_f1']:.4f} "
                    f"| {m['span_iou']:.4f} |")
-            row += "".join(f" {m['per_class'][n]['f1']:.4f} |" for n in OP_NAMES)
+            row += "".join(f" {m['per_class'][n]['f1']:.4f} |" for n in OP3_NAMES)
+            row += f" {m['ins']['f1']:.4f} |"
             lines.append(row)
         lines.append(f"| all-KEEP baseline | {base['accuracy']:.4f} "
                      f"| {base['macro_f1']:.4f} | — |"
-                     + " — |" * NUM_OPS)
-        lines += ["", "Per-class recall (condition = true):"]
-        for n in OP_NAMES:
+                     + " — |" * (NUM_OPS3 + 1))
+        lines += ["", "Per-class detail (condition = true):"]
+        for n in OP3_NAMES:
             pc = tagger_m["conditions"]["true"]["per_class"][n]
             lines.append(f"- {n}: P={pc['precision']:.4f} R={pc['recall']:.4f} "
                          f"F1={pc['f1']:.4f} (support {pc['support']})")
+        pc = tagger_m["conditions"]["true"]["ins"]
+        lines.append(f"- INS-before (binary head): P={pc['precision']:.4f} "
+                     f"R={pc['recall']:.4f} F1={pc['f1']:.4f} "
+                     f"(support {pc['support']})")
         d = tagger_m["diagnostics"]
         lines += ["", f"cond_scale = {d['cond_scale']:.4f}   "
                       f"‖Proj_A.W‖ = {d['proj_a_weight_norm']:.2f}", ""]
@@ -402,24 +446,17 @@ def write_report(out_dir: Path, tagger_m, editor_m, verdicts) -> None:
         lines += ["## Editor (Level 1)", "",
                   f"samples: {editor_m['n_samples']}", ""]
         cols = ["mean_loss", "keep_top1_acc", "repl_top1_acc", "repl_top5_acc",
-                "ins_top1_acc", "ins_top5_acc", "del_top1_acc",
-                "overgenerate_rate"]
+                "ins_top1_acc", "ins_top5_acc", "marker_emission_rate"]
         lines += ["| condition | " + " | ".join(cols) + " |",
                   "|---|" + "---|" * len(cols)]
         for c in CONDITIONS:
             m = editor_m["conditions"][c]
             lines.append("| " + c + " |"
                          + "".join(f" {m[k]:.4f} |" for k in cols))
-        m = editor_m["conditions"]["true"]
-        lines += ["",
-                  f"[DEL] logit mean at DEL positions: "
-                  f"{m['del_logit_mean_at_del']:.2f}  vs at KEEP positions: "
-                  f"{m['del_logit_mean_at_keep']:.2f} (separation must be "
-                  f"positive and growing for the tied output-column delta "
-                  f"to be working)", ""]
         d = editor_m["diagnostics"]
-        lines.append(f"cond_scale = {d['cond_scale']:.4f}   "
-                     f"‖Proj_A.W‖ = {d['proj_a_weight_norm']:.2f}")
+        lines += ["",
+                  f"cond_scale = {d['cond_scale']:.4f}   "
+                  f"‖Proj_A.W‖ = {d['proj_a_weight_norm']:.2f}"]
         if d["delta_emb_norms"]:
             lines.append("delta_emb row norms: " + ", ".join(
                 f"{k}={v:.3f}" for k, v in d["delta_emb_norms"].items()))
@@ -455,10 +492,15 @@ def _dtype(s: str) -> torch.dtype:
             "float32": torch.float32}[s]
 
 
-def make_loader(args, d_sae: int, pad_token_id: int) -> DataLoader:
+def make_loader(args, d_sae: int, tok) -> DataLoader:
     ds = CorruptionDataset(args.corruption_dir, shuffle=False,
                            seed=args.seed, infinite=False)
-    coll = CorruptionCollator(d_sae=d_sae, pad_token_id=pad_token_id)
+    coll = CorruptionCollator(
+        d_sae=d_sae, pad_token_id=tok.pad_token_id,
+        sep_token_id=tok.convert_tokens_to_ids("[SEP]"),
+        del_token_id=tok.convert_tokens_to_ids("[DEL]"),
+        bos_token_id=tok.bos_token_id,
+    )
     return DataLoader(ds, batch_size=args.batch_size, num_workers=0,
                       collate_fn=coll)
 
@@ -482,11 +524,9 @@ def main():
     tagger_m = None
     editor_m = None
     if args.tagger_ckpt:
-        tagger_m = eval_tagger(args, d_sae,
-                               make_loader(args, d_sae, tok.pad_token_id))
+        tagger_m = eval_tagger(args, d_sae, make_loader(args, d_sae, tok))
     if args.editor_ckpt:
-        editor_m = eval_editor(args, d_sae,
-                               make_loader(args, d_sae, tok.pad_token_id), tok)
+        editor_m = eval_editor(args, d_sae, make_loader(args, d_sae, tok), tok)
 
     verdicts = build_verdicts(tagger_m, editor_m)
     payload = {

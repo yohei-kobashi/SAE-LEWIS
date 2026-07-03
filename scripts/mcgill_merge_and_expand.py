@@ -67,11 +67,14 @@ def parse_args():
     p.add_argument("--dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32"])
     p.add_argument("--add-special-tokens", nargs="+",
-                   default=["[INS]", "[DEL]", "[MASK]"],
+                   default=["[INS]", "[DEL]", "[MASK]", "[SEP]"],
                    help="Tokens to add to the tokenizer before saving. "
                         "[MASK] is only added if the tokenizer has no "
-                        "mask_token already; [INS] / [DEL] are new either "
-                        "way (SAE-LEWIS-specific).")
+                        "mask_token already; [INS] / [DEL] / [SEP] are new "
+                        "either way (SAE-LEWIS-specific; [SEP] separates "
+                        "x' from the edit template in the v2 editor input). "
+                        "For an ALREADY-merged checkpoint use "
+                        "scripts/add_special_tokens.py instead.")
     return p.parse_args()
 
 
@@ -229,7 +232,7 @@ def main():
         print("[bridge]   new rows initialised via HF's mean-of-existing trick "
               "(same as our previous train_llm2vec.py)")
     ids = {tok: tokenizer.convert_tokens_to_ids(tok)
-           for tok in ("[MASK]", "[INS]", "[DEL]")
+           for tok in ("[MASK]", "[INS]", "[DEL]", "[SEP]")
            if tokenizer.convert_tokens_to_ids(tok) is not None}
     print(f"[bridge]   token ids: {ids}")
 
@@ -250,6 +253,7 @@ def main():
         "mask_token_id": tokenizer.mask_token_id,
         "ins_token_id": tokenizer.convert_tokens_to_ids("[INS]"),
         "del_token_id": tokenizer.convert_tokens_to_ids("[DEL]"),
+        "sep_token_id": tokenizer.convert_tokens_to_ids("[SEP]"),
         "lora": {
             "mntp":   {"merged": True, "source": str(args.mntp_adapter)},
             "simcse": ({"merged": True, "source": str(args.simcse_adapter)}
