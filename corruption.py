@@ -71,7 +71,7 @@ import json
 import math
 import random
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
@@ -183,6 +183,30 @@ def parse_args():
     p.add_argument("--op-position-max-retries", type=int, default=20,
                    help="Per-op attempts to find a non-conflicting position "
                         "before giving up on the compound.")
+
+    # Condition-selective emission (v3, README §6.2.8). From every accepted
+    # compound, besides the full-revert record, also emit:
+    #   partial : a random proper nonempty op-subset S is reverted; the
+    #             record's "clean" side becomes X_S and the conditioning
+    #             becomes diff(SAE(X_S), SAE(X')). The same X' with a
+    #             different S has DIFFERENT gold, so the conditioning is
+    #             the only disambiguator — the loss cannot be minimised
+    #             without reading it. (N >= 2 only.)
+    #   null    : S = ∅ — the record's clean side IS X' (all-KEEP gold,
+    #             zero SAE diff). Teaches "corrupted-looking text + no
+    #             instruction → edit nothing", which the v1/v2 cache never
+    #             contained and which replaces the harmful empty-cond
+    #             training hack (z = 0 while the target stayed the full
+    #             restore).
+    p.add_argument("--emit-full", type=float, default=1.0,
+                   help="Probability of emitting the full-revert record per "
+                        "accepted compound.")
+    p.add_argument("--emit-partial", type=float, default=1.0,
+                   help="Probability of emitting one random proper-subset "
+                        "record per accepted compound (N >= 2 only).")
+    p.add_argument("--emit-null", type=float, default=0.5,
+                   help="Probability of emitting the S=∅ (all-KEEP) record "
+                        "per accepted compound.")
 
     # Per-op span / MLM knobs
     p.add_argument("--repl-mlm-topk", type=int, default=8)
@@ -1430,6 +1454,113 @@ def build_identity_sample(stage: Stage, text: str) -> Tuple[Optional[Dict], str]
 
 
 # ---------------------------------------------------------------------------
+# Condition-selective subsets (v3, README §6.2.8)
+# ---------------------------------------------------------------------------
+def rebase_subset_ops(
+    text: str,
+    words: List[Tuple[str, int, int]],
+    ops: List[OpSpec],
+    subset_idx: Set[int],
+) -> Optional[Tuple[str, List[OpSpec]]]:
+    """Rebase the ops in `subset_idx` from X onto X_S.
+
+    X_S = X with the COMPLEMENT ops applied (i.e. X' with the subset
+    reverted). The subset ops' own char spans are untouched by the
+    complement (the claim rules of `can_add_op` guarantee non-overlap), so
+    each span survives verbatim in X_S at a shifted position; we map the
+    positions through the complement's cumulative char shifts, verify the
+    substring is identical, and re-derive word indices on X_S.
+
+    Returns (xs_text, rebased_subset_ops) or None if any mapping step
+    fails (caller counts the reason and skips the partial record).
+    """
+    comp = [op for i, op in enumerate(ops) if i not in subset_idx]
+    sub = [op for i, op in enumerate(ops) if i in subset_idx]
+    if not sub:
+        return None
+    try:
+        xs_text, _ = apply_compound_to_text(text, words, comp)
+    except Exception:
+        return None
+    if not xs_text:
+        return None
+
+    # Char-shift events induced by the complement ops on X.
+    events: List[Tuple[int, int, int]] = []   # (cs, ce, delta)
+    for op in comp:
+        if op.op_type == "repl":
+            cs = words[op.word_start][1]
+            ce = words[op.word_end - 1][2]
+            events.append((cs, ce, len(op.payload or "") - (ce - cs)))
+        elif op.op_type == "ins":
+            cs = words[op.word_start][1]
+            ce = words[op.word_end - 1][2]
+            if ce < len(text) and text[ce].isspace():
+                ce += 1
+            events.append((cs, ce, -(ce - cs)))
+        elif op.op_type == "del":
+            pos = words[op.word_start][1]
+            events.append((pos, pos, len(op.payload or "") + 1))
+    events.sort()
+
+    def map_pos(p: int) -> Optional[int]:
+        shift = 0
+        for cs, ce, d in events:
+            if ce <= p:
+                shift += d
+            elif cs >= p:
+                break
+            else:
+                return None   # inside a complement-edited region
+        return p + shift
+
+    xs_words = words_with_offsets(xs_text)
+    starts = {w[1]: i for i, w in enumerate(xs_words)}
+    ends = {w[2]: i for i, w in enumerate(xs_words)}
+
+    new_ops: List[OpSpec] = []
+    for op in sub:
+        if op.op_type == "del":
+            pos = map_pos(words[op.word_start][1])
+            if pos is None or pos not in starts:
+                return None
+            wi = starts[pos]
+            new_ops.append(OpSpec("del", wi, wi, payload=op.payload))
+        else:
+            cs = words[op.word_start][1]
+            ce = words[op.word_end - 1][2]
+            cs2 = map_pos(cs)
+            if cs2 is None:
+                return None
+            ce2 = cs2 + (ce - cs)
+            if xs_text[cs2:ce2] != text[cs:ce]:
+                return None            # self-check: span must survive verbatim
+            if cs2 not in starts or ce2 not in ends:
+                return None
+            new_ops.append(OpSpec(op.op_type, starts[cs2], ends[ce2] + 1,
+                                  payload=op.payload))
+    return xs_text, new_ops
+
+
+def build_partial_sample(
+    stage: Stage, text: str, words: List[Tuple[str, int, int]],
+    ops: List[OpSpec], subset_idx: Set[int],
+) -> Tuple[Optional[Dict], str]:
+    """Build the record whose clean side is X_S (subset reverted).
+
+    The pair is self-consistent by construction: build_compound_sample
+    re-derives its own corrupted text from (X_S, rebased ops), so the
+    record's gold is exact even if whitespace details differ marginally
+    from the parent X'.
+    """
+    rb = rebase_subset_ops(text, words, ops, subset_idx)
+    if rb is None:
+        return None, "partial_rebase_failed"
+    xs_text, sub_ops = rb
+    return build_compound_sample(stage, xs_text, sub_ops)
+
+
+# ---------------------------------------------------------------------------
 # N-dependent gates (§6.2.6)
 # ---------------------------------------------------------------------------
 def gate_thresholds(N: int, args) -> Tuple[float, int]:
@@ -1465,6 +1596,7 @@ def gate_thresholds(N: int, args) -> Tuple[float, int]:
 def finalize_sample(
     stage: Stage, sample: Dict, source_id: str, args,
     calibration_writer: Optional[any] = None,
+    light: bool = False,
 ) -> Tuple[Optional[Dict], str]:
     """Apply N-dependent PPL / SAE-shift gates and attach conditioning topk.
 
@@ -1472,6 +1604,11 @@ def finalize_sample(
     to `calibration_writer` (a JSONL handle). The sample is then still
     finalised and returned so the calibration run still emits a usable
     cache (useful for end-to-end shape testing).
+
+    `light=True` (v3 partial/null records): skip SLOR/PPL scoring and all
+    gates — the record derives from a compound that already passed them —
+    and compute only the SAE conditioning. Cuts the per-extra-record cost
+    to two SAE forwards (one when the two texts are identical).
     """
     x_text = sample.get("x_text", "")
     xp_text = sample.get("x_prime_text", "")
@@ -1479,7 +1616,7 @@ def finalize_sample(
         return None, "empty_xprime_text"
 
     N = int(sample.get("N_total", 0))
-    is_identity = (N == 0)
+    is_identity = (N == 0) or light
 
     if is_identity:
         slor_X = slor_Xp = None
@@ -1508,7 +1645,10 @@ def finalize_sample(
     # L2 shift telemetry; local (= pool-max over tokens that overlap an
     # edited char range) is what the SAE gate decides on.
     offsets_X, z_X = sae_encode_with_offsets(stage, x_text)
-    offsets_Xp, z_Xp = sae_encode_with_offsets(stage, xp_text)
+    if xp_text == x_text:
+        offsets_Xp, z_Xp = offsets_X, z_X    # null records: identical texts
+    else:
+        offsets_Xp, z_Xp = sae_encode_with_offsets(stage, xp_text)
     fX, vX = sae_global_pool_topk(stage, z_X)
     fXp, vXp = sae_global_pool_topk(stage, z_Xp)
     shift = sae_l2_shift(fX, vX, fXp, vXp)
@@ -1551,7 +1691,7 @@ def finalize_sample(
 
     slor_drop_max, sae_min_topk_change = gate_thresholds(N, args)
 
-    if calibration_writer is not None:
+    if calibration_writer is not None and not light:
         calibration_writer.write(json.dumps({
             "N": N,
             "source_sent_id": source_id,
@@ -1899,6 +2039,40 @@ def main():
 
     open_shard()
 
+    emit_counts: Counter = Counter()
+
+    def write_record(rec: Dict):
+        """Write one record; rotate shards and log at shard boundaries."""
+        nonlocal written
+        cur_shard_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        written += 1
+        pbar.update(1)
+        emit_counts[rec.get("subset_kind", "full")] += 1
+        if written % args.samples_per_shard == 0 and written < args.target_samples:
+            cur_shard_file.close()
+            open_shard()
+            yield_pct = written / max(1, attempted)
+            per_bucket = ", ".join(
+                f"{b}={bucket_accepts[b]}/{bucket_attempts[b]}="
+                f"{bucket_accepts[b] / max(1, bucket_attempts[b]):.2f}"
+                for b in BUCKETS
+            )
+            per_N = ", ".join(
+                f"N={k}:{n_accepts[k]}/{n_attempts[k]}="
+                f"{n_accepts[k] / max(1, n_attempts[k]):.2f}"
+                for k in sorted(n_attempts)
+            )
+            per_kind = ", ".join(f"{k}={v}" for k, v in emit_counts.items())
+            print(
+                f"[corruption] written={written} sents={sent_idx} "
+                f"attempts={attempted} yield={yield_pct:.3f}  "
+                f"buckets({per_bucket})  N({per_N})  kinds({per_kind})"
+            )
+            if reject_reasons:
+                top = sorted(reject_reasons.items(), key=lambda kv: -kv[1])[:8]
+                print(f"[corruption] reject reasons: " +
+                      ", ".join(f"{k}={v}" for k, v in top))
+
     # tqdm progress bar over written/target_samples. initial=written lets
     # the bar start at the resumed offset.
     pbar = tqdm(
@@ -1963,44 +2137,74 @@ def main():
                         reject_reasons[reason] += 1
             if sample is None:
                 continue
+            # v3: keep the parent's corrupted text for the S=∅ record
+            # (finalize_sample strips the text fields from the dict).
+            parent_xp_text = sample.get("x_prime_text", "")
+            source_id = f"dolma:s{sent_idx}"
             final, finalize_reason = finalize_sample(
                 stage, sample,
-                source_id=f"dolma:s{sent_idx}",
+                source_id=source_id,
                 args=args,
                 calibration_writer=calibration_writer,
             )
             if final is None:
                 reject_reasons[finalize_reason] += 1
                 continue
-            final["bucket"] = bucket
-            cur_shard_file.write(json.dumps(final, ensure_ascii=False) + "\n")
-            written += 1
-            pbar.update(1)
             bucket_accepts[bucket] += 1
             n_accepts[N] += 1
-            if written % args.samples_per_shard == 0 and written < args.target_samples:
-                cur_shard_file.close()
-                open_shard()
-                yield_pct = written / max(1, attempted)
-                per_bucket = ", ".join(
-                    f"{b}={bucket_accepts[b]}/{bucket_attempts[b]}="
-                    f"{bucket_accepts[b] / max(1, bucket_attempts[b]):.2f}"
-                    for b in BUCKETS
-                )
-                per_N = ", ".join(
-                    f"N={k}:{n_accepts[k]}/{n_attempts[k]}="
-                    f"{n_accepts[k] / max(1, n_attempts[k]):.2f}"
-                    for k in sorted(n_attempts)
-                )
-                print(
-                    f"[corruption] written={written} sents={sent_idx} "
-                    f"attempts={attempted} yield={yield_pct:.3f}  "
-                    f"buckets({per_bucket})  N({per_N})"
-                )
-                if reject_reasons:
-                    top = sorted(reject_reasons.items(), key=lambda kv: -kv[1])[:8]
-                    print(f"[corruption] reject reasons: " +
-                          ", ".join(f"{k}={v}" for k, v in top))
+
+            # ---- condition-selective emission (v3, README §6.2.8) ------- #
+            to_write: List[Dict] = []
+            final["bucket"] = bucket
+            final["n_parent"] = N
+            if N == 0:
+                final["subset_kind"] = "identity"
+                to_write.append(final)
+            else:
+                if rng.random() < args.emit_full:
+                    final["subset_kind"] = "full"
+                    to_write.append(final)
+                if N >= 2 and ops is not None and rng.random() < args.emit_partial:
+                    k_sub = rng.randint(1, N - 1)
+                    subset = set(rng.sample(range(N), k_sub))
+                    psample, preason = build_partial_sample(
+                        stage, sent, words_with_offsets(sent), ops, subset,
+                    )
+                    if psample is None:
+                        reject_reasons[f"partial_{preason}"] += 1
+                    else:
+                        pfinal, pr = finalize_sample(
+                            stage, psample, source_id=source_id, args=args,
+                            calibration_writer=calibration_writer, light=True,
+                        )
+                        if pfinal is None:
+                            reject_reasons[f"partial_{pr}"] += 1
+                        else:
+                            pfinal["bucket"] = bucket
+                            pfinal["subset_kind"] = "partial"
+                            pfinal["n_parent"] = N
+                            to_write.append(pfinal)
+                if parent_xp_text and rng.random() < args.emit_null:
+                    nsample, nreason = build_identity_sample(stage, parent_xp_text)
+                    if nsample is None:
+                        reject_reasons[f"null_{nreason}"] += 1
+                    else:
+                        nfinal, nr = finalize_sample(
+                            stage, nsample, source_id=source_id, args=args,
+                            calibration_writer=calibration_writer, light=True,
+                        )
+                        if nfinal is None:
+                            reject_reasons[f"null_{nr}"] += 1
+                        else:
+                            nfinal["bucket"] = bucket
+                            nfinal["subset_kind"] = "null"
+                            nfinal["n_parent"] = N
+                            to_write.append(nfinal)
+
+            for rec in to_write:
+                if written >= args.target_samples:
+                    break
+                write_record(rec)
             break
 
     if cur_shard_file is not None:
@@ -2021,10 +2225,11 @@ def main():
         f"{n_accepts[k] / max(1, n_attempts[k]):.2f}"
         for k in sorted(n_attempts)
     )
+    per_kind = ", ".join(f"{k}={v}" for k, v in emit_counts.items())
     print(
         f"[corruption] FINAL written={written} sents={sent_idx} "
         f"attempts={attempted} yield={yield_pct:.3f}  "
-        f"buckets({per_bucket})  N({per_N})"
+        f"buckets({per_bucket})  N({per_N})  kinds({per_kind})"
     )
     if reject_reasons:
         all_rej = sorted(reject_reasons.items(), key=lambda kv: -kv[1])
@@ -2045,6 +2250,13 @@ def main():
         "n_attempts": {str(k): int(v) for k, v in n_attempts.items()},
         "n_accepts": {str(k): int(v) for k, v in n_accepts.items()},
         "reject_reasons": {k: int(v) for k, v in reject_reasons.items()},
+        # v3 condition-selective emission (README §6.2.8)
+        "subset_emission": {
+            "emit_full": float(args.emit_full),
+            "emit_partial": float(args.emit_partial),
+            "emit_null": float(args.emit_null),
+            "counts": {k: int(v) for k, v in emit_counts.items()},
+        },
         "calibration_mode": bool(args.calibration_mode),
         "gates": {
             # Fluency: SLOR drop, linear N

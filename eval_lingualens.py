@@ -96,6 +96,10 @@ def parse_args():
 
     p.add_argument("--l-max", type=int, default=3)
     p.add_argument("--ins-threshold", type=float, default=0.8)
+    p.add_argument("--op-thresholds", default="0.0,0.9",
+                   help="Edit-plan strictness levels (see "
+                        "evaluate_intervention.py). The unedited input is "
+                        "always a candidate.")
     p.add_argument("--max-templates", type=int, default=256)
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -264,13 +268,14 @@ def main():
                "amp_features": (z_amp_t > 0).nonzero(as_tuple=True)[0].tolist(),
                "sup_features": (z_sup_t > 0).nonzero(as_tuple=True)[0].tolist(),
                "outputs": {}}
+        op_taus = tuple(float(t) for t in args.op_thresholds.split(","))
         try:
             for c, (za, zs) in variants.items():
                 out_text = edit_once(
                     text=src, z_amp_full=za, z_sup_full=zs,
                     tagger=tagger, editor=editor, ranker=ranker,
                     tokenizer=tokenizer, l_max=args.l_max, device=args.device,
-                    ins_threshold=args.ins_threshold,
+                    ins_threshold=args.ins_threshold, op_thresholds=op_taus,
                     max_templates=args.max_templates,
                     verbose=False,
                 )

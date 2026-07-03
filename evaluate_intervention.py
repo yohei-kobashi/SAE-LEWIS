@@ -71,9 +71,15 @@ def parse_args():
     p.add_argument("--ins-threshold", type=float, default=0.5,
                    help="Sigmoid threshold for the tagger's insert head; "
                         "raise toward 1.0 to suppress spurious INS gaps.")
+    p.add_argument("--op-thresholds", default="0.0,0.9",
+                   help="Comma list of edit-plan strictness levels (0.0 = "
+                        "plain argmax; τ > 0 keeps REPL/DEL only at softmax "
+                        "prob ≥ τ). Each level yields one candidate plan; "
+                        "the unedited input is always a candidate too.")
     p.add_argument("--max-templates", type=int, default=256,
-                   help="Abort if slot enumeration (l_max^G) would exceed "
-                        "this many editor forwards.")
+                   help="Editor-forward budget across all plans; plans "
+                        "whose enumeration exceeds the remainder are "
+                        "dropped (the identity candidate always survives).")
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -81,7 +87,9 @@ def parse_args():
 
 
 class TemplateBudgetExceeded(RuntimeError):
-    """Slot enumeration would exceed --max-templates editor forwards."""
+    """Kept for import compatibility. Since the identity candidate joined
+    the ranker pool, edit_once degrades gracefully (plans whose enumeration
+    exceeds the budget are dropped) instead of raising."""
 
 
 @torch.no_grad()
@@ -97,9 +105,20 @@ def edit_once(
     l_max: int,
     device: str,
     ins_threshold: float = 0.5,
+    op_thresholds: Tuple[float, ...] = (0.0, 0.9),
     max_templates: int = 256,
     verbose: bool = True,
 ) -> str:
+    """Tagger → candidate plans → template enumeration → ranker top-1.
+
+    Candidate diversity (LEWIS's beam analog): one tagger forward yields
+    several EDIT PLANS at different strictness levels (`op_thresholds`:
+    0.0 = plain argmax; τ > 0 keeps a REPL/DEL decision only when its
+    softmax probability ≥ τ, and raises the insert bar to max(τ,
+    ins_threshold)), plus the UNEDITED input as an always-present identity
+    candidate. The ranker chooses across all of them, so a trigger-happy
+    tagger can be overruled instead of silently degrading the output.
+    """
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=True).to(device)
     input_ids = enc.input_ids                         # (1, T)
     attn = enc.attention_mask
@@ -112,81 +131,94 @@ def edit_once(
     del_id = int(tokenizer.convert_tokens_to_ids("[DEL]"))
     bos_id = tokenizer.bos_token_id
 
-    # 1. Tagger — two tags per token (LEWIS §2.1)
-    op3_t, ins_t = tagger.predict_ops(input_ids, attn, z_amp_dev, z_sup_dev,
-                                      ins_threshold=ins_threshold)
-    op3 = op3_t[0].cpu().tolist()
-    ins_before = ins_t[0].cpu().tolist()
+    # 1. Tagger — one forward, probabilistic outputs
+    t_out = tagger(input_ids, attn, z_amp_dev, z_sup_dev)
+    op_probs = torch.softmax(t_out["op_logits"].float(), dim=-1)[0].cpu()  # (T, 3)
+    ins_prob = torch.sigmoid(t_out["ins_logits"].float())[0].cpu()         # (T,)
+    op_argmax = op_probs.argmax(dim=-1).tolist()
     token_ids = input_ids[0].cpu().tolist()
-    # <bos> is structural: never delete/replace it or insert before it
-    # (sentence-initial insertion is ins_before on the first real token).
-    if bos_id is not None and token_ids and token_ids[0] == bos_id:
-        op3[0] = OP3_KEEP
-        ins_before[0] = 0
 
-    # 2. Build the edit template x'_c (DEL tokens removed)
-    ed_in = apply_ops_for_editor(
-        token_ids, op3, ins_before,
-        mask_token_id=mask_id, ins_token_id=ins_id,
-    )
+    # 2. Edit plans at increasing strictness
+    plans = []
+    seen = set()
+    for tau in op_thresholds:
+        op3 = list(op_argmax)
+        ins_bar = max(ins_threshold, tau) if tau > 0 else ins_threshold
+        for i in range(len(op3)):
+            if op3[i] != OP3_KEEP and float(op_probs[i, op3[i]]) < tau:
+                op3[i] = OP3_KEEP
+        ins_before = [1 if float(p) >= ins_bar else 0 for p in ins_prob]
+        # <bos> is structural: never delete/replace it or insert before it
+        # (sentence-initial insertion is ins_before on the first real token).
+        if bos_id is not None and token_ids and token_ids[0] == bos_id:
+            op3[0] = OP3_KEEP
+            ins_before[0] = 0
+        key = (tuple(op3), tuple(ins_before))
+        if key in seen:
+            continue
+        seen.add(key)
+        plans.append((tau, op3, ins_before))
 
-    if verbose:
-        from collections import Counter
-        op_counts = Counter("KEEP" if o == 0 else ("REPL" if o == 1 else "DEL")
-                            for o in op3)
-        print(f"[edit] tagger: {dict(op_counts)}  "
-              f"ins_gaps={int(sum(ins_before))} "
-              f"(ins_threshold={ins_threshold})")
-
-    # 3. enumerate INS slot counts
-    G = len(ed_in.ins_gaps)
-    if G == 0:
-        slot_choices = [tuple()]
-    else:
-        n_templates = l_max ** G
-        if n_templates > max_templates:
-            raise TemplateBudgetExceeded(
-                f"[edit] enumeration would need {n_templates} editor "
-                f"forwards (l_max={l_max} ^ G={G} gaps) > "
-                f"--max-templates {max_templates}. Raise --ins-threshold "
-                f"(fewer gaps), lower --l-max, or raise --max-templates.")
-        slot_choices = list(itertools.product(range(1, l_max + 1), repeat=G))
-
-    # The template duplicates x'’s leading <bos>; the editor input keeps
-    # only the copy inside x' (matches CorruptionCollator).
     marker_ids = [mask_id, ins_id, sep_id, del_id]
-
     candidates: List[List[int]] = []
     ins_counts: List[int] = []
-    for choice in slot_choices:
-        cur = ed_in
-        for gi, k in enumerate(choice):
-            cur = expand_ins_gap(cur, gi, k, ins_id)
-        tpl_ids = cur.input_ids.tolist()
-        tpl_ops = cur.op_per_pos
-        offset = 0
-        if bos_id is not None and tpl_ids and tpl_ids[0] == bos_id:
-            offset = 1  # skip the duplicated <bos> in the template segment
-        full = token_ids + [sep_id] + tpl_ids[offset:]
-        tpl_start = len(token_ids) + 1
+    # Identity candidate: always present, so the ranker can decline to edit.
+    candidates.append(list(token_ids))
+    ins_counts.append(0)
 
-        ids = torch.tensor([full], dtype=torch.long, device=device)
-        mask = torch.ones_like(ids)
-        out = editor(
-            input_ids=ids, attention_mask=mask,
-            z_amp=z_amp_dev, z_sup=z_sup_dev,
+    templates_used = 0
+    for tau, op3, ins_before in plans:
+        ed_in = apply_ops_for_editor(
+            token_ids, op3, ins_before,
+            mask_token_id=mask_id, ins_token_id=ins_id,
         )
-        logits = out["logits"][0, tpl_start:]           # template segment
-        logits[:, marker_ids] = float("-inf")           # never emit markers
-        argmax = logits.argmax(dim=-1).cpu().numpy()
-        decoded = decode_editor_output(
-            np.asarray(tpl_ids[offset:], dtype=np.int64), argmax,
-            tpl_ops[offset:],
-        )
-        if offset:
-            decoded = [bos_id] + decoded
-        candidates.append(decoded)
-        ins_counts.append(sum(choice) if choice else 0)
+        G = len(ed_in.ins_gaps)
+        n_templates = (l_max ** G) if G > 0 else 1
+        if templates_used + n_templates > max_templates:
+            if verbose:
+                print(f"[edit] plan τ={tau}: {n_templates} templates would "
+                      f"exceed --max-templates {max_templates} — dropped")
+            continue
+        templates_used += n_templates
+        if verbose:
+            from collections import Counter
+            op_counts = Counter(
+                "KEEP" if o == 0 else ("REPL" if o == 1 else "DEL")
+                for o in op3)
+            print(f"[edit] plan τ={tau}: {dict(op_counts)} "
+                  f"ins_gaps={int(sum(ins_before))} templates={n_templates}")
+
+        slot_choices = ([tuple()] if G == 0 else
+                        list(itertools.product(range(1, l_max + 1), repeat=G)))
+        for choice in slot_choices:
+            cur = ed_in
+            for gi, k in enumerate(choice):
+                cur = expand_ins_gap(cur, gi, k, ins_id)
+            tpl_ids = cur.input_ids.tolist()
+            tpl_ops = cur.op_per_pos
+            offset = 0
+            if bos_id is not None and tpl_ids and tpl_ids[0] == bos_id:
+                offset = 1  # skip the duplicated <bos> in the template segment
+            full = token_ids + [sep_id] + tpl_ids[offset:]
+            tpl_start = len(token_ids) + 1
+
+            ids = torch.tensor([full], dtype=torch.long, device=device)
+            mask = torch.ones_like(ids)
+            out = editor(
+                input_ids=ids, attention_mask=mask,
+                z_amp=z_amp_dev, z_sup=z_sup_dev,
+            )
+            logits = out["logits"][0, tpl_start:]           # template segment
+            logits[:, marker_ids] = float("-inf")           # never emit markers
+            argmax = logits.argmax(dim=-1).cpu().numpy()
+            decoded = decode_editor_output(
+                np.asarray(tpl_ids[offset:], dtype=np.int64), argmax,
+                tpl_ops[offset:],
+            )
+            if offset:
+                decoded = [bos_id] + decoded
+            candidates.append(decoded)
+            ins_counts.append(sum(choice) if choice else 0)
 
     # 4. rank
     scores = ranker.rank(
@@ -224,15 +256,14 @@ def main():
 
     specs = [FeatureSpec.parse(s) for s in args.spec]
     z_amp_full, z_sup_full = build_intervention_vectors(specs, mu, args.strength)
-    try:
-        out = edit_once(
-            text=args.text, z_amp_full=z_amp_full, z_sup_full=z_sup_full,
-            tagger=tagger, editor=editor, ranker=ranker, tokenizer=tokenizer,
-            l_max=args.l_max, device=args.device,
-            ins_threshold=args.ins_threshold, max_templates=args.max_templates,
-        )
-    except TemplateBudgetExceeded as e:
-        raise SystemExit(str(e))
+    op_taus = tuple(float(t) for t in args.op_thresholds.split(","))
+    out = edit_once(
+        text=args.text, z_amp_full=z_amp_full, z_sup_full=z_sup_full,
+        tagger=tagger, editor=editor, ranker=ranker, tokenizer=tokenizer,
+        l_max=args.l_max, device=args.device,
+        ins_threshold=args.ins_threshold, op_thresholds=op_taus,
+        max_templates=args.max_templates,
+    )
     print("== edited ==")
     print(out)
 

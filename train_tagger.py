@@ -58,24 +58,27 @@ def parse_args():
     p.add_argument("--save-steps", type=int, default=2000)
 
     p.add_argument("--k-top", type=int, default=8)
-    # Match the editor's conditioning distribution (README C2: shared
-    # interface): near-empty conditioning is confined to this probability,
-    # not additionally produced by k_amp/k_sup = 0 draws.
-    p.add_argument("--empty-cond-prob", type=float, default=0.05)
+    # 0.0 since the v3 condition-selective cache (README §6.2.8): S=∅
+    # "null" records supply zero-conditioning supervision with the correct
+    # all-KEEP gold. Set > 0 only when training on a pre-v3 cache.
+    p.add_argument("--empty-cond-prob", type=float, default=0.0)
 
     p.add_argument("--estimate-class-weights-batches", type=int, default=200,
                    help="Number of warmup batches used to estimate inverse-freq "
                         "op-class weights and the insert-head pos_weight.")
-    # 0.5 capped the raw rare-class weight at 2.0; 0.05 keeps the cap at 20x
-    # while still bounding the weight against warmup-sample noise. (The v1
-    # INS-starvation failure mode is gone — insertion now has its own binary
-    # head — but DEL/REPL are still ~10-60x rarer than KEEP.)
-    p.add_argument("--class-weight-smoothing", type=float, default=0.05)
+    # 0.05 produced a recall-heavy operating point (held-out: REPL P=0.30,
+    # DEL P=0.25, accuracy below the all-KEEP baseline; on LinguaLens the
+    # system edited 90% of inputs and sim_target fell BELOW input-copy).
+    # 0.15 pulls the trade-off back toward precision; the v3 null records
+    # additionally teach conditional KEEP, so extreme weights are no longer
+    # the only lever against the KEEP majority.
+    p.add_argument("--class-weight-smoothing", type=float, default=0.15)
     p.add_argument("--ins-loss-weight", type=float, default=1.0,
                    help="Multiplier on the insert-head BCE term.")
-    p.add_argument("--ins-pos-weight-cap", type=float, default=50.0,
+    p.add_argument("--ins-pos-weight-cap", type=float, default=20.0,
                    help="Upper bound on the BCE pos_weight (neg/pos ratio) "
-                        "for the insert head.")
+                        "for the insert head. 50 made the insert head fire "
+                        "at P=0.15 on held-out data.")
 
     p.add_argument("--init-proj-a-from", default=None,
                    help="Editor checkpoint (.pt from train_editor_phaseA.py) "

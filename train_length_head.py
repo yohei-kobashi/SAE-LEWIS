@@ -47,7 +47,7 @@ def parse_args():
     p.add_argument("--save-steps", type=int, default=1000)
 
     p.add_argument("--k-top", type=int, default=8)
-    p.add_argument("--empty-cond-prob", type=float, default=0.05)
+    p.add_argument("--empty-cond-prob", type=float, default=0.0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)

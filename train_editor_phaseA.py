@@ -66,10 +66,12 @@ def parse_args():
 
     # Conditioning sub-sampling
     p.add_argument("--k-top", type=int, default=8)
-    # 0.15 left the editor conditioning-IGNORED for REPL (held-out probe
-    # Δ(true−empty) ≈ 0): together with k_amp/k_sup allowing 0, the model
-    # saw weak-or-empty conditioning often enough to learn to ignore it.
-    p.add_argument("--empty-cond-prob", type=float, default=0.05)
+    # 0.0 since the v3 condition-selective cache (README §6.2.8): its S=∅
+    # "null" records supply zero-conditioning supervision with the CORRECT
+    # target (= the input, unchanged). The old hack zeroed z while keeping
+    # the full-restore target, i.e. it actively taught "edit without being
+    # asked". Set > 0 only when training on a pre-v3 cache.
+    p.add_argument("--empty-cond-prob", type=float, default=0.0)
     # CE weight on copy positions (label == input). Uniform CE (1.0) spends
     # ~95% of the gradient on copying, starving Proj_A; edit positions
     # ([MASK]/[INS] slots) always keep weight 1.
