@@ -68,6 +68,12 @@ def parse_args():
                    help="Intervention spec entries: '+1234' (amp) or '-5678' (sup).")
     p.add_argument("--strength", type=float, default=1.0)
     p.add_argument("--l-max", type=int, default=5)
+    p.add_argument("--ins-threshold", type=float, default=0.5,
+                   help="Sigmoid threshold for the tagger's insert head; "
+                        "raise toward 1.0 to suppress spurious INS gaps.")
+    p.add_argument("--max-templates", type=int, default=256,
+                   help="Abort if slot enumeration (l_max^G) would exceed "
+                        "this many editor forwards.")
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -87,6 +93,8 @@ def edit_once(
     tokenizer,
     l_max: int,
     device: str,
+    ins_threshold: float = 0.5,
+    max_templates: int = 256,
 ) -> str:
     d_sae = int(mu.shape[0])
     z_amp_full, z_sup_full = build_intervention_vectors(spec, mu, strength)
@@ -104,7 +112,8 @@ def edit_once(
     bos_id = tokenizer.bos_token_id
 
     # 1. Tagger — two tags per token (LEWIS §2.1)
-    op3_t, ins_t = tagger.predict_ops(input_ids, attn, z_amp_dev, z_sup_dev)
+    op3_t, ins_t = tagger.predict_ops(input_ids, attn, z_amp_dev, z_sup_dev,
+                                      ins_threshold=ins_threshold)
     op3 = op3_t[0].cpu().tolist()
     ins_before = ins_t[0].cpu().tolist()
     token_ids = input_ids[0].cpu().tolist()
@@ -120,11 +129,25 @@ def edit_once(
         mask_token_id=mask_id, ins_token_id=ins_id,
     )
 
+    from collections import Counter
+    op_counts = Counter("KEEP" if o == 0 else ("REPL" if o == 1 else "DEL")
+                        for o in op3)
+    n_gaps = int(sum(ins_before))
+    print(f"[edit] tagger: {dict(op_counts)}  ins_gaps={n_gaps} "
+          f"(ins_threshold={ins_threshold})")
+
     # 3. enumerate INS slot counts
     G = len(ed_in.ins_gaps)
     if G == 0:
         slot_choices = [tuple()]
     else:
+        n_templates = l_max ** G
+        if n_templates > max_templates:
+            raise SystemExit(
+                f"[edit] enumeration would need {n_templates} editor "
+                f"forwards (l_max={l_max} ^ G={G} gaps) > "
+                f"--max-templates {max_templates}. Raise --ins-threshold "
+                f"(fewer gaps), lower --l-max, or raise --max-templates.")
         slot_choices = list(itertools.product(range(1, l_max + 1), repeat=G))
 
     # The template duplicates x'’s leading <bos>; the editor input keeps
@@ -202,6 +225,7 @@ def main():
         text=args.text, spec=specs, strength=args.strength, mu=mu,
         tagger=tagger, editor=editor, ranker=ranker, tokenizer=tokenizer,
         l_max=args.l_max, device=args.device,
+        ins_threshold=args.ins_threshold, max_templates=args.max_templates,
     )
     print("== edited ==")
     print(out)
