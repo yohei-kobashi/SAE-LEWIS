@@ -117,6 +117,7 @@ def edit_once(
     fill_topk: int = 5,
     max_fill_variants: int = 32,
     return_details: bool = False,
+    verbose: bool = True,
 ):
     """Tagger → candidate plans → template enumeration → ranker top-1.
 
