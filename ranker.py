@@ -69,6 +69,49 @@ class Ranker:
         return h.mean(dim=0)
 
     @torch.no_grad()
+    def component_scores(
+        self,
+        cand_ids: List[int],
+        input_ids: List[int],
+        z_amp: torch.Tensor,
+        z_sup: torch.Tensor,
+        num_ins_slots: int,
+    ) -> dict:
+        """Raw sub-scores for one candidate — combined by `combine()`.
+
+        Exposed separately so weight calibration can grid-search
+        RankerWeights offline over cached components
+        (scripts/calibrate_ranker.py) without re-running the three models.
+        """
+        z_cand = self._sae_pool_max(cand_ids).to(z_amp.device)
+        eps = 1e-8
+        sa_amp = torch.dot(z_cand, z_amp) / (z_cand.norm() * z_amp.norm() + eps)
+        sa_sup = torch.dot(z_cand, z_sup) / (z_cand.norm() * z_sup.norm() + eps)
+
+        fluency = self._causal_logprob(cand_ids)
+
+        e_in = self._sentence_embed(input_ids).float()
+        e_cd = self._sentence_embed(cand_ids).float()
+        content = float((e_in @ e_cd) / (e_in.norm() * e_cd.norm() + eps))
+
+        return {
+            "sae_align": float(sa_amp - sa_sup),
+            # tanh-bounded mean log-likelihood ([0,1]-ish soft scale)
+            "fluency": math.tanh(fluency),
+            "content": content,
+            "ins_slots": int(num_ins_slots),
+        }
+
+    def combine(self, comp: dict) -> float:
+        w = self.weights
+        return (
+            w.sae_align * comp["sae_align"]
+            + w.fluency * comp["fluency"]
+            + w.content * comp["content"]
+            - w.length_penalty * comp["ins_slots"]
+        )
+
+    @torch.no_grad()
     def score_candidate(
         self,
         cand_ids: List[int],
@@ -77,32 +120,8 @@ class Ranker:
         z_sup: torch.Tensor,
         num_ins_slots: int,
     ) -> float:
-        # SAE alignment
-        z_cand = self._sae_pool_max(cand_ids).to(z_amp.device)
-        eps = 1e-8
-        sa_amp = torch.dot(z_cand, z_amp) / (z_cand.norm() * z_amp.norm() + eps)
-        sa_sup = torch.dot(z_cand, z_sup) / (z_cand.norm() * z_sup.norm() + eps)
-        sa = float(sa_amp - sa_sup)
-
-        # Fluency (mean log-likelihood)
-        fluency = self._causal_logprob(cand_ids)
-        # Normalize to a [0,1]-ish scale (a flat tanh works fine as a soft bound)
-        fluency_s = math.tanh(fluency)
-
-        # Content preservation
-        e_in = self._sentence_embed(input_ids).float()
-        e_cd = self._sentence_embed(cand_ids).float()
-        content = float(
-            (e_in @ e_cd) / (e_in.norm() * e_cd.norm() + eps)
-        )
-
-        w = self.weights
-        return (
-            w.sae_align * sa
-            + w.fluency * fluency_s
-            + w.content * content
-            - w.length_penalty * num_ins_slots
-        )
+        return self.combine(self.component_scores(
+            cand_ids, input_ids, z_amp, z_sup, num_ins_slots))
 
     @torch.no_grad()
     def rank(

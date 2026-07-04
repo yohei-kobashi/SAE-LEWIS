@@ -101,6 +101,19 @@ def parse_args():
                         "evaluate_intervention.py). The unedited input is "
                         "always a candidate.")
     p.add_argument("--max-templates", type=int, default=256)
+    p.add_argument("--fill-topk", type=int, default=5,
+                   help="Fill-refinement depth (evaluate_intervention.py).")
+    p.add_argument("--max-fill-variants", type=int, default=32)
+    p.add_argument("--ranker-weights", default=None,
+                   help="Override RankerWeights as 'sae,fluency,content,"
+                        "len_pen' (e.g. '2.0,0.3,0.2,0.05'). Default: "
+                        "ranker.py defaults. Calibrate with "
+                        "scripts/calibrate_ranker.py.")
+    p.add_argument("--dump-details", action="store_true",
+                   help="Store every candidate's text + raw ranker "
+                        "components in records.jsonl (for offline weight "
+                        "calibration). Run this on a DEV slice (different "
+                        "--seed than the evaluation slice).")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     return p.parse_args()
@@ -233,7 +246,12 @@ def main():
     ).to(args.device).eval()
     causal, _ = load_causal_gemma(args.llm2vec_dir)
     bid = BidirectionalLLM(args.llm2vec_dir, dtype=dtype)
-    ranker = Ranker(extractor, causal, bid, RankerWeights(), device=args.device)
+    rw = RankerWeights()
+    if args.ranker_weights:
+        a, b, c, e = (float(x) for x in args.ranker_weights.split(","))
+        rw = RankerWeights(sae_align=a, fluency=b, content=c, length_penalty=e)
+        print(f"[lingua-eval] ranker weights: {rw}")
+    ranker = Ranker(extractor, causal, bid, rw, device=args.device)
 
     rng = np.random.default_rng(args.seed)
     records: List[Dict] = []
@@ -271,14 +289,21 @@ def main():
         op_taus = tuple(float(t) for t in args.op_thresholds.split(","))
         try:
             for c, (za, zs) in variants.items():
-                out_text = edit_once(
+                result = edit_once(
                     text=src, z_amp_full=za, z_sup_full=zs,
                     tagger=tagger, editor=editor, ranker=ranker,
                     tokenizer=tokenizer, l_max=args.l_max, device=args.device,
                     ins_threshold=args.ins_threshold, op_thresholds=op_taus,
                     max_templates=args.max_templates,
+                    fill_topk=args.fill_topk,
+                    max_fill_variants=args.max_fill_variants,
+                    return_details=args.dump_details,
                     verbose=False,
                 )
+                if args.dump_details:
+                    out_text, details = result
+                else:
+                    out_text = result
                 m = pair_metrics(out_text, src, tgt)
                 with torch.no_grad():
                     z_out = extractor.pool_max_topk(
@@ -295,6 +320,9 @@ def main():
                 texts[c]["out"].append(out_text)
                 texts[c]["tgt"].append(tgt)
                 rec["outputs"][c] = {"text": out_text, **m}
+                if args.dump_details:
+                    rec["outputs"][c]["candidates"] = details["candidates"]
+                    rec["outputs"][c]["chosen"] = details["chosen"]
         except TemplateBudgetExceeded as e:
             skipped += 1
             rec["skipped"] = str(e)

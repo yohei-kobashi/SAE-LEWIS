@@ -29,7 +29,7 @@ import argparse
 import itertools
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -39,6 +39,7 @@ from editor import load_editor_from_checkpoint
 from intervene import FeatureSpec, build_intervention_vectors
 from lewis_ops import (
     OP3_KEEP,
+    OP_KEEP as OP_KEEP_CACHE,
     apply_ops_for_editor,
     decode_editor_output,
     expand_ins_gap,
@@ -80,6 +81,12 @@ def parse_args():
                    help="Editor-forward budget across all plans; plans "
                         "whose enumeration exceeds the remainder are "
                         "dropped (the identity candidate always survives).")
+    p.add_argument("--fill-topk", type=int, default=5,
+                   help="Fill-refinement depth: expand the best edited "
+                        "candidate's edit positions into top-k alternative "
+                        "fills, ranked by the SAE-grounded ranker. 1 "
+                        "disables refinement.")
+    p.add_argument("--max-fill-variants", type=int, default=32)
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -107,8 +114,10 @@ def edit_once(
     ins_threshold: float = 0.5,
     op_thresholds: Tuple[float, ...] = (0.0, 0.9),
     max_templates: int = 256,
-    verbose: bool = True,
-) -> str:
+    fill_topk: int = 5,
+    max_fill_variants: int = 32,
+    return_details: bool = False,
+):
     """Tagger → candidate plans → template enumeration → ranker top-1.
 
     Candidate diversity (LEWIS's beam analog): one tagger forward yields
@@ -118,6 +127,20 @@ def edit_once(
     ins_threshold)), plus the UNEDITED input as an always-present identity
     candidate. The ranker chooses across all of them, so a trigger-happy
     tagger can be overruled instead of silently degrading the output.
+
+    Fill refinement (`fill_topk` > 1): the editor's CONTENT choice is not
+    conditioning-driven (its template already fixes where to edit, so its
+    training loss never depended on z — held-out probe IGNORED). The
+    feature-directed choice is therefore delegated to the SAE-grounded
+    ranker: the best-scoring edited candidate's template is expanded into
+    one-position-at-a-time top-k fill alternatives, and the ranker's
+    sae_align picks the fill that actually moves the features. Division of
+    labor: tagger (SAE-GROUNDED) decides where, ranker (the SAE itself)
+    decides what.
+
+    Returns the edited text, or (text, details) if return_details — details
+    carries per-candidate token ids / decoded texts / raw ranker components
+    for offline weight calibration (scripts/calibrate_ranker.py).
     """
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=True).to(device)
     input_ids = enc.input_ids                         # (1, T)
@@ -162,9 +185,11 @@ def edit_once(
     marker_ids = [mask_id, ins_id, sep_id, del_id]
     candidates: List[List[int]] = []
     ins_counts: List[int] = []
+    cand_meta: List[Optional[dict]] = []   # template info for fill refinement
     # Identity candidate: always present, so the ranker can decline to edit.
     candidates.append(list(token_ids))
     ins_counts.append(0)
+    cand_meta.append(None)
 
     templates_used = 0
     for tau, op3, ins_before in plans:
@@ -219,15 +244,74 @@ def edit_once(
                 decoded = [bos_id] + decoded
             candidates.append(decoded)
             ins_counts.append(sum(choice) if choice else 0)
+            cand_meta.append({
+                "full": full,
+                "tpl_ids": tpl_ids[offset:],
+                "tpl_ops": tpl_ops[offset:],
+                "offset": offset,
+                "tpl_start": tpl_start,
+            })
 
-    # 4. rank
-    scores = ranker.rank(
-        candidates=candidates, input_ids=token_ids,
-        z_amp=z_amp_full.to(device), z_sup=z_sup_full.to(device),
-        num_ins_slots_per_cand=ins_counts,
-    )
+    # 4. rank (via components, so calibration can reuse them)
+    z_amp_r = z_amp_full.to(device)
+    z_sup_r = z_sup_full.to(device)
+    comps = [ranker.component_scores(c, token_ids, z_amp_r, z_sup_r, k)
+             for c, k in zip(candidates, ins_counts)]
+    scores = [ranker.combine(cp) for cp in comps]
+
+    # 5. fill refinement on the best EDITED candidate (see docstring)
+    if fill_topk > 1 and len(candidates) > 1:
+        edited_best = 1 + int(np.argmax(scores[1:]))
+        meta = cand_meta[edited_best]
+        edit_pos = [j for j, op in enumerate(meta["tpl_ops"])
+                    if int(op) != OP_KEEP_CACHE]
+        if edit_pos:
+            ids = torch.tensor([meta["full"]], dtype=torch.long, device=device)
+            out = editor(
+                input_ids=ids, attention_mask=torch.ones_like(ids),
+                z_amp=z_amp_dev, z_sup=z_sup_dev,
+            )
+            logits = out["logits"][0, meta["tpl_start"]:]
+            logits[:, marker_ids] = float("-inf")
+            parent = candidates[edited_best]
+            dec_off = 1 if meta["offset"] else 0   # parent has <bos> prepended
+            n_var = 0
+            for j in edit_pos:
+                if n_var >= max_fill_variants:
+                    break
+                topv = logits[j].topk(fill_topk).indices.tolist()
+                for t in topv[1:]:                 # rank-1 == parent's argmax
+                    if n_var >= max_fill_variants:
+                        break
+                    var = list(parent)
+                    var[j + dec_off] = int(t)
+                    candidates.append(var)
+                    ins_counts.append(ins_counts[edited_best])
+                    cand_meta.append(None)
+                    cp = ranker.component_scores(
+                        var, token_ids, z_amp_r, z_sup_r,
+                        ins_counts[edited_best])
+                    comps.append(cp)
+                    scores.append(ranker.combine(cp))
+                    n_var += 1
+            if verbose and n_var:
+                print(f"[edit] fill refinement: +{n_var} variants over "
+                      f"{len(edit_pos)} edit positions (top-{fill_topk})")
+
     best = int(np.argmax(scores))
-    return tokenizer.decode(candidates[best], skip_special_tokens=True)
+    best_text = tokenizer.decode(candidates[best], skip_special_tokens=True)
+    if return_details:
+        details = {
+            "chosen": best,
+            "candidates": [
+                {"text": tokenizer.decode(c, skip_special_tokens=True),
+                 "components": cp,
+                 "is_identity": i == 0}
+                for i, (c, cp) in enumerate(zip(candidates, comps))
+            ],
+        }
+        return best_text, details
+    return best_text
 
 
 def main():
@@ -263,6 +347,7 @@ def main():
         l_max=args.l_max, device=args.device,
         ins_threshold=args.ins_threshold, op_thresholds=op_taus,
         max_templates=args.max_templates,
+        fill_topk=args.fill_topk, max_fill_variants=args.max_fill_variants,
     )
     print("== edited ==")
     print(out)
