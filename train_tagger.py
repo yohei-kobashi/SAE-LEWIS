@@ -67,6 +67,12 @@ def parse_args():
     p.add_argument("--proj-a-freeze-steps", type=int, default=500)
     p.add_argument("--logging-steps", type=int, default=50)
     p.add_argument("--save-steps", type=int, default=2000)
+    # Dev-monitored best-checkpoint selection (same scheme as
+    # train_editor_phaseA.py): tagger-final.pt = best dev state when
+    # --dev-corruption-dir is set; the last state is tagger-last.pt.
+    p.add_argument("--dev-corruption-dir", default=None)
+    p.add_argument("--eval-steps", type=int, default=2000)
+    p.add_argument("--dev-batches", type=int, default=64)
 
     p.add_argument("--k-top", type=int, default=8)
     # 0.0 since the v3 condition-selective cache (README §6.2.8): S=∅
@@ -240,6 +246,76 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    dev_batches = []
+    if args.dev_corruption_dir:
+        dev_ds = CorruptionDataset(args.dev_corruption_dir, shuffle=False,
+                                   seed=args.seed, infinite=False)
+        dev_loader = DataLoader(dev_ds, batch_size=args.batch_size,
+                                num_workers=0, collate_fn=coll)
+        for i, b in enumerate(dev_loader):
+            if i >= args.dev_batches:
+                break
+            dev_batches.append(b)
+        print(f"[tagger] dev monitoring: {len(dev_batches)} batches from "
+              f"{args.dev_corruption_dir}, every {args.eval_steps} steps")
+
+    def evaluate_dev() -> float:
+        """Mean dev loss (same class weights) under fixed conditioning."""
+        dev_rng = np.random.default_rng(args.seed + 9999)
+        tot, nb = 0.0, 0
+        with torch.no_grad():
+            for batch in dev_batches:
+                z_X, z_Xp = batch["z_X"], batch["z_X_prime"]
+                za = torch.zeros_like(z_X)
+                zs = torch.zeros_like(z_X)
+                for b in range(z_X.shape[0]):
+                    a, sp = diff_to_sparse(
+                        z_X[b], z_Xp[b], k_top=args.k_top,
+                        k_amp=int(dev_rng.integers(1, 5)),
+                        k_sup=int(dev_rng.integers(1, 5)),
+                        rng=dev_rng, empty_conditioning_prob=0.0,
+                    )
+                    za[b], zs[b] = a, sp
+                out = tagger(
+                    input_ids=batch["tagger_input_ids"].to(args.device),
+                    attention_mask=batch["tagger_attention_mask"].to(args.device),
+                    z_amp=za.to(args.device), z_sup=zs.to(args.device),
+                    op_labels=batch["tagger_op3_gold"].to(args.device),
+                    ins_labels=batch["tagger_ins_gold"].to(args.device),
+                    class_weights=weights,
+                    ins_pos_weight=ins_pos_weight,
+                    ins_loss_weight=args.ins_loss_weight,
+                )
+                tot += float(out["loss"].item())
+                nb += 1
+        return tot / max(1, nb)
+
+    best_path = out_dir / "tagger-best.pt"
+    best_json = out_dir / "best.json"
+    best_dev = float("inf")
+    if best_json.exists():
+        try:
+            best_dev = float(json.loads(best_json.read_text())["dev_loss"])
+            print(f"[tagger] RESUME: best dev loss so far {best_dev:.4f}")
+        except (ValueError, KeyError):
+            pass
+
+    def maybe_update_best(at_step: int) -> None:
+        nonlocal best_dev
+        if not dev_batches:
+            return
+        dev_loss = evaluate_dev()
+        marker = ""
+        if dev_loss < best_dev:
+            best_dev = dev_loss
+            tagger.save(str(best_path))
+            best_json.write_text(json.dumps(
+                {"step": int(at_step), "dev_loss": float(dev_loss)}))
+            marker = "  ** new best **"
+        print(f"[tagger] step={at_step} DEV loss={dev_loss:.4f} "
+              f"(best {best_dev:.4f}){marker}")
+
     step = 0
 
     # Resume from the latest <out_dir>/tagger-step{N}.pt if requested.
@@ -333,12 +409,23 @@ def main():
             save_train_state(ckpt, optim, sched, step)
             print(f"[tagger] saved {ckpt}")
 
+        if dev_batches and step > 0 and step % args.eval_steps == 0:
+            maybe_update_best(step)
+
         step += 1
         pbar.update(1)
 
     pbar.close()
-    tagger.save(str(out_dir / "tagger-final.pt"))
-    print(f"[tagger] done at step {step}")
+    maybe_update_best(step)
+    if dev_batches and best_path.exists():
+        tagger.save(str(out_dir / "tagger-last.pt"))
+        import shutil
+        shutil.copyfile(best_path, out_dir / "tagger-final.pt")
+        print(f"[tagger] done at step {step}; tagger-final.pt = best dev "
+              f"state ({json.loads(best_json.read_text())})")
+    else:
+        tagger.save(str(out_dir / "tagger-final.pt"))
+        print(f"[tagger] done at step {step}")
 
 
 if __name__ == "__main__":

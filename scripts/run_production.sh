@@ -121,6 +121,17 @@ fi
 SKIP_SIMCSE=${SKIP_SIMCSE:-0}
 CORRUPTION_SAMPLES=${CORRUPTION_SAMPLES:-100000}
 CORRUPTION_SHARD=${CORRUPTION_SHARD:-10000}
+# Dev-monitored best-checkpoint selection (stages 03/04). Point
+# DEV_CORRUPTION_DIR at a SELECTION split (distinct from the reporting dev
+# cache) to enable; editor-final.pt / tagger-final.pt then hold the best
+# dev state instead of the last step.
+DEV_CORRUPTION_DIR=${DEV_CORRUPTION_DIR:-""}
+EVAL_STEPS=${EVAL_STEPS:-2000}
+DEV_ARGS=()
+if [[ -n "$DEV_CORRUPTION_DIR" ]]; then
+    DEV_ARGS=(--dev-corruption-dir "$DEV_CORRUPTION_DIR" --eval-steps "$EVAL_STEPS")
+fi
+
 TAGGER_STEPS=${TAGGER_STEPS:-10000}
 TAGGER_BATCH=${TAGGER_BATCH:-8}
 EDITOR_STEPS=${EDITOR_STEPS:-20000}
@@ -496,6 +507,7 @@ else
             --num-workers "$NUM_WORKERS" \
             --save-steps 2000 \
             --logging-steps 50 \
+            "${DEV_ARGS[@]}" \
             --device "$DEVICE" \
             --seed "$SEED" \
             $RESUME_FLAG
@@ -521,6 +533,7 @@ else
             --save-steps 2000 \
             --logging-steps 50 \
             --estimate-class-weights-batches 200 \
+            "${DEV_ARGS[@]}" \
             --device "$DEVICE" \
             --seed "$SEED" \
             $RESUME_FLAG
