@@ -81,7 +81,10 @@ import torch
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, set_seed
 
+import difflib
+
 from data import download_dolma_shards, iter_dolma_texts, iter_sentences
+from transforms import propose_transforms, roundtrip_ok
 from lewis_ops import OP_DEL, OP_INS, OP_KEEP, OP_REPL
 from model import MLMProvider, SAEFeatureExtractor, load_causal_gemma
 
@@ -207,6 +210,33 @@ def parse_args():
     p.add_argument("--emit-null", type=float, default=0.5,
                    help="Probability of emitting the S=∅ (all-KEEP) record "
                         "per accepted compound.")
+
+    # v4 linguistically-typed transformation ops (transforms.py, README
+    # §6.2.10). A fraction of sentence attempts goes to rule-based
+    # grammatical↔grammatical transformations (tense/aspect/modality/
+    # number/degree/negation+NPI/det-quant/anaphor/voice/questions/
+    # existential/valency/tough/ellipsis/cleft/inversion/split). Both
+    # directions are emitted, so the same surface form appears with
+    # opposite conditioning and opposite gold — the direction is decidable
+    # only through z.
+    p.add_argument("--transform-prob", type=float, default=0.35,
+                   help="Fraction of sentence attempts routed to "
+                        "transformation ops (0 disables v4).")
+    p.add_argument("--transform-families", default="all",
+                   help="'all' or comma list of transforms.FAMILIES keys.")
+    p.add_argument("--transform-slor-delta", type=float, default=1.5,
+                   help="Symmetric fluency gate for transform pairs: "
+                        "|SLOR(X) − SLOR(T(X))| must not exceed this "
+                        "(both sides are supposed to be grammatical).")
+    p.add_argument("--blocklist", default="",
+                   help="Path to blocklist.npy (generic grammaticality "
+                        "features, scripts/build_grammaticality_blocklist"
+                        ".py); masked before conditioning top-k.")
+    p.add_argument("--cond-scope", choices=["local", "global"],
+                   default="local",
+                   help="Conditioning top-k source: pool over edit-local "
+                        "tokens (default; higher information content about "
+                        "the edit) or the whole sentence (pre-v4).")
 
     # Per-op span / MLM knobs
     p.add_argument("--repl-mlm-topk", type=int, default=8)
@@ -1454,6 +1484,117 @@ def build_identity_sample(stage: Stage, text: str) -> Tuple[Optional[Dict], str]
 
 
 # ---------------------------------------------------------------------------
+# Arbitrary-pair gold (v4): token-level diff → v1 cache format. Handles
+# reordering/length changes (VOICE etc.) that the OpSpec machinery cannot.
+# ---------------------------------------------------------------------------
+def pair_to_gold(x_ids, xp_ids, mask_id, ins_id, del_id):
+    """Build (tagger_gold, editor pair, span lens, op hunks) for any token
+    pair, mirroring build_compound_gold's v1 record conventions (INS tag on
+    the gap-adjacent kept token; gap adjacent to REPL/DEL or at the end →
+    None)."""
+    sm = difflib.SequenceMatcher(None, x_ids, xp_ids, autojunk=False)
+    tagger_gold, ei, et = [], [], []
+    ins_lens, del_lens, op_types = [], [], []
+    pend = False
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(j2 - j1):
+                tagger_gold.append(OP_INS if pend else OP_KEEP)
+                pend = False
+                ei.append(xp_ids[j1 + k])
+                et.append(x_ids[i1 + k])
+        elif tag == "replace":
+            if pend:
+                return None
+            lx, lxp = i2 - i1, j2 - j1
+            m = min(lx, lxp)
+            for k in range(m):
+                tagger_gold.append(OP_REPL)
+                ei.append(mask_id)
+                et.append(x_ids[i1 + k])
+            if lxp > m:                       # extra corrupted tokens → DEL
+                del_lens.append(lxp - m)
+                for k in range(m, lxp):
+                    tagger_gold.append(OP_DEL)
+                    ei.append(xp_ids[j1 + k])
+                    et.append(del_id)
+            elif lx > m:                      # extra clean tokens → INS gap
+                ins_lens.append(lx - m)
+                for k in range(m, lx):
+                    ei.append(ins_id)
+                    et.append(x_ids[i1 + k])
+                pend = True
+            op_types.append("REPL")
+        elif tag == "delete":                 # clean-only tokens → INS gap
+            if pend:
+                ins_lens[-1] += i2 - i1
+            else:
+                ins_lens.append(i2 - i1)
+                op_types.append("INS")
+            for k in range(i1, i2):
+                ei.append(ins_id)
+                et.append(x_ids[k])
+            pend = True
+        elif tag == "insert":                 # corrupted-only tokens → DEL
+            if pend:
+                return None
+            del_lens.append(j2 - j1)
+            op_types.append("DEL")
+            for k in range(j1, j2):
+                tagger_gold.append(OP_DEL)
+                ei.append(xp_ids[k])
+                et.append(del_id)
+    if pend or len(tagger_gold) != len(xp_ids) or len(ei) != len(et):
+        return None
+    return {
+        "tagger_gold": tagger_gold,
+        "editor_input_token_ids": ei,
+        "editor_target_token_ids": et,
+        "ins_span_lengths": ins_lens,
+        "del_span_lengths": del_lens,
+        "op_types": op_types,
+        "opcodes": sm.get_opcodes(),
+    }
+
+
+def build_pair_sample(stage: Stage, clean_text: str, corrupted_text: str,
+                      ) -> Tuple[Optional[Dict], str]:
+    """Record whose clean side / corrupted side are ARBITRARY texts (v4
+    transformations; also usable for external pair corpora)."""
+    x_ids, x_off = gemma_tokenize(stage.gemma_tok, clean_text)
+    xp_ids, xp_off = gemma_tokenize(stage.gemma_tok, corrupted_text)
+    if len(x_ids) < 3 or len(xp_ids) < 3:
+        return None, "too_short_sentence"
+    gold = pair_to_gold(x_ids, xp_ids, mask_id=stage.mask_id,
+                        ins_id=stage.ins_id, del_id=stage.del_id)
+    if gold is None:
+        return None, "pair_gold_failed"
+    x_ranges, xp_ranges = [], []
+    for tag, i1, i2, j1, j2 in gold.pop("opcodes"):
+        if tag == "equal":
+            continue
+        if i2 > i1:
+            spans = [x_off[i] for i in range(i1, i2) if x_off[i] != (0, 0)]
+            if spans:
+                x_ranges.append((spans[0][0], spans[-1][1]))
+        if j2 > j1:
+            spans = [xp_off[j] for j in range(j1, j2) if xp_off[j] != (0, 0)]
+            if spans:
+                xp_ranges.append((spans[0][0], spans[-1][1]))
+    sample = {
+        "x_token_ids": x_ids,
+        "x_prime_token_ids": xp_ids,
+        **gold,
+        "N_total": len(gold["op_types"]),
+        "x_text": clean_text,
+        "x_prime_text": corrupted_text,
+        "_x_edit_char_ranges": x_ranges,
+        "_xp_edit_char_ranges": xp_ranges,
+    }
+    return sample, ""
+
+
+# ---------------------------------------------------------------------------
 # Condition-selective subsets (v3, README §6.2.8)
 # ---------------------------------------------------------------------------
 def rebase_subset_ops(
@@ -1597,6 +1738,7 @@ def finalize_sample(
     stage: Stage, sample: Dict, source_id: str, args,
     calibration_writer: Optional[any] = None,
     light: bool = False,
+    transform: bool = False,
 ) -> Tuple[Optional[Dict], str]:
     """Apply N-dependent PPL / SAE-shift gates and attach conditioning topk.
 
@@ -1724,10 +1866,52 @@ def finalize_sample(
     if not args.calibration_mode and not is_identity:
         if slor_drop is None:
             return None, "slor_undefined"
-        if slor_drop > slor_drop_max:
+        if transform:
+            # v4 transformation pairs: BOTH sides are supposed to be
+            # grammatical, so gate on the symmetric fluency difference
+            # instead of the one-sided corruption drop.
+            if abs(slor_drop) > float(args.transform_slor_delta):
+                return None, "transform_slor_delta"
+        elif slor_drop > slor_drop_max:
             return None, "slor_drop_too_high"
         if topk_change < sae_min_topk_change:
             return None, "sae_topk_unchanged"
+
+    # ---- conditioning extraction (v4: edit-local scope + blocklist) ---- #
+    def _pooled_dense(z, offsets, ranges):
+        if ranges and getattr(args, "cond_scope", "local") == "local":
+            pos = _char_ranges_to_token_positions(offsets, ranges)
+            if pos:
+                return z[pos].max(dim=0).values.float()
+        return z.max(dim=0).values.float()
+
+    dense_x = _pooled_dense(z_X, offsets_X, x_ranges)
+    dense_xp = _pooled_dense(z_Xp, offsets_Xp, xp_ranges)
+    blk = getattr(args, "_blocklist", None)
+    if blk is not None:
+        blk = blk.to(dense_x.device)
+    cond_blocked_mass = None
+    if blk is not None:
+        diff_abs = (dense_x - dense_xp).abs()
+        k8 = min(8, diff_abs.numel())
+        vals, idx = diff_abs.topk(k8)
+        tot = float(vals.sum())
+        if tot > 0:
+            bset = set(int(i) for i in blk.tolist())
+            cond_blocked_mass = float(sum(
+                float(v) for v, i in zip(vals.tolist(), idx.tolist())
+                if i in bset) / tot)
+        dense_x[blk] = 0.0
+        dense_xp[blk] = 0.0
+
+    def _cond_topk(dense, k=64):
+        k = min(k, dense.numel())
+        vals, idx = dense.topk(k)
+        keep = vals > 0
+        return idx[keep].tolist(), vals[keep].tolist()
+
+    cfX, cvX = _cond_topk(dense_x)
+    cfXp, cvXp = _cond_topk(dense_xp)
 
     sample.pop("x_text", None)
     sample.pop("x_prime_text", None)
@@ -1735,8 +1919,8 @@ def finalize_sample(
     sample.pop("_xp_edit_char_ranges", None)
     sample.update({
         "source_sent_id": source_id,
-        "z_X_topk": topk_records(fX, vX),
-        "z_X_prime_topk": topk_records(fXp, vXp),
+        "z_X_topk": topk_records(cfX, cvX),
+        "z_X_prime_topk": topk_records(cfXp, cvXp),
         "filter_telemetry": {
             "slor_clean": slor_X,
             "slor_corr":  slor_Xp,
@@ -1753,6 +1937,8 @@ def finalize_sample(
             "sae_topk_change_global": topk_change_global,
             "sae_topk_used_local": used_local,
             "sae_min_topk_change_at_N": sae_min_topk_change,
+            "cond_scope": ("local" if x_ranges or xp_ranges else "global"),
+            "cond_blocked_mass": cond_blocked_mass,
         },
     })
     return sample, ""
@@ -1883,6 +2069,16 @@ def main():
     print(f"[corruption] resolved MLM: {mlm.resolved_name}  mask={mlm.mask_token!r}")
 
     print(f"[corruption] loading spaCy POS tagger: {args.spacy_model}")
+    args._blocklist = None
+    if args.blocklist:
+        _bl = np.load(args.blocklist)
+        args._blocklist = torch.as_tensor(np.asarray(_bl, dtype=np.int64))
+        print(f"[corruption] blocklist: {len(_bl)} generic grammaticality "
+              f"features masked from conditioning ({args.blocklist})")
+    args._families = (None if args.transform_families.strip() == "all"
+                      else [x.strip() for x in
+                            args.transform_families.split(",") if x.strip()])
+
     spacy_nlp = load_spacy(args.spacy_model)
 
     # ----- Build / load the SLOR unigram baseline -------------------------
@@ -2040,6 +2236,7 @@ def main():
     open_shard()
 
     emit_counts: Counter = Counter()
+    ttype_counts: Counter = Counter()
 
     def write_record(rec: Dict):
         """Write one record; rotate shards and log at shard boundaries."""
@@ -2111,6 +2308,59 @@ def main():
         if args.sentence_stride > 1 and \
                 (sent_idx % args.sentence_stride) != args.sentence_offset:
             continue
+
+        # ---- v4: transformation-op attempt (README §6.2.10) ---------- #
+        if (args.transform_prob > 0 and args.force_n is None
+                and rng.random() < args.transform_prob):
+            wrote_t = 0
+            props = propose_transforms(stage.spacy_nlp, sent, rng,
+                                       families=args._families)
+            if props:
+                prop = props[rng.randrange(len(props))]
+                ttype_counts[f"prop:{prop.t_type}"] += 1
+                if not roundtrip_ok(stage.spacy_nlp, prop, sent, rng):
+                    ttype_counts[f"rtfail:{prop.family}"] += 1
+                    reject_reasons["transform_roundtrip"] += 1
+                else:
+                    source_id_t = f"dolma:s{sent_idx}"
+                    # both directions: apply (X→T) and revert (T→X)
+                    for clean, corr, tt in (
+                            (prop.out_text, sent, prop.t_type),
+                            (sent, prop.out_text, prop.t_type + "/rev")):
+                        ps, pr = build_pair_sample(stage, clean, corr)
+                        if ps is None:
+                            reject_reasons[f"transform_{pr}"] += 1
+                            continue
+                        pf, fr = finalize_sample(
+                            stage, ps, source_id=source_id_t, args=args,
+                            calibration_writer=None, transform=True)
+                        if pf is None:
+                            reject_reasons[f"transform_{fr}"] += 1
+                            continue
+                        pf["bucket"] = "transform"
+                        pf["subset_kind"] = "full"
+                        pf["n_parent"] = int(pf.get("N_total", 1))
+                        pf["t_type"] = tt
+                        if written < args.target_samples:
+                            write_record(pf)
+                            ttype_counts[f"acc:{tt}"] += 1
+                            wrote_t += 1
+                    # null record: corrupted side, all-KEEP, zero diff
+                    if wrote_t and rng.random() < args.emit_null                             and written < args.target_samples:
+                        ns, nr = build_identity_sample(stage, prop.out_text)
+                        if ns is not None:
+                            nf, _ = finalize_sample(
+                                stage, ns, source_id=source_id_t, args=args,
+                                calibration_writer=None, light=True)
+                            if nf is not None:
+                                nf["bucket"] = "transform"
+                                nf["subset_kind"] = "null"
+                                nf["n_parent"] = 0
+                                nf["t_type"] = "null"
+                                write_record(nf)
+            if wrote_t:
+                continue          # sentence consumed by the transform path
+            # else fall through to the lexical corruption path
 
         if args.force_n is not None:
             N_forced = max(0, min(int(args.force_n), int(args.n_max)))
@@ -2226,6 +2476,11 @@ def main():
         for k in sorted(n_attempts)
     )
     per_kind = ", ".join(f"{k}={v}" for k, v in emit_counts.items())
+    if ttype_counts:
+        acc_t = {k[4:]: v for k, v in ttype_counts.items()
+                 if k.startswith("acc:")}
+        print("[corruption] transform accepts: " +
+              ", ".join(f"{k}={v}" for k, v in sorted(acc_t.items())))
     print(
         f"[corruption] FINAL written={written} sents={sent_idx} "
         f"attempts={attempted} yield={yield_pct:.3f}  "
@@ -2250,6 +2505,15 @@ def main():
         "n_attempts": {str(k): int(v) for k, v in n_attempts.items()},
         "n_accepts": {str(k): int(v) for k, v in n_accepts.items()},
         "reject_reasons": {k: int(v) for k, v in reject_reasons.items()},
+        # v4 transformation ops (README §6.2.10)
+        "transform": {
+            "transform_prob": float(args.transform_prob),
+            "families": (args.transform_families),
+            "slor_delta": float(args.transform_slor_delta),
+            "blocklist": args.blocklist or None,
+            "cond_scope": args.cond_scope,
+            "counts": {k: int(v) for k, v in sorted(ttype_counts.items())},
+        },
         # v3 condition-selective emission (README §6.2.8)
         "subset_emission": {
             "emit_full": float(args.emit_full),

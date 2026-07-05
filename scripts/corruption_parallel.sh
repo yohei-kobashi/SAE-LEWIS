@@ -66,6 +66,14 @@ SEED=${SEED:-42}
 OP_WEIGHT_REPL=${OP_WEIGHT_REPL:-0.60}
 OP_WEIGHT_INS=${OP_WEIGHT_INS:-0.34}
 OP_WEIGHT_DEL=${OP_WEIGHT_DEL:-0.06}
+# v4 transformation ops + confound-controlled conditioning
+TRANSFORM_PROB=${TRANSFORM_PROB:-0.35}
+TRANSFORM_FAMILIES=${TRANSFORM_FAMILIES:-all}
+BLOCKLIST=${BLOCKLIST:-""}
+BLOCKLIST_ARGS=()
+if [[ -n "$BLOCKLIST" ]]; then
+    BLOCKLIST_ARGS=(--blocklist "$BLOCKLIST")
+fi
 
 mkdir -p "$OUT_DIR"
 
@@ -141,6 +149,9 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --op-weight-repl "$OP_WEIGHT_REPL" \
         --op-weight-ins "$OP_WEIGHT_INS" \
         --op-weight-del "$OP_WEIGHT_DEL" \
+        --transform-prob "$TRANSFORM_PROB" \
+        --transform-families "$TRANSFORM_FAMILIES" \
+        "${BLOCKLIST_ARGS[@]}" \
         --target-samples "$PER_WORKER" \
         --samples-per-shard "$CORRUPTION_SHARD" \
         --sentence-stride "$WORKERS" \
