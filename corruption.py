@@ -378,6 +378,10 @@ class Stage:
     # the table (smoothed). Built once at startup; see build_unigram(...).
     unigram_log: Dict[int, float]
     unigram_log_unk: float
+    # Full spaCy pipeline (parser + lemmatizer; ner off) — required by the
+    # v4 transformation proposers (dependency patterns, doc.sents, lemma_).
+    # spacy_nlp above stays POS-only for the fast INS-priority path.
+    spacy_full: any = None
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +454,21 @@ def looks_like_word(s: str) -> bool:
 HIGH_PRIORITY_UPOS: Set[str] = {
     "ADJ", "ADV", "DET", "ADP", "CCONJ", "SCONJ", "AUX", "PART",
 }
+
+
+def load_spacy_full(model_name: str):
+    """Full pipeline (only ner disabled) for the v4 transformation
+    proposers: they need the dependency parse (doc.sents, token.dep_) and
+    the lemmatizer (token.lemma_), both of which the fast POS-only
+    pipeline below strips — with it, every proposer's guard except-ed out
+    and the transform branch was silently empty."""
+    import spacy
+    try:
+        return spacy.load(model_name, disable=["ner"])
+    except OSError:
+        from spacy.cli import download as spacy_download
+        spacy_download(model_name)
+        return spacy.load(model_name, disable=["ner"])
 
 
 def load_spacy(model_name: str):
@@ -2080,6 +2099,8 @@ def main():
                             args.transform_families.split(",") if x.strip()])
 
     spacy_nlp = load_spacy(args.spacy_model)
+    spacy_full = (load_spacy_full(args.spacy_model)
+                  if args.transform_prob > 0 else None)
 
     # ----- Build / load the SLOR unigram baseline -------------------------
     skip_special_ids = {
@@ -2126,6 +2147,7 @@ def main():
         extractor=extractor, causal_llm=causal_llm, mlm=mlm,
         gemma_tok=gemma_tok,
         spacy_nlp=spacy_nlp,
+        spacy_full=spacy_full,
         mask_id=int(gemma_tok.mask_token_id),
         ins_id=int(gemma_tok.convert_tokens_to_ids("[INS]")),
         del_id=int(gemma_tok.convert_tokens_to_ids("[DEL]")),
@@ -2313,12 +2335,14 @@ def main():
         if (args.transform_prob > 0 and args.force_n is None
                 and rng.random() < args.transform_prob):
             wrote_t = 0
-            props = propose_transforms(stage.spacy_nlp, sent, rng,
+            props = propose_transforms(stage.spacy_full, sent, rng,
                                        families=args._families)
+            if not props:
+                ttype_counts["no_proposal"] += 1
             if props:
                 prop = props[rng.randrange(len(props))]
                 ttype_counts[f"prop:{prop.t_type}"] += 1
-                if not roundtrip_ok(stage.spacy_nlp, prop, sent, rng):
+                if not roundtrip_ok(stage.spacy_full, prop, sent, rng):
                     ttype_counts[f"rtfail:{prop.family}"] += 1
                     reject_reasons["transform_roundtrip"] += 1
                 else:
