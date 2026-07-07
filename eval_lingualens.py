@@ -118,6 +118,12 @@ def parse_args():
                         "the SAME user-supplied feature state, so features "
                         "already achieved stop driving edits. Other "
                         "conditions keep their pass-1 vectors.")
+    p.add_argument("--fluency-gate", type=float, default=0.0,
+                   help="Reject candidates whose mean-LL drop vs the input "
+                        "exceeds this (nats/token; 0 = off). The identity "
+                        "candidate has delta 0 and always survives. Pick "
+                        "offline from a --dump-details run (components store "
+                        "tanh(delta)).")
     p.add_argument("--ranker-weights", default=None,
                    help="Override RankerWeights as 'sae,fluency,content,"
                         "len_pen' (e.g. '2.0,0.3,0.2,0.05'). Default: "
@@ -265,7 +271,8 @@ def main():
         a, b, c, e = (float(x) for x in args.ranker_weights.split(","))
         rw = RankerWeights(sae_align=a, fluency=b, content=c, length_penalty=e)
         print(f"[lingua-eval] ranker weights: {rw}")
-    ranker = Ranker(extractor, causal, bid, rw, device=args.device)
+    ranker = Ranker(extractor, causal, bid, rw, device=args.device,
+                    fluency_gate=args.fluency_gate)
 
     rng = np.random.default_rng(args.seed)
     records: List[Dict] = []

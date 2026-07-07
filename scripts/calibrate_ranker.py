@@ -30,6 +30,7 @@ import argparse
 import difflib
 import itertools
 import json
+import math
 from pathlib import Path
 from typing import Dict, List
 
@@ -43,6 +44,13 @@ def parse_args():
     p.add_argument("--grid-fluency", default="0.0,0.1,0.3,1.0")
     p.add_argument("--grid-content", default="0.0,0.1,0.2,0.5")
     p.add_argument("--grid-lenpen", default="0.0,0.05,0.2")
+    p.add_argument("--fluency-gate", type=float, default=0.0,
+                   help="Mirror of the inference-time gate (nats/token; "
+                        "0 = off): candidates with components['fluency'] < "
+                        "tanh(-gate) are excluded before scoring, identity "
+                        "excepted. Only valid on dumps produced AFTER the "
+                        "fluency component became a delta (ranker.py); "
+                        "older dumps store saturated absolute values.")
     p.add_argument("--top", type=int, default=15)
     return p.parse_args()
 
@@ -99,6 +107,8 @@ def main():
     print(f"[calibrate] grid size: {len(grid)}")
 
     # Precompute per-candidate metrics once.
+    gate_floor = math.tanh(-args.fluency_gate) if args.fluency_gate > 0 else None
+    n_gated = 0
     for p_ in pairs:
         sw = _words(p_["source"])
         gold = edited_positions(sw, _words(p_["target"]))
@@ -108,6 +118,13 @@ def main():
             pred = edited_positions(sw, _words(c["text"]))
             union = gold | pred
             c["_iou"] = (len(gold & pred) / len(union)) if union else 1.0
+            c["_gated"] = (gate_floor is not None
+                           and not c.get("is_identity", False)
+                           and c["components"]["fluency"] < gate_floor)
+            n_gated += int(c["_gated"])
+    if gate_floor is not None:
+        print(f"[calibrate] fluency gate {args.fluency_gate}: "
+              f"{n_gated} candidates excluded")
 
     results = []
     for a, b, cw, e in grid:
@@ -115,6 +132,8 @@ def main():
         for p_ in pairs:
             best, best_s = None, -1e30
             for c in p_["cands"]:
+                if c["_gated"]:
+                    continue
                 comp = c["components"]
                 sc = (a * comp["sae_align"] + b * comp["fluency"]
                       + cw * comp["content"] - e * comp["ins_slots"])

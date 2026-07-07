@@ -218,16 +218,17 @@ Scores each candidate output `c` produced by template enumeration:
 
 ```
 score(c) =  α · sae_align(c, z_amp, z_sup)
-          + β · fluency(c)
+          + β · fluency_delta(input, c)
           + γ · content_preservation(input, c)
           − η · num_INS_slots(c)
 ```
 
 - `sae_align(c)`: cosine of pool-max SAE features with `z_amp` minus cosine with `z_sup`
-- `fluency(c)`: average log-likelihood under frozen causal Gemma
+- `fluency_delta(input, c)`: `tanh(meanLL(c) − meanLL(input))` under frozen causal Gemma. A **delta**, not the absolute mean log-likelihood: sentences sit at −3..−5 nats/token, where `tanh` is saturated at ≈ −1.0 for every candidate — the v4 LinguaLens error analysis measured a 0.0003 spread between junk (`Apples apples …`) and clean candidates, i.e. the component was dead. The delta is centered at 0 (identity = exactly 0), so degraded candidates go negative and genuinely more fluent edits positive — which also removes a copy bias, since `content` alone structurally maximises at the identity.
 - `content_preservation(input, c)`: cosine of LLM2Vec sentence embeddings of input vs candidate
 - Length penalty discourages over-insertion
-- Default weights (tuned on dev): `α = 1.0, β = 0.3, γ = 0.2, η = 0.05`
+- Default weights (tuned on dev): `α = 1.0, β = 0.3, γ = 0.2, η = 0.05`; recalibrate with `scripts/calibrate_ranker.py` on a `--dump-details` dev dump (dumps from before the delta change store the saturated values and cannot be reused)
+- `--fluency-gate τ` (opt-in, nats/token): candidates whose meanLL drop vs the input exceeds `τ` score `−inf`. The identity candidate has delta 0 and always survives, so inference never aborts. Mirrored in `calibrate_ranker.py --fluency-gate` so offline weight search matches inference.
 
 ### 4.5 Length Predictor (ablation only)
 

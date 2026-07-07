@@ -93,6 +93,10 @@ def parse_args():
                         "same spec, up to this many passes (stops early at "
                         "a fixpoint). Coordinated multi-site edits (voice "
                         "flip, inversion) typically need 2-3.")
+    p.add_argument("--fluency-gate", type=float, default=0.0,
+                   help="Reject candidates whose mean-LL drop vs the input "
+                        "exceeds this (nats/token; 0 = off). The identity "
+                        "candidate has delta 0 and always survives.")
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -384,7 +388,8 @@ def main():
     )
     causal, _ = load_causal_gemma(args.llm2vec_dir)
     bid = BidirectionalLLM(args.llm2vec_dir, dtype=dtype)
-    ranker = Ranker(extractor, causal, bid, RankerWeights(), device=args.device)
+    ranker = Ranker(extractor, causal, bid, RankerWeights(),
+                    device=args.device, fluency_gate=args.fluency_gate)
 
     specs = [FeatureSpec.parse(s) for s in args.spec]
     z_amp_full, z_sup_full = build_intervention_vectors(specs, mu, args.strength)

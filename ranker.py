@@ -2,13 +2,22 @@
 SAE-aware candidate ranker (see README §4.4).
 
     score(c) =  α · sae_align(c, z_amp, z_sup)
-              + β · fluency(c)
+              + β · fluency_delta(input, c)
               + γ · content_preservation(input, c)
               − η · num_INS_slots(c)
 
 - sae_align: cosine of pool-max SAE features with z_amp minus with z_sup
-- fluency:   mean log-likelihood under frozen causal Gemma
+- fluency:   tanh(meanLL(c) − meanLL(input)) under frozen causal Gemma.
+  A DELTA, not the absolute mean log-likelihood: absolute meanLL sits at
+  −3..−5 nats/token, where tanh is saturated at ≈ −1.0 for every candidate
+  (v4 error analysis: junk vs clean differed by 0.0003 — the component was
+  dead). The delta is centered at 0 (identity = exactly 0), so degraded
+  candidates go negative and genuinely more fluent edits go positive.
 - content:   cosine between LLM2Vec sentence embeddings of input and candidate
+
+`fluency_gate` (opt-in, nats/token): candidates whose fluency delta falls
+below −gate score −inf. The identity candidate has delta 0 and always
+survives, so inference never aborts.
 
 All sub-scores are computed offline at inference (no gradient).
 """
@@ -40,12 +49,20 @@ class Ranker:
         bid_llm: BidirectionalLLM,
         weights: RankerWeights = RankerWeights(),
         device: str = "cuda",
+        fluency_gate: float = 0.0,
     ):
         self.extractor = extractor.to(device).eval()
         self.causal_llm = causal_llm.to(device).eval()
         self.bid_llm = bid_llm.to(device).eval()
         self.weights = weights
         self.device = device
+        # Reject candidates whose meanLL drops > gate nats/token vs the
+        # input (0.0 = off). Compared in tanh space in combine().
+        self.fluency_gate = float(fluency_gate)
+        # component_scores is called once per candidate with the SAME
+        # input_ids; memoize the input's meanLL (one entry is enough).
+        self._input_ll_key: tuple = ()
+        self._input_ll_val: float = 0.0
 
     @torch.no_grad()
     def _sae_pool_max(self, token_ids: List[int]) -> torch.Tensor:
@@ -88,7 +105,11 @@ class Ranker:
         sa_amp = torch.dot(z_cand, z_amp) / (z_cand.norm() * z_amp.norm() + eps)
         sa_sup = torch.dot(z_cand, z_sup) / (z_cand.norm() * z_sup.norm() + eps)
 
-        fluency = self._causal_logprob(cand_ids)
+        key = tuple(input_ids)
+        if key != self._input_ll_key:
+            self._input_ll_key = key
+            self._input_ll_val = self._causal_logprob(input_ids)
+        fluency_delta = self._causal_logprob(cand_ids) - self._input_ll_val
 
         e_in = self._sentence_embed(input_ids).float()
         e_cd = self._sentence_embed(cand_ids).float()
@@ -96,13 +117,17 @@ class Ranker:
 
         return {
             "sae_align": float(sa_amp - sa_sup),
-            # tanh-bounded mean log-likelihood ([0,1]-ish soft scale)
-            "fluency": math.tanh(fluency),
+            # tanh-bounded meanLL DELTA vs input (identity = exactly 0;
+            # absolute meanLL saturates tanh at ≈ −1 for every candidate)
+            "fluency": math.tanh(fluency_delta),
             "content": content,
             "ins_slots": int(num_ins_slots),
         }
 
     def combine(self, comp: dict) -> float:
+        if self.fluency_gate > 0.0 \
+                and comp["fluency"] < math.tanh(-self.fluency_gate):
+            return float("-inf")
         w = self.weights
         return (
             w.sae_align * comp["sae_align"]
