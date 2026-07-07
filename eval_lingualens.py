@@ -104,6 +104,20 @@ def parse_args():
     p.add_argument("--fill-topk", type=int, default=5,
                    help="Fill-refinement depth (evaluate_intervention.py).")
     p.add_argument("--max-fill-variants", type=int, default=32)
+    p.add_argument("--refine-passes", type=int, default=1,
+                   help="Iterative refinement: feed each pass's output back "
+                        "through the whole tagger→editor→ranker loop, up to "
+                        "this many passes (early-stops at a fixpoint). "
+                        "Coordinated multi-site edits (voice flip, "
+                        "inversion) exceed one pass because fill refinement "
+                        "varies one position at a time.")
+    p.add_argument("--refine-recompute", action="store_true",
+                   help="With --refine-passes > 1: recompute the 'true' "
+                        "condition's (z_amp, z_sup) each pass as "
+                        "diff(z(current), z(target)) — the remaining gap to "
+                        "the SAME user-supplied feature state, so features "
+                        "already achieved stop driving edits. Other "
+                        "conditions keep their pass-1 vectors.")
     p.add_argument("--ranker-weights", default=None,
                    help="Override RankerWeights as 'sae,fluency,content,"
                         "len_pen' (e.g. '2.0,0.3,0.2,0.05'). Default: "
@@ -256,6 +270,7 @@ def main():
     rng = np.random.default_rng(args.seed)
     records: List[Dict] = []
     agg = {c: defaultdict(list) for c in conditions}
+    passes_agg = {c: [] for c in conditions}
     texts = {c: {"out": [], "tgt": []} for c in conditions}
     baseline = defaultdict(list)
     base_texts = {"out": [], "tgt": []}
@@ -289,21 +304,43 @@ def main():
         op_taus = tuple(float(t) for t in args.op_thresholds.split(","))
         try:
             for c, (za, zs) in variants.items():
-                result = edit_once(
-                    text=src, z_amp_full=za, z_sup_full=zs,
-                    tagger=tagger, editor=editor, ranker=ranker,
-                    tokenizer=tokenizer, l_max=args.l_max, device=args.device,
-                    ins_threshold=args.ins_threshold, op_thresholds=op_taus,
-                    max_templates=args.max_templates,
-                    fill_topk=args.fill_topk,
-                    max_fill_variants=args.max_fill_variants,
-                    return_details=args.dump_details,
-                    verbose=False,
-                )
-                if args.dump_details:
-                    out_text, details = result
-                else:
-                    out_text = result
+                cur = src
+                details = None
+                pass_texts: List[str] = []
+                n_passes = 0
+                for p_i in range(max(1, args.refine_passes)):
+                    if p_i > 0 and args.refine_recompute and c == "true":
+                        # Remaining gap to the SAME target feature state;
+                        # achieved features drop out of the spec.
+                        with torch.no_grad():
+                            z_cur = extractor.pool_max_topk(
+                                extractor.encode_text(cur), args.pool_topk,
+                            ).float().cpu()
+                        za, zs = diff_intervention(
+                            z_cur, z_tgt, args.k_amp, args.k_sup)
+                    result = edit_once(
+                        text=cur, z_amp_full=za, z_sup_full=zs,
+                        tagger=tagger, editor=editor, ranker=ranker,
+                        tokenizer=tokenizer, l_max=args.l_max,
+                        device=args.device,
+                        ins_threshold=args.ins_threshold,
+                        op_thresholds=op_taus,
+                        max_templates=args.max_templates,
+                        fill_topk=args.fill_topk,
+                        max_fill_variants=args.max_fill_variants,
+                        return_details=args.dump_details,
+                        verbose=False,
+                    )
+                    if args.dump_details:
+                        out_text, details = result
+                    else:
+                        out_text = result
+                    n_passes = p_i + 1
+                    if out_text == cur:      # fixpoint: identity chosen
+                        break
+                    cur = out_text
+                    pass_texts.append(out_text)
+                out_text = cur
                 m = pair_metrics(out_text, src, tgt)
                 with torch.no_grad():
                     z_out = extractor.pool_max_topk(
@@ -319,8 +356,13 @@ def main():
                     agg[c][key].append(v)
                 texts[c]["out"].append(out_text)
                 texts[c]["tgt"].append(tgt)
+                passes_agg[c].append(n_passes)
                 rec["outputs"][c] = {"text": out_text, **m}
+                if args.refine_passes > 1:
+                    rec["outputs"][c]["n_passes"] = n_passes
+                    rec["outputs"][c]["pass_texts"] = pass_texts
                 if args.dump_details:
+                    # Final executed pass only (calibration-compatible).
                     rec["outputs"][c]["candidates"] = details["candidates"]
                     rec["outputs"][c]["chosen"] = details["chosen"]
         except TemplateBudgetExceeded as e:
@@ -350,6 +392,9 @@ def main():
         row = {k2: float(np.mean(agg[c][k2])) if agg[c][k2] else None
                for k2 in metric_keys}
         row.update(corpus_bleu_chrf(texts[c]["out"], texts[c]["tgt"]))
+        if args.refine_passes > 1:
+            row["mean_passes"] = (float(np.mean(passes_agg[c]))
+                                  if passes_agg[c] else None)
         summary["conditions"][c] = row
     brow = {k2: float(np.mean(baseline[k2])) if baseline[k2] else None
             for k2 in metric_keys}
@@ -367,7 +412,9 @@ def main():
              f"{summary['n_scored']}, enumeration-skipped={skipped}", "",
              f"intervention: diff-based, k_amp={args.k_amp} k_sup={args.k_sup} "
              f"pool_topk={args.pool_topk}; l_max={args.l_max} "
-             f"ins_threshold={args.ins_threshold}", "",
+             f"ins_threshold={args.ins_threshold}; refine_passes="
+             f"{args.refine_passes}"
+             + (" (recompute)" if args.refine_recompute else ""), "",
              "| condition | " + " | ".join(cols) + " |",
              "|---|" + "---|" * len(cols)]
 

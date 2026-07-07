@@ -87,6 +87,12 @@ def parse_args():
                         "fills, ranked by the SAE-grounded ranker. 1 "
                         "disables refinement.")
     p.add_argument("--max-fill-variants", type=int, default=32)
+    p.add_argument("--refine-passes", type=int, default=1,
+                   help="Iterative refinement: re-run the whole "
+                        "tagger→editor→ranker loop on the output under the "
+                        "same spec, up to this many passes (stops early at "
+                        "a fixpoint). Coordinated multi-site edits (voice "
+                        "flip, inversion) typically need 2-3.")
 
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -315,6 +321,47 @@ def edit_once(
     return best_text
 
 
+@torch.no_grad()
+def edit_iterative(
+    *,
+    text: str,
+    passes: int = 1,
+    return_details: bool = False,
+    **edit_kwargs,
+):
+    """Iterative refinement: run edit_once up to `passes` times, feeding each
+    output back in as the next input under the SAME (z_amp, z_sup) spec.
+
+    Coordinated multi-site edits (voice flip, inversion) exceed what one
+    pass can express — fill refinement varies ONE position at a time, so the
+    pool only ever contains partially-moved intermediates (e.g. subject
+    swapped, object not yet). A second pass re-tags the intermediate: the
+    features named by the spec still mismatch at the remaining sites, so the
+    tagger fires there next. Stops early at a fixpoint (output == input;
+    the identity candidate guarantees one exists) — `passes` is a cap, not
+    a target.
+
+    Returns the final text, or (text, details_list) with one edit_once
+    details dict per executed pass.
+    """
+    cur = text
+    history = []
+    for _ in range(max(1, passes)):
+        result = edit_once(text=cur, return_details=return_details,
+                           **edit_kwargs)
+        if return_details:
+            out_text, details = result
+            history.append(details)
+        else:
+            out_text = result
+        if out_text == cur:
+            break
+        cur = out_text
+    if return_details:
+        return cur, history
+    return cur
+
+
 def main():
     args = parse_args()
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
@@ -342,8 +389,9 @@ def main():
     specs = [FeatureSpec.parse(s) for s in args.spec]
     z_amp_full, z_sup_full = build_intervention_vectors(specs, mu, args.strength)
     op_taus = tuple(float(t) for t in args.op_thresholds.split(","))
-    out = edit_once(
-        text=args.text, z_amp_full=z_amp_full, z_sup_full=z_sup_full,
+    out = edit_iterative(
+        text=args.text, passes=args.refine_passes,
+        z_amp_full=z_amp_full, z_sup_full=z_sup_full,
         tagger=tagger, editor=editor, ranker=ranker, tokenizer=tokenizer,
         l_max=args.l_max, device=args.device,
         ins_threshold=args.ins_threshold, op_thresholds=op_taus,
