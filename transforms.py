@@ -736,6 +736,260 @@ def propose_splitjoin(doc, text, rng) -> List[Proposal]:
 
 
 # ---------------------------------------------------------------------------
+# v4d families — variation-oriented additions (README §6.2.10). Chosen for
+# EDIT-GEOMETRY coverage rather than benchmark coverage: pure reordering
+# (PARTICLE, DATIVE, ADVPLACE, PPFRONT, QUOTINV), token fusion/split
+# (CONTRACT), clause-edge function words (COMPZR, NONFIN).
+# ---------------------------------------------------------------------------
+PARTICLES = {"up", "off", "out", "on", "down", "away", "back", "over", "in"}
+DATIVE_VERBS = {"give", "send", "show", "tell", "offer", "hand", "lend",
+                "sell", "pass", "bring", "teach", "pay", "mail", "throw",
+                "owe", "promise"}
+FRONT_PREPS = {"in", "on", "at", "during", "after", "before"}
+PREP_VERB_BLOCK = {"believe", "depend", "rely", "consist", "result",
+                   "participate", "engage", "invest", "specialize"}
+BRIDGE_VERBS = {"say", "think", "believe", "know", "hope", "claim",
+                "suppose", "guess", "wish", "feel", "hear", "admit",
+                "argue", "insist", "suggest", "assume", "expect"}
+ASPECTUAL_VERBS = {"begin", "start", "continue", "cease", "like", "love",
+                   "hate", "prefer"}
+SPEECH_VERBS = ("said", "asked", "replied", "shouted", "whispered",
+                "added", "answered", "explained")
+CONTRACTION_PAIRS = [
+    ("do not", "don't"), ("does not", "doesn't"), ("did not", "didn't"),
+    ("is not", "isn't"), ("are not", "aren't"), ("was not", "wasn't"),
+    ("were not", "weren't"), ("has not", "hasn't"), ("have not", "haven't"),
+    ("had not", "hadn't"), ("will not", "won't"), ("would not", "wouldn't"),
+    ("could not", "couldn't"), ("should not", "shouldn't"),
+    ("cannot", "can't"),
+    ("I am", "I'm"), ("you are", "you're"), ("we are", "we're"),
+    ("they are", "they're"), ("I will", "I'll"), ("you will", "you'll"),
+    ("we will", "we'll"), ("they will", "they'll"), ("I have", "I've"),
+    ("you have", "you've"), ("we have", "we've"), ("they have", "they've"),
+]
+
+
+def propose_particle(doc, text, rng) -> List[Proposal]:
+    """V prt OBJ ↔ V OBJ prt (verb-particle alternation; pure reorder)."""
+    out = []
+    for v in doc:
+        if v.pos_ != "VERB":
+            continue
+        prt = next((c for c in v.children if c.dep_ == "prt"
+                    and c.lower_ in PARTICLES), None)
+        obj = next((c for c in v.children if c.dep_ == "dobj"), None)
+        if prt is None or obj is None or obj.pos_ == "PRON":
+            continue                       # "picked it up" has one order only
+        osp = _span(obj)
+        if osp is None or len(list(obj.subtree)) > 4:
+            continue
+        v_end = v.idx + len(v.text)
+        prt_end = prt.idx + len(prt.text)
+        # V prt OBJ → V OBJ prt  (prt directly after V, obj directly after prt)
+        if prt.idx == v_end + 1 and osp[0] == prt_end + 1:
+            T = _splice(text, [(v_end, prt_end, ""),
+                               (osp[1], osp[1], " " + prt.text)])
+            out.append(Proposal("PRT:VPO->VOP", "PARTICLE", T, True))
+        # V OBJ prt → V prt OBJ  (obj directly after V, prt directly after obj)
+        elif osp[0] == v_end + 1 and prt.idx == osp[1] + 1:
+            T = _splice(text, [(osp[1], prt_end, ""),
+                               (v_end, v_end, " " + prt.text)])
+            out.append(Proposal("PRT:VOP->VPO", "PARTICLE", T, True))
+    return out
+
+
+def propose_dative(doc, text, rng) -> List[Proposal]:
+    """V OBJ to REC ↔ V REC OBJ (dative alternation; coordinated reorder)."""
+    out = []
+    for v in doc:
+        if v.pos_ != "VERB" or v.lemma_ not in DATIVE_VERBS:
+            continue
+        obj = next((c for c in v.children if c.dep_ == "dobj"), None)
+        if obj is None:
+            continue
+        osp = _span(obj)
+        if osp is None or len(list(obj.subtree)) > 4:
+            continue
+        obj_txt = text[osp[0]:osp[1]]
+        # A: V OBJ to REC → V REC OBJ   (spaCy tags the to-PP prep or dative)
+        prep = next((c for c in v.children
+                     if c.dep_ in ("prep", "dative") and c.lower_ == "to"),
+                    None)
+        if prep is not None and prep.idx == osp[1] + 1:
+            rec = next((c for c in prep.children if c.dep_ == "pobj"), None)
+            if rec is not None and rec.pos_ in ("PROPN", "PRON"):
+                rsp = _span(rec)
+                if rsp is not None and len(list(rec.subtree)) <= 2 \
+                        and rsp[0] > prep.idx:
+                    rec_txt = text[rsp[0]:rsp[1]]
+                    T = _splice(text, [(osp[0], rsp[1],
+                                        rec_txt + " " + obj_txt)])
+                    out.append(Proposal("DAT:PP->DO", "DATIVE", T, True))
+        # B: V REC OBJ → V OBJ to REC
+        rec2 = next((c for c in v.children
+                     if c.dep_ == "dative" and c.pos_ in ("PROPN", "PRON")),
+                    None)
+        if rec2 is not None:
+            r2sp = _span(rec2)
+            if r2sp is not None and len(list(rec2.subtree)) <= 2 \
+                    and osp[0] == r2sp[1] + 1:
+                rec_txt = text[r2sp[0]:r2sp[1]]
+                T = _splice(text, [(r2sp[0], osp[1],
+                                    obj_txt + " to " + rec_txt)])
+                out.append(Proposal("DAT:DO->PP", "DATIVE", T, True))
+    return out
+
+
+def propose_advplace(doc, text, rng) -> List[Proposal]:
+    """Pre-verbal -ly manner adverb ↔ clause-final (constituent movement)."""
+    out = []
+    if not _sent_ok(doc):
+        return out
+    for adv in doc:
+        if adv.dep_ != "advmod" or not adv.lower_.endswith("ly") \
+                or adv.head.pos_ != "VERB" or adv.i == 0 \
+                or any(True for _ in adv.children):
+            continue
+        v = adv.head
+        vsub = sorted(v.subtree, key=lambda t: t.i)
+        last = vsub[-1]
+        if last.pos_ == "PUNCT" and len(vsub) >= 2:
+            last = vsub[-2]
+        # A: directly before its verb → clause-final
+        if adv.i == v.i - 1 and last.i > v.i:
+            end = last.idx + len(last.text)
+            T = _splice(text, [(adv.idx, adv.idx + len(adv.text) + 1, ""),
+                               (end, end, " " + adv.text)])
+            out.append(Proposal("ADV:PRE->END", "ADVPLACE", T, True))
+        # B: clause-final → directly before the verb
+        elif adv.i == last.i and adv.i > v.i and v.i > 0:
+            T = _splice(text,
+                        [(adv.idx - 1, adv.idx + len(adv.text), ""),
+                         (v.idx, v.idx, adv.text + " ")])
+            out.append(Proposal("ADV:END->PRE", "ADVPLACE", T, True))
+    return out
+
+
+def propose_ppfront(doc, text, rng) -> List[Proposal]:
+    """Sentence-final adjunct PP ↔ fronted PP + comma (long-distance move)."""
+    out = []
+    if not _sent_ok(doc):
+        return out
+    root = next((t for t in doc if t.dep_ == "ROOT"), None)
+    if root is None or root.pos_ not in ("VERB", "AUX"):
+        return out
+    # A: final PP → fronted
+    if root.lemma_ not in PREP_VERB_BLOCK and not text.startswith(
+            tuple(p.capitalize() + " " for p in FRONT_PREPS)):
+        for prep in root.children:
+            if prep.dep_ != "prep" or prep.lower_ not in FRONT_PREPS:
+                continue
+            psp = _span(prep)
+            if psp is None or len(list(prep.subtree)) > 5:
+                continue
+            if text[psp[1]:] != "." or text[psp[0] - 1] != " ":
+                continue
+            if next((c for c in prep.children if c.dep_ == "pobj"),
+                    None) is None:
+                continue
+            pp_txt = text[psp[0]:psp[1]]
+            rest = text[:psp[0] - 1]
+            T = _cap(pp_txt) + ", " + _decap(rest, _keep_cap(doc[0])) + "."
+            out.append(Proposal("PP:END->FRONT", "PPFRONT", T, True))
+    # B: fronted PP + comma → sentence-final
+    m = re.match(r"^(In|On|At|During|After|Before) (.+?), (.+)\.$", text)
+    if m and doc[0].dep_ == "prep":
+        T = (_cap(m.group(3)) + " " + m.group(1).lower() + " "
+             + m.group(2) + ".")
+        out.append(Proposal("PP:FRONT->END", "PPFRONT", T, True))
+    return out
+
+
+def propose_contract(doc, text, rng) -> List[Proposal]:
+    """Auxiliary contraction ↔ expansion (token fusion/split; register)."""
+    out = []
+    for full, con in CONTRACTION_PAIRS:
+        for f, c in {(full, con), (_cap(full), _cap(con))}:
+            m = re.search(rf"\b{re.escape(f)}\b", text)
+            if m:
+                T = text[:m.start()] + c + text[m.end():]
+                out.append(Proposal("CTR:FUSE", "CONTRACT", T, True))
+            m2 = re.search(rf"\b{re.escape(c)}\b", text)
+            if m2:
+                T = text[:m2.start()] + f + text[m2.end():]
+                out.append(Proposal("CTR:SPLIT", "CONTRACT", T, True))
+    return out
+
+
+def propose_compzr(doc, text, rng) -> List[Proposal]:
+    """Complementizer 'that' omission ↔ insertion under bridge verbs."""
+    out = []
+    for v in doc:
+        if v.pos_ != "VERB" or v.lemma_ not in BRIDGE_VERBS:
+            continue
+        cc = next((c for c in v.children if c.dep_ == "ccomp"), None)
+        if cc is None or cc.i < v.i:
+            continue
+        if not any(c.dep_ in ("nsubj", "nsubjpass") for c in cc.children):
+            continue                                 # finite ccomp only
+        sub = sorted(cc.subtree, key=lambda t: t.i)
+        first = sub[0]
+        if first.i <= v.i:
+            continue
+        if first.lower_ == "that" and first.dep_ == "mark":
+            T = _splice(text,
+                        [(first.idx, first.idx + len(first.text) + 1, "")])
+            out.append(Proposal("CZR:-THAT", "COMPZR", T, True))
+        elif first.lower_ != "that":
+            T = _splice(text, [(first.idx, first.idx, "that ")])
+            out.append(Proposal("CZR:+THAT", "COMPZR", T, True))
+    return out
+
+
+def propose_nonfin(doc, text, rng) -> List[Proposal]:
+    """to-infinitive ↔ gerund complement under aspectual/emotive verbs."""
+    out = []
+    for v in doc:
+        if v.pos_ != "VERB" or v.lemma_ not in ASPECTUAL_VERBS:
+            continue
+        xc = next((c for c in v.children
+                   if c.dep_ == "xcomp" and c.pos_ == "VERB"), None)
+        if xc is None:
+            continue
+        to = next((c for c in xc.children
+                   if c.dep_ == "aux" and c.lower_ == "to"), None)
+        v_end = v.idx + len(v.text)
+        if to is not None and xc.tag_ == "VB" and to.i == xc.i - 1 \
+                and to.idx == v_end + 1:
+            ger = _inflect(xc.lemma_, "VBG")
+            if ger:
+                T = _splice(text, [(to.idx, xc.idx + len(xc.text), ger)])
+                out.append(Proposal("NF:TO->ING", "NONFIN", T, True))
+        elif to is None and xc.tag_ == "VBG" and xc.idx == v_end + 1:
+            base = _inflect(xc.lemma_, "VB") or xc.lemma_
+            T = _splice(text,
+                        [(xc.idx, xc.idx + len(xc.text), "to " + base)])
+            out.append(Proposal("NF:ING->TO", "NONFIN", T, True))
+    return out
+
+
+def propose_quotinv(doc, text, rng) -> List[Proposal]:
+    """Quotation frame: '," said NAME.' ↔ '," NAME said.' (SV inversion)."""
+    out = []
+    verbs = "|".join(SPEECH_VERBS)
+    name = r"[A-Z][a-z]+(?: [A-Z][a-z]+)?"
+    m = re.match(rf'^(["“].+[,!?]["”]) ({verbs}) ({name})\.$', text)
+    if m:
+        T = f"{m.group(1)} {m.group(3)} {m.group(2)}."
+        out.append(Proposal("QI:VS->SV", "QUOTINV", T, True))
+    m2 = re.match(rf'^(["“].+[,!?]["”]) ({name}) ({verbs})\.$', text)
+    if m2:
+        T = f"{m2.group(1)} {m2.group(3)} {m2.group(2)}."
+        out.append(Proposal("QI:SV->VS", "QUOTINV", T, True))
+    return out
+
+
+# ---------------------------------------------------------------------------
 FAMILIES: Dict[str, Callable] = {
     # v4a
     "TENSE": propose_tense,
@@ -756,6 +1010,15 @@ FAMILIES: Dict[str, Callable] = {
     "CLEFT": propose_cleft,
     "INVERSION": propose_inversion,
     "SPLITJOIN": propose_splitjoin,
+    # v4d — edit-geometry variation (reorder / fusion / clause edge)
+    "PARTICLE": propose_particle,
+    "DATIVE": propose_dative,
+    "ADVPLACE": propose_advplace,
+    "PPFRONT": propose_ppfront,
+    "CONTRACT": propose_contract,
+    "COMPZR": propose_compzr,
+    "NONFIN": propose_nonfin,
+    "QUOTINV": propose_quotinv,
 }
 
 

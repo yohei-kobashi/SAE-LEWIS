@@ -69,6 +69,7 @@ OP_WEIGHT_DEL=${OP_WEIGHT_DEL:-0.06}
 # v4 transformation ops + confound-controlled conditioning
 TRANSFORM_PROB=${TRANSFORM_PROB:-0.35}
 TRANSFORM_FAMILIES=${TRANSFORM_FAMILIES:-all}
+TRANSFORM_COMPOSE_PROB=${TRANSFORM_COMPOSE_PROB:-0.15}
 BLOCKLIST=${BLOCKLIST:-""}
 BLOCKLIST_ARGS=()
 if [[ -n "$BLOCKLIST" ]]; then
@@ -151,6 +152,7 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --op-weight-del "$OP_WEIGHT_DEL" \
         --transform-prob "$TRANSFORM_PROB" \
         --transform-families "$TRANSFORM_FAMILIES" \
+        --transform-compose-prob "$TRANSFORM_COMPOSE_PROB" \
         "${BLOCKLIST_ARGS[@]}" \
         --target-samples "$PER_WORKER" \
         --samples-per-shard "$CORRUPTION_SHARD" \

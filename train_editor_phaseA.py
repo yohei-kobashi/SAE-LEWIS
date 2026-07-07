@@ -30,7 +30,7 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_see
 
 from data import CorruptionCollator, CorruptionDataset
 from editor import SAEEditor
-from intervene import diff_to_sparse
+from intervene import diff_to_sparse, draw_k, parse_k_spec
 from model import load_sae_w_dec
 from resume_utils import (
     add_resume_args, find_latest_ckpt,
@@ -98,6 +98,18 @@ def parse_args():
     # the full-restore target, i.e. it actively taught "edit without being
     # asked". Set > 0 only when training on a pre-v3 cache.
     p.add_argument("--empty-cond-prob", type=float, default=0.0)
+    p.add_argument("--k-amp", default="1-8",
+                   help="Per-sample k_amp draw: 'LO-HI' uniform inclusive "
+                        "or fixed int. v4 used 1-4; the eval-time sweep "
+                        "showed dense specs (k=8) dominate, so v5 trains "
+                        "across the full range.")
+    p.add_argument("--k-sup", default="1-8",
+                   help="Per-sample k_sup draw; same syntax as --k-amp.")
+    p.add_argument("--exclude-families", default="",
+                   help="Comma list of transforms.FAMILIES keys: DROP "
+                        "transform records touching these families "
+                        "(leave-one-family-out generalization training; "
+                        "composed 'A+B' records drop if either is listed).")
     # CE weight on copy positions (label == input). Uniform CE (1.0) spends
     # ~95% of the gradient on copying, starving Proj_A; edit positions
     # ([MASK]/[INS] slots) always keep weight 1.
@@ -112,6 +124,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args._k_amp = parse_k_spec(args.k_amp)
+    args._k_sup = parse_k_spec(args.k_sup)
+    args._excluded = [x.strip() for x in
+                      args.exclude_families.split(",") if x.strip()]
+    if args._excluded:
+        print(f"[train] LOFO: excluding transform families "
+              f"{args._excluded}")
     set_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
@@ -178,7 +197,8 @@ def main():
         optim, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps,
     )
 
-    dataset = CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed)
+    dataset = CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed,
+                  exclude_t_families=args._excluded)
     collator = CorruptionCollator(
         d_sae=d_sae, pad_token_id=tokenizer.pad_token_id,
         sep_token_id=sep_id, del_token_id=del_id,
@@ -218,8 +238,8 @@ def main():
                 for b in range(z_X.shape[0]):
                     a, sp = diff_to_sparse(
                         z_X[b], z_Xp[b], k_top=args.k_top,
-                        k_amp=int(dev_rng.integers(1, 5)),
-                        k_sup=int(dev_rng.integers(1, 5)),
+                        k_amp=draw_k(dev_rng, args._k_amp),
+                        k_sup=draw_k(dev_rng, args._k_sup),
                         rng=dev_rng, empty_conditioning_prob=0.0,
                     )
                     za[b], zs[b] = a, sp
@@ -299,11 +319,11 @@ def main():
         z_amp = torch.zeros_like(z_X)
         z_sup = torch.zeros_like(z_X)
         for b in range(B):
-            # {1..4}, not {0..3}: the fully-empty case is handled by
-            # --empty-cond-prob alone, so every non-empty conditioning
+            # Lower bound 1, not 0: the fully-empty case is handled
+            # by --empty-cond-prob alone, so every non-empty conditioning
             # carries at least one amplified and one suppressed feature.
-            k_amp = int(rng.integers(1, 5))
-            k_sup = int(rng.integers(1, 5))
+            k_amp = draw_k(rng, args._k_amp)
+            k_sup = draw_k(rng, args._k_sup)
             a, s = diff_to_sparse(
                 z_X[b], z_X_prime[b],
                 k_top=args.k_top,

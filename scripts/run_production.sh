@@ -127,11 +127,20 @@ CORRUPTION_SHARD=${CORRUPTION_SHARD:-10000}
 # dev state instead of the last step.
 DEV_CORRUPTION_DIR=${DEV_CORRUPTION_DIR:-""}
 EVAL_STEPS=${EVAL_STEPS:-2000}
+DEV_BATCHES=${DEV_BATCHES:-64}
 DEV_ARGS=()
 if [[ -n "$DEV_CORRUPTION_DIR" ]]; then
-    DEV_ARGS=(--dev-corruption-dir "$DEV_CORRUPTION_DIR" --eval-steps "$EVAL_STEPS")
+    DEV_ARGS=(--dev-corruption-dir "$DEV_CORRUPTION_DIR" --eval-steps "$EVAL_STEPS"
+              --dev-batches "$DEV_BATCHES")
 fi
 
+K_DRAW=${K_DRAW:-"1-8"}
+EXCLUDE_FAMILIES=${EXCLUDE_FAMILIES:-""}
+LOFO_ARGS=()
+if [[ -n "$EXCLUDE_FAMILIES" ]]; then
+    LOFO_ARGS=(--exclude-families "$EXCLUDE_FAMILIES")
+fi
+TRANSFORM_COMPOSE_PROB=${TRANSFORM_COMPOSE_PROB:-0.15}
 TAGGER_STEPS=${TAGGER_STEPS:-10000}
 TAGGER_BATCH=${TAGGER_BATCH:-8}
 EDITOR_STEPS=${EDITOR_STEPS:-20000}
@@ -481,6 +490,7 @@ else
             --spacy-model "$SPACY_MODEL" \
             --target-samples "$CORRUPTION_SAMPLES" \
             --samples-per-shard "$CORRUPTION_SHARD" \
+            --transform-compose-prob "$TRANSFORM_COMPOSE_PROB" \
             --device "$DEVICE" \
             --seed "$SEED" \
             $RESUME_FLAG
@@ -503,6 +513,8 @@ else
             --max-steps "$EDITOR_STEPS" \
             --warmup-steps 500 \
             --proj-a-freeze-steps 1000 \
+            --k-amp "$K_DRAW" --k-sup "$K_DRAW" \
+            "${LOFO_ARGS[@]}" \
             --batch-size "$EDITOR_BATCH" \
             --num-workers "$NUM_WORKERS" \
             --save-steps 2000 \
@@ -528,6 +540,8 @@ else
             --max-steps "$TAGGER_STEPS" \
             --warmup-steps 500 \
             --proj-a-freeze-steps 500 \
+            --k-amp "$K_DRAW" --k-sup "$K_DRAW" \
+            "${LOFO_ARGS[@]}" \
             --batch-size "$TAGGER_BATCH" \
             --num-workers "$NUM_WORKERS" \
             --save-steps 2000 \

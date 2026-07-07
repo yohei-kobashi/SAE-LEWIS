@@ -22,7 +22,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_seed
 
 from data import CorruptionCollator, CorruptionDataset
-from intervene import diff_to_sparse
+from intervene import diff_to_sparse, draw_k, parse_k_spec
 from lewis_ops import NUM_OPS3, OP3_NAMES
 from model import load_sae_w_dec
 from resume_utils import (
@@ -79,6 +79,18 @@ def parse_args():
     # "null" records supply zero-conditioning supervision with the correct
     # all-KEEP gold. Set > 0 only when training on a pre-v3 cache.
     p.add_argument("--empty-cond-prob", type=float, default=0.0)
+    p.add_argument("--k-amp", default="1-8",
+                   help="Per-sample k_amp draw: 'LO-HI' uniform inclusive "
+                        "or fixed int. v4 used 1-4; the eval-time sweep "
+                        "showed dense specs (k=8) dominate, so v5 trains "
+                        "across the full range.")
+    p.add_argument("--k-sup", default="1-8",
+                   help="Per-sample k_sup draw; same syntax as --k-amp.")
+    p.add_argument("--exclude-families", default="",
+                   help="Comma list of transforms.FAMILIES keys: DROP "
+                        "transform records touching these families "
+                        "(leave-one-family-out generalization training; "
+                        "composed 'A+B' records drop if either is listed).")
 
     p.add_argument("--estimate-class-weights-batches", type=int, default=200,
                    help="Number of warmup batches used to estimate inverse-freq "
@@ -141,6 +153,13 @@ def _estimate_weights(
 
 def main():
     args = parse_args()
+    args._k_amp = parse_k_spec(args.k_amp)
+    args._k_sup = parse_k_spec(args.k_sup)
+    args._excluded = [x.strip() for x in
+                      args.exclude_families.split(",") if x.strip()]
+    if args._excluded:
+        print(f"[train] LOFO: excluding transform families "
+              f"{args._excluded}")
     set_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
@@ -211,7 +230,8 @@ def main():
         optim, args.warmup_steps, args.max_steps,
     )
 
-    ds = CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed)
+    ds = CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed,
+                  exclude_t_families=args._excluded)
     coll = CorruptionCollator(
         d_sae=d_sae, pad_token_id=tokenizer.pad_token_id,
         sep_token_id=sep_id, del_token_id=del_id,
@@ -224,7 +244,8 @@ def main():
     # Estimate class weights / pos_weight from a small warmup pass
     print("[tagger] estimating class weights ...")
     cw_iter = iter(DataLoader(
-        CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed + 1),
+        CorruptionDataset(args.corruption_dir, shuffle=True, seed=args.seed + 1,
+                  exclude_t_families=args._excluded),
         batch_size=args.batch_size, num_workers=0, collate_fn=coll,
     ))
     cw_batches = [next(cw_iter) for _ in range(args.estimate_class_weights_batches)]
@@ -272,8 +293,8 @@ def main():
                 for b in range(z_X.shape[0]):
                     a, sp = diff_to_sparse(
                         z_X[b], z_Xp[b], k_top=args.k_top,
-                        k_amp=int(dev_rng.integers(1, 5)),
-                        k_sup=int(dev_rng.integers(1, 5)),
+                        k_amp=draw_k(dev_rng, args._k_amp),
+                        k_sup=draw_k(dev_rng, args._k_sup),
                         rng=dev_rng, empty_conditioning_prob=0.0,
                     )
                     za[b], zs[b] = a, sp
@@ -363,10 +384,10 @@ def main():
         z_amp = torch.zeros_like(z_X)
         z_sup = torch.zeros_like(z_X)
         for b in range(B):
-            # {1..4}: the fully-empty case is handled by --empty-cond-prob
+            # Lower bound 1: the fully-empty case is handled by --empty-cond-prob
             # alone (same scheme as the editor).
-            k_amp = int(rng.integers(1, 5))
-            k_sup = int(rng.integers(1, 5))
+            k_amp = draw_k(rng, args._k_amp)
+            k_sup = draw_k(rng, args._k_sup)
             a, s = diff_to_sparse(
                 z_X[b], z_X_prime[b],
                 k_top=args.k_top, k_amp=k_amp, k_sup=k_sup,

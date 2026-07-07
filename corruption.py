@@ -84,6 +84,7 @@ from transformers import AutoTokenizer, set_seed
 import difflib
 
 from data import download_dolma_shards, iter_dolma_texts, iter_sentences
+from transforms import FAMILIES as TRANSFORM_FAMILIES
 from transforms import propose_transforms, roundtrip_ok
 from lewis_ops import OP_DEL, OP_INS, OP_KEEP, OP_REPL
 from model import MLMProvider, SAEFeatureExtractor, load_causal_gemma
@@ -224,6 +225,13 @@ def parse_args():
                         "transformation ops (0 disables v4).")
     p.add_argument("--transform-families", default="all",
                    help="'all' or comma list of transforms.FAMILIES keys.")
+    p.add_argument("--transform-compose-prob", type=float, default=0.15,
+                   help="Given an accepted transform T1(X), probability of "
+                        "chaining a SECOND family T2 (re-parsed, per-step "
+                        "round-trip) so the pair becomes (X, T2(T1(X))) "
+                        "with t_type 'A+B'. Teaches compositional feature "
+                        "semantics — unseen edits are often unseen "
+                        "COMBINATIONS of seen operations.")
     p.add_argument("--transform-slor-delta", type=float, default=1.5,
                    help="Symmetric fluency gate for transform pairs: "
                         "|SLOR(X) − SLOR(T(X))| must not exceed this "
@@ -2356,11 +2364,38 @@ def main():
                     ttype_counts[f"rtfail:{prop.family}"] += 1
                     reject_reasons["transform_roundtrip"] += 1
                 else:
+                    out_text = prop.out_text
+                    t_type = prop.t_type
+                    t_family = prop.family
+                    # Optional composition: chain a SECOND family on T1(X).
+                    # Each step is round-trip checked individually; the
+                    # symmetric SLOR gate below sees the composed pair.
+                    if rng.random() < float(args.transform_compose_prob):
+                        ttype_counts["compose_attempt"] += 1
+                        fams2 = [f for f in (args._families
+                                             or list(TRANSFORM_FAMILIES))
+                                 if f != prop.family]
+                        props2 = propose_transforms(
+                            stage.spacy_full, out_text, rng, families=fams2)
+                        by_fam2: Dict[str, list] = {}
+                        for pr2 in props2:
+                            if pr2.out_text != sent:
+                                by_fam2.setdefault(pr2.family, []).append(pr2)
+                        if by_fam2:
+                            fams2s = sorted(by_fam2)
+                            fp2 = by_fam2[fams2s[rng.randrange(len(fams2s))]]
+                            prop2 = fp2[rng.randrange(len(fp2))]
+                            if roundtrip_ok(stage.spacy_full, prop2,
+                                            out_text, rng):
+                                out_text = prop2.out_text
+                                t_type = f"{prop.t_type}+{prop2.t_type}"
+                                t_family = f"{prop.family}+{prop2.family}"
+                                ttype_counts["compose_accept"] += 1
                     source_id_t = f"dolma:s{sent_idx}"
                     # both directions: apply (X→T) and revert (T→X)
                     for clean, corr, tt in (
-                            (prop.out_text, sent, prop.t_type),
-                            (sent, prop.out_text, prop.t_type + "/rev")):
+                            (out_text, sent, t_type),
+                            (sent, out_text, t_type + "/rev")):
                         ps, pr = build_pair_sample(stage, clean, corr)
                         if ps is None:
                             reject_reasons[f"transform_{pr}"] += 1
@@ -2375,13 +2410,14 @@ def main():
                         pf["subset_kind"] = "full"
                         pf["n_parent"] = int(pf.get("N_total", 1))
                         pf["t_type"] = tt
+                        pf["t_family"] = t_family
                         if written < args.target_samples:
                             write_record(pf)
                             ttype_counts[f"acc:{tt}"] += 1
                             wrote_t += 1
                     # null record: corrupted side, all-KEEP, zero diff
                     if wrote_t and rng.random() < args.emit_null                             and written < args.target_samples:
-                        ns, nr = build_identity_sample(stage, prop.out_text)
+                        ns, nr = build_identity_sample(stage, out_text)
                         if ns is not None:
                             nf, _ = finalize_sample(
                                 stage, ns, source_id=source_id_t, args=args,
@@ -2391,6 +2427,7 @@ def main():
                                 nf["subset_kind"] = "null"
                                 nf["n_parent"] = 0
                                 nf["t_type"] = "null"
+                                nf["t_family"] = t_family
                                 write_record(nf)
             if wrote_t:
                 continue          # sentence consumed by the transform path
@@ -2543,6 +2580,7 @@ def main():
         "transform": {
             "transform_prob": float(args.transform_prob),
             "families": (args.transform_families),
+            "compose_prob": float(args.transform_compose_prob),
             "slor_delta": float(args.transform_slor_delta),
             "blocklist": args.blocklist or None,
             "cond_scope": args.cond_scope,

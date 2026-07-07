@@ -7,12 +7,14 @@ SAE-aware candidate ranker (see README §4.4).
               − η · num_INS_slots(c)
 
 - sae_align: cosine of pool-max SAE features with z_amp minus with z_sup
-- fluency:   tanh(meanLL(c) − meanLL(input)) under frozen causal Gemma.
-  A DELTA, not the absolute mean log-likelihood: absolute meanLL sits at
-  −3..−5 nats/token, where tanh is saturated at ≈ −1.0 for every candidate
-  (v4 error analysis: junk vs clean differed by 0.0003 — the component was
-  dead). The delta is centered at 0 (identity = exactly 0), so degraded
-  candidates go negative and genuinely more fluent edits go positive.
+- fluency:   min(0, tanh(meanLL(c) − meanLL(input))) under frozen causal
+  Gemma. A DELTA, not the absolute mean log-likelihood: absolute meanLL
+  sits at −3..−5 nats/token, where tanh is saturated at ≈ −1.0 for every
+  candidate (v4 error analysis: junk vs clean differed by 0.0003 — the
+  component was dead). CLIPPED at 0: a constraint, not an objective —
+  fluency gains must never beat the identity candidate, or the ranker
+  edits under empty conditioning (stylistically marked inputs get
+  "fluency-normalised" regardless of z).
 - content:   cosine between LLM2Vec sentence embeddings of input and candidate
 
 `fluency_gate` (opt-in, nats/token): candidates whose fluency delta falls
@@ -117,9 +119,15 @@ class Ranker:
 
         return {
             "sae_align": float(sa_amp - sa_sup),
-            # tanh-bounded meanLL DELTA vs input (identity = exactly 0;
-            # absolute meanLL saturates tanh at ≈ −1 for every candidate)
-            "fluency": math.tanh(fluency_delta),
+            # tanh-bounded meanLL DELTA vs input, CLIPPED at 0: fluency is
+            # a constraint, not an objective. Rewarding fluency GAINS turns
+            # the ranker into a generic "make it more fluent" editor that
+            # edits even under empty conditioning (LinguaLens k=8 run:
+            # empty-condition copy_rate fell 1.00 → 0.65). With the clip,
+            # the identity candidate (delta = 0) is never beaten on this
+            # component, so empty → no-edit is structural again; degraded
+            # candidates still go negative and the gate still applies.
+            "fluency": min(0.0, math.tanh(fluency_delta)),
             "content": content,
             "ins_slots": int(num_ins_slots),
         }

@@ -54,6 +54,26 @@ def build_intervention_vectors(
     return z_amp, z_sup
 
 
+def parse_k_spec(spec) -> tuple:
+    """Conditioning-count spec: 'LO-HI' (uniform inclusive) or a fixed int.
+
+    Shared by training (--k-amp/--k-sup, default '1-8') and evaluation
+    (eval_tagger_editor.py / scripts/sweep_eval_hparams.py) so both sides
+    draw from the same distribution family.
+    """
+    s = str(spec)
+    if "-" in s:
+        lo, hi = s.split("-", 1)
+        return int(lo), int(hi)
+    v = int(s)
+    return v, v
+
+
+def draw_k(rng, spec_lohi: tuple) -> int:
+    lo, hi = spec_lohi
+    return int(rng.integers(lo, hi + 1))
+
+
 def diff_to_sparse(
     z_X: torch.Tensor,
     z_X_prime: torch.Tensor,

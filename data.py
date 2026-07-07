@@ -328,6 +328,20 @@ class CorruptionDataset(IterableDataset):
         }
     """
 
+    # Pre-v5 transform records carry only t_type; map its prefix back to
+    # the transforms.FAMILIES key. v5+ records carry t_family directly.
+    _TTYPE_PREFIX2FAMILY = {
+        "TENSE": "TENSE", "ASPECT": "ASPECT", "MOD": "MODALITY",
+        "NUMBER": "NUMBER", "DEG": "DEGREE", "NEG": "NEGATION",
+        "DETQ": "DETQUANT", "ANA": "ANAPHOR", "VOICE": "VOICE",
+        "Q": "INTERROG", "EXIST": "EXISTENTIAL", "VAL": "VALENCY",
+        "TOUGH": "TOUGH", "ELL": "ELLIPSIS", "CLEFT": "CLEFT",
+        "INV": "INVERSION", "SPLIT": "SPLITJOIN", "JOIN": "SPLITJOIN",
+        "PRT": "PARTICLE", "DAT": "DATIVE", "ADV": "ADVPLACE",
+        "PP": "PPFRONT", "CTR": "CONTRACT", "CZR": "COMPZR",
+        "NF": "NONFIN", "QI": "QUOTINV",
+    }
+
     def __init__(
         self,
         cache_dir: str,
@@ -335,7 +349,13 @@ class CorruptionDataset(IterableDataset):
         seed: int = 42,
         infinite: bool = True,
         glob_pattern: str = "shard-*.jsonl.gz",
+        exclude_t_families: Optional[List[str]] = None,
+        only_t_families: Optional[List[str]] = None,
     ):
+        """exclude_t_families: drop transform records touching any of these
+        families (LOFO training side; composed 'A+B' drops if either is
+        listed). only_t_families: keep ONLY transform records touching one
+        of these families (LOFO evaluation side)."""
         self.cache_dir = Path(cache_dir)
         self.shards = sorted(self.cache_dir.glob(glob_pattern))
         if not self.shards:
@@ -345,6 +365,8 @@ class CorruptionDataset(IterableDataset):
         self.shuffle = shuffle
         self.seed = seed
         self.infinite = infinite
+        self.exclude_t_families = set(exclude_t_families or [])
+        self.only_t_families = set(only_t_families or [])
         meta_path = self.cache_dir / "meta.json"
         self.meta: Dict = json.loads(meta_path.read_text()) if meta_path.exists() else {}
         self.d_sae = int(self.meta.get("d_sae", 0))
@@ -370,6 +392,33 @@ class CorruptionDataset(IterableDataset):
             print(f"[CorruptionDataset] {path.name} is truncated "
                   f"(interrupted corruption run?) — using the readable "
                   f"prefix and continuing.")
+
+    def _record_families(self, rec: Dict) -> List[str]:
+        """Transform families a record touches ([] for lexical buckets)."""
+        if rec.get("bucket") != "transform":
+            return []
+        fam = rec.get("t_family")
+        if fam:
+            return fam.split("+")
+        tt = rec.get("t_type", "")
+        if not tt or tt == "null":
+            return []
+        fams = []
+        for part in tt.split("+"):
+            pref = part.split("/", 1)[0].split(":", 1)[0]
+            fams.append(self._TTYPE_PREFIX2FAMILY.get(pref, pref))
+        return fams
+
+    def _keep(self, rec: Dict) -> bool:
+        if not self.exclude_t_families and not self.only_t_families:
+            return True
+        fams = self._record_families(rec)
+        if self.exclude_t_families and any(
+                f in self.exclude_t_families for f in fams):
+            return False
+        if self.only_t_families:
+            return any(f in self.only_t_families for f in fams)
+        return True
 
     def __iter__(self) -> Iterator[Dict]:
         worker = get_worker_info()
@@ -400,6 +449,8 @@ class CorruptionDataset(IterableDataset):
             n_yielded = 0
             for i in order:
                 for rec in self._iter_shard(shards[i]):
+                    if not self._keep(rec):
+                        continue
                     n_yielded += 1
                     yield rec
             if n_yielded == 0:

@@ -54,7 +54,7 @@ from transformers import AutoTokenizer, set_seed
 
 from data import CorruptionCollator, CorruptionDataset
 from editor import load_editor_from_checkpoint
-from intervene import diff_to_sparse
+from intervene import diff_to_sparse, parse_k_spec
 from lewis_ops import NUM_OPS3, OP3_NAMES
 from tagger import load_tagger_from_checkpoint
 
@@ -84,6 +84,10 @@ def parse_args():
                    help="Per-sample k_sup draw; same syntax as --k-amp.")
     p.add_argument("--ins-threshold", type=float, default=0.5,
                    help="Sigmoid threshold for the tagger's insert head.")
+    p.add_argument("--only-families", default="",
+                   help="Comma list of transforms.FAMILIES keys: evaluate "
+                        "ONLY transform records touching these families "
+                        "(the held-out side of a LOFO experiment).")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
@@ -93,14 +97,7 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Paired conditioning construction
 # ---------------------------------------------------------------------------
-def _parse_k_spec(spec) -> Tuple[int, int]:
-    """'LO-HI' → uniform inclusive range; a bare int → fixed value."""
-    s = str(spec)
-    if "-" in s:
-        lo, hi = s.split("-", 1)
-        return int(lo), int(hi)
-    v = int(s)
-    return v, v
+_parse_k_spec = parse_k_spec        # shared with training (intervene.py)
 
 
 def build_conditions(
@@ -554,8 +551,11 @@ def _dtype(s: str) -> torch.dtype:
 
 
 def make_loader(args, d_sae: int, tok) -> DataLoader:
+    only = [x.strip() for x in
+            getattr(args, "only_families", "").split(",") if x.strip()]
     ds = CorruptionDataset(args.corruption_dir, shuffle=False,
-                           seed=args.seed, infinite=False)
+                           seed=args.seed, infinite=False,
+                           only_t_families=only or None)
     coll = CorruptionCollator(
         d_sae=d_sae, pad_token_id=tok.pad_token_id,
         sep_token_id=tok.convert_tokens_to_ids("[SEP]"),
