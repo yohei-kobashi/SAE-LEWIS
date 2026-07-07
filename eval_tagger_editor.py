@@ -76,7 +76,12 @@ def parse_args():
     p.add_argument("--max-samples", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--k-top", type=int, default=8,
-                   help="Diff candidate pool size (match training).")
+                   help="Diff candidate pool size (training used 8).")
+    p.add_argument("--k-amp", default="1-4",
+                   help="Per-sample k_amp draw: 'LO-HI' (uniform incl.) or "
+                        "a fixed int. Training used '1-4'.")
+    p.add_argument("--k-sup", default="1-4",
+                   help="Per-sample k_sup draw; same syntax as --k-amp.")
     p.add_argument("--ins-threshold", type=float, default=0.5,
                    help="Sigmoid threshold for the tagger's insert head.")
     p.add_argument("--device", default="cuda")
@@ -88,20 +93,38 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Paired conditioning construction
 # ---------------------------------------------------------------------------
+def _parse_k_spec(spec) -> Tuple[int, int]:
+    """'LO-HI' → uniform inclusive range; a bare int → fixed value."""
+    s = str(spec)
+    if "-" in s:
+        lo, hi = s.split("-", 1)
+        return int(lo), int(hi)
+    v = int(s)
+    return v, v
+
+
 def build_conditions(
     z_X: torch.Tensor,          # (B, d_sae)
     z_X_prime: torch.Tensor,    # (B, d_sae)
     k_top: int,
     rng: np.random.Generator,
+    k_amp_spec: str = "1-4",
+    k_sup_spec: str = "1-4",
+    conditions: Optional[List[str]] = None,
 ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
-    """Build the three paired (z_amp, z_sup) variants for a batch.
+    """Build the paired (z_amp, z_sup) variants for a batch.
 
-    The per-sample k_amp / k_sup draw matches the training distribution
-    (uniform over {1..4}) and empty-conditioning is disabled so every
-    sample carries signal under `true`. `random` reuses the exact nonzero
-    counts and (permuted) magnitudes of `true` at uniformly random feature
-    indices, so any accuracy gap vs `true` isolates feature IDENTITY.
+    The default per-sample k_amp / k_sup draw matches the training
+    distribution (uniform over {1..4}; override via k specs) and
+    empty-conditioning is disabled so every sample carries signal under
+    `true`. `random` reuses the exact nonzero counts and (permuted)
+    magnitudes of `true` at uniformly random feature indices, so any
+    accuracy gap vs `true` isolates feature IDENTITY. Only the requested
+    `conditions` are built (hyperparameter sweeps use ["true"] alone).
     """
+    conditions = list(CONDITIONS) if conditions is None else list(conditions)
+    amp_lo, amp_hi = _parse_k_spec(k_amp_spec)
+    sup_lo, sup_hi = _parse_k_spec(k_sup_spec)
     B, d_sae = z_X.shape
     amp_t = torch.zeros_like(z_X)
     sup_t = torch.zeros_like(z_X)
@@ -109,8 +132,8 @@ def build_conditions(
     sup_r = torch.zeros_like(z_X)
 
     for b in range(B):
-        k_amp = int(rng.integers(1, 5))
-        k_sup = int(rng.integers(1, 5))
+        k_amp = int(rng.integers(amp_lo, amp_hi + 1))
+        k_sup = int(rng.integers(sup_lo, sup_hi + 1))
         a, s = diff_to_sparse(
             z_X[b], z_X_prime[b],
             k_top=k_top, k_amp=k_amp, k_sup=k_sup,
@@ -118,6 +141,8 @@ def build_conditions(
         )
         amp_t[b] = a
         sup_t[b] = s
+        if "random" not in conditions:
+            continue
         for true_vec, rand_vec in ((a, amp_r), (s, sup_r)):
             nz = (true_vec > 0).nonzero(as_tuple=True)[0]
             if len(nz) == 0:
@@ -129,60 +154,84 @@ def build_conditions(
                 rand_vec[b, int(i)] = float(v)
 
     zeros = torch.zeros_like(z_X)
-    return {
+    all_variants = {
         "true": (amp_t, sup_t),
         "empty": (zeros, zeros.clone()),
         "random": (amp_r, sup_r),
     }
+    return {c: all_variants[c] for c in conditions}
 
 
 # ---------------------------------------------------------------------------
 # Tagger evaluation
 # ---------------------------------------------------------------------------
-def eval_tagger(args, d_sae: int, loader) -> Dict:
-    dtype = _dtype(args.llm_dtype)
-    print(f"[eval] loading tagger from {args.tagger_ckpt}")
-    tagger = load_tagger_from_checkpoint(
-        args.llm2vec_dir, args.tagger_ckpt, d_sae=d_sae, dtype=dtype,
-    ).to(args.device)
-    tagger.eval()
+def eval_tagger(args, d_sae: int, loader, tagger=None,
+                conditions: Optional[List[str]] = None,
+                ins_thresholds: Optional[List[float]] = None) -> Dict:
+    """Level 1+2 tagger metrics.
+
+    tagger        : pass a preloaded model to skip load/free (sweeps call
+                    this repeatedly under different args).
+    conditions    : subset of CONDITIONS (default: all three).
+    ins_thresholds: extra INS thresholds evaluated from the SAME forwards
+                    (reported under conditions[c]["ins_by_threshold"];
+                    the primary args.ins_threshold drives "ins" and the
+                    span IoU as before).
+    """
+    conds_list = list(CONDITIONS) if conditions is None else list(conditions)
+    own_model = tagger is None
+    if own_model:
+        dtype = _dtype(args.llm_dtype)
+        print(f"[eval] loading tagger from {args.tagger_ckpt}")
+        tagger = load_tagger_from_checkpoint(
+            args.llm2vec_dir, args.tagger_ckpt, d_sae=d_sae, dtype=dtype,
+        ).to(args.device)
+        tagger.eval()
+    thresholds = [float(args.ins_threshold)] + [
+        float(t) for t in (ins_thresholds or [])
+        if float(t) != float(args.ins_threshold)]
 
     rng = np.random.default_rng(args.seed)
-    conf = {c: np.zeros((NUM_OPS3, NUM_OPS3), dtype=np.int64) for c in CONDITIONS}
-    ins_cnt = {c: defaultdict(int) for c in CONDITIONS}   # tp/fp/fn/tn
-    iou_sum = {c: 0.0 for c in CONDITIONS}
-    iou_n = {c: 0 for c in CONDITIONS}
+    conf = {c: np.zeros((NUM_OPS3, NUM_OPS3), dtype=np.int64) for c in conds_list}
+    ins_cnt = {c: {t: defaultdict(int) for t in thresholds}
+               for c in conds_list}                        # tp/fp/fn/tn
+    iou_sum = {c: 0.0 for c in conds_list}
+    iou_n = {c: 0 for c in conds_list}
     seen = 0
 
     for batch in tqdm(loader, desc="[eval:tagger]", unit="batch"):
         conds = build_conditions(batch["z_X"], batch["z_X_prime"],
-                                 args.k_top, rng)
+                                 args.k_top, rng,
+                                 k_amp_spec=getattr(args, "k_amp", "1-4"),
+                                 k_sup_spec=getattr(args, "k_sup", "1-4"),
+                                 conditions=conds_list)
         ids = batch["tagger_input_ids"].to(args.device)
         attn = batch["tagger_attention_mask"].to(args.device)
         op_gold = batch["tagger_op3_gold"]
         ins_gold = batch["tagger_ins_gold"]
         valid = op_gold != -100
 
-        for c in CONDITIONS:
+        for c in conds_list:
             z_amp, z_sup = conds[c]
             with torch.no_grad():
                 out = tagger(ids, attn,
                              z_amp.to(args.device), z_sup.to(args.device))
             op_pred = out["op_logits"].argmax(dim=-1).cpu()
-            ins_pred = (torch.sigmoid(out["ins_logits"].float().cpu())
-                        >= args.ins_threshold).long()
+            ins_prob = torch.sigmoid(out["ins_logits"].float().cpu())
+            ins_pred = (ins_prob >= args.ins_threshold).long()
 
             g = op_gold[valid].numpy()
             p = op_pred[valid].numpy()
             np.add.at(conf[c], (g, p), 1)
 
             ig = ins_gold[valid]
-            ip = ins_pred[valid]
-            ic = ins_cnt[c]
-            ic["tp"] += int(((ig == 1) & (ip == 1)).sum())
-            ic["fp"] += int(((ig == 0) & (ip == 1)).sum())
-            ic["fn"] += int(((ig == 1) & (ip == 0)).sum())
-            ic["tn"] += int(((ig == 0) & (ip == 0)).sum())
+            for t in thresholds:
+                ip_t = (ins_prob >= t).long()[valid]
+                ic = ins_cnt[c][t]
+                ic["tp"] += int(((ig == 1) & (ip_t == 1)).sum())
+                ic["fp"] += int(((ig == 0) & (ip_t == 1)).sum())
+                ic["fn"] += int(((ig == 1) & (ip_t == 0)).sum())
+                ic["tn"] += int(((ig == 0) & (ip_t == 0)).sum())
 
             # Edit-span IoU per sample: union of both heads' edit positions
             # (op3 != KEEP or ins fired) vs the gold union.
@@ -202,11 +251,14 @@ def eval_tagger(args, d_sae: int, loader) -> Dict:
             break
 
     metrics = {"n_samples": seen, "conditions": {}}
-    for c in CONDITIONS:
+    for c in conds_list:
         m = _prf_from_confusion(conf[c])
         m["span_iou"] = iou_sum[c] / max(1, iou_n[c])
         m["confusion"] = conf[c].tolist()
-        m["ins"] = _prf_binary(ins_cnt[c])
+        m["ins"] = _prf_binary(ins_cnt[c][thresholds[0]])
+        if len(thresholds) > 1:
+            m["ins_by_threshold"] = {
+                f"{t:g}": _prf_binary(ins_cnt[c][t]) for t in thresholds}
         metrics["conditions"][c] = m
 
     # All-KEEP baseline from the gold marginal (same for every condition)
@@ -219,10 +271,11 @@ def eval_tagger(args, d_sae: int, loader) -> Dict:
         "cond_scale": float(tagger.cond_scale.item()),
         "proj_a_weight_norm": float(tagger.proj_a.weight.norm().item()),
     }
-    del tagger
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if own_model:
+        del tagger
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return metrics
 
 
@@ -261,13 +314,17 @@ def _prf_from_confusion(conf: np.ndarray) -> Dict:
 # ---------------------------------------------------------------------------
 # Editor evaluation
 # ---------------------------------------------------------------------------
-def eval_editor(args, d_sae: int, loader, tok) -> Dict:
-    dtype = _dtype(args.llm_dtype)
-    print(f"[eval] loading editor from {args.editor_ckpt}")
-    editor = load_editor_from_checkpoint(
-        args.llm2vec_dir, args.editor_ckpt, d_sae=d_sae, dtype=dtype,
-    ).to(args.device)
-    editor.eval()
+def eval_editor(args, d_sae: int, loader, tok, editor=None,
+                conditions: Optional[List[str]] = None) -> Dict:
+    conds_list = list(CONDITIONS) if conditions is None else list(conditions)
+    own_model = editor is None
+    if own_model:
+        dtype = _dtype(args.llm_dtype)
+        print(f"[eval] loading editor from {args.editor_ckpt}")
+        editor = load_editor_from_checkpoint(
+            args.llm2vec_dir, args.editor_ckpt, d_sae=d_sae, dtype=dtype,
+        ).to(args.device)
+        editor.eval()
 
     mask_id = int(tok.mask_token_id)
     ins_id = int(tok.convert_tokens_to_ids("[INS]"))
@@ -276,12 +333,15 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
     marker_ids = torch.tensor([mask_id, ins_id, sep_id, del_id])
 
     rng = np.random.default_rng(args.seed)
-    agg = {c: defaultdict(float) for c in CONDITIONS}
+    agg = {c: defaultdict(float) for c in conds_list}
     seen = 0
 
     for batch in tqdm(loader, desc="[eval:editor]", unit="batch"):
         conds = build_conditions(batch["z_X"], batch["z_X_prime"],
-                                 args.k_top, rng)
+                                 args.k_top, rng,
+                                 k_amp_spec=getattr(args, "k_amp", "1-4"),
+                                 k_sup_spec=getattr(args, "k_sup", "1-4"),
+                                 conditions=conds_list)
         ids = batch["editor_input_ids"].to(args.device)
         attn = batch["editor_attention_mask"].to(args.device)
         tgt = batch["editor_target_ids"]
@@ -293,7 +353,7 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
         is_ins = (batch["editor_input_ids"] == ins_id) & valid
         is_keep = valid & ~is_repl & ~is_ins
 
-        for c in CONDITIONS:
+        for c in conds_list:
             z_amp, z_sup = conds[c]
             with torch.no_grad():
                 out = editor(ids, attn,
@@ -326,7 +386,7 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
             break
 
     metrics = {"n_samples": seen, "conditions": {}}
-    for c in CONDITIONS:
+    for c in conds_list:
         a = agg[c]
         m = {"mean_loss": a["loss_sum"] / max(1, a["loss_n"])}
         for key in ("keep", "repl", "ins"):
@@ -346,10 +406,11 @@ def eval_editor(args, d_sae: int, loader, tok) -> Dict:
             for slot, (name, _tid) in enumerate(editor.train_token_ids.items())
         } if editor.delta_emb.numel() > 0 else {},
     }
-    del editor
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if own_model:
+        del editor
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return metrics
 
 
