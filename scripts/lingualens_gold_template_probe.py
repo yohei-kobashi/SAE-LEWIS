@@ -89,6 +89,15 @@ def parse_args():
     p.add_argument("--pool-topk", type=int, default=64)
     p.add_argument("--conditions", default="true,empty")
     p.add_argument("--modes", default=",".join(MODES))
+    p.add_argument("--steer-lambdas", default="",
+                   help="Comma floats; each λ adds a 'lens{λ}' decode "
+                        "variant (true condition only): parallel fill "
+                        "plus a logit bias λ·norm(W_U @ (z_amp − z_sup) "
+                        "W_dec) — the SAE's own feature→token dictionary "
+                        "(README A-1), bypassing the learned conditioning "
+                        "readout entirely. The bias is std-normalised "
+                        "over the vocab, so λ is in logit units. "
+                        "Suggested sweep: '0.5,1,2,4'.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     return p.parse_args()
@@ -151,6 +160,7 @@ def fill_template(
     z_sup: torch.Tensor,
     marker_ids: List[int],
     device: str,
+    logit_bias: torch.Tensor = None,   # (V,) added at every edit position
 ) -> Tuple[List[int], List[Dict]]:
     """Fill the template's edit positions; return (filled template-segment
     ids, per-position results). top-5 is taken from the logits available
@@ -163,6 +173,8 @@ def fill_template(
                      z_amp=z_amp, z_sup=z_sup)
         lg = out["logits"][0, tpl_start:].float()
         lg[:, marker_ids] = float("-inf")
+        if logit_bias is not None:
+            lg = lg + logit_bias           # -inf markers stay -inf
         return lg
 
     results: List[Dict] = []
@@ -209,6 +221,9 @@ def main():
     for m in modes:
         if m not in MODES:
             raise SystemExit(f"unknown mode {m!r}; pick from {MODES}")
+    lambdas = [float(x) for x in args.steer_lambdas.split(",") if x.strip()]
+    lens_modes = [f"lens{lam:g}" for lam in lambdas]
+    all_modes = modes + lens_modes
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
@@ -242,12 +257,30 @@ def main():
         sae_layer=args.sae_layer, sae_type=args.sae_type, sae_k=args.sae_k,
     ).to(args.device).eval()
 
+    # A-1 logit-lens machinery: feature row f of W_dec is a residual
+    # direction; unembedding it gives the token distribution that feature
+    # pushes — a feature→content dictionary that needs no training.
+    w_dec = head_w = None
+    if lambdas:
+        from model import load_sae_w_dec
+        w_dec = load_sae_w_dec(args.sae_repo, args.sae_path).to(args.device)
+        head_w = editor.lm_head.weight.detach().float().to(args.device)
+        print(f"[probe] logit-lens bias enabled: λ ∈ {lambdas} "
+              f"(W_dec {tuple(w_dec.shape)} → vocab {head_w.shape[0]})")
+
+    def lens_bias(z_amp_v: torch.Tensor, z_sup_v: torch.Tensor):
+        """(V,) std-normalised logit bias for one pair's conditioning."""
+        d = (z_amp_v.to(args.device) - z_sup_v.to(args.device)) @ w_dec
+        lb = head_w @ d
+        return lb / (lb.std() + 1e-8)
+
     # tok[cond][mode] counters; pairagg[cond][mode][key] lists
-    tok = {c: {m: defaultdict(int) for m in modes} for c in conditions}
-    pairagg = {c: {m: defaultdict(list) for m in modes} for c in conditions}
+    tok = {c: {m: defaultdict(int) for m in all_modes} for c in conditions}
+    pairagg = {c: {m: defaultdict(list) for m in all_modes}
+               for c in conditions}
     # bucketed, true condition only
-    btok = {m: defaultdict(lambda: defaultdict(int)) for m in modes}
-    bpair = {m: defaultdict(lambda: defaultdict(list)) for m in modes}
+    btok = {m: defaultdict(lambda: defaultdict(int)) for m in all_modes}
+    bpair = {m: defaultdict(lambda: defaultdict(list)) for m in all_modes}
     records: List[Dict] = []
     skipped_no_fill = 0
     gold_mismatch = 0
@@ -296,10 +329,17 @@ def main():
             za = zvar[c][0].unsqueeze(0).to(args.device)
             zs = zvar[c][1].unsqueeze(0).to(args.device)
             rec["outputs"][c] = {}
-            for m in modes:
+            runs = [(m, m, None) for m in modes]
+            if lambdas and c == "true":
+                with torch.no_grad():
+                    lb = lens_bias(zvar[c][0], zvar[c][1])
+                runs += [(name, "parallel", lam * lb)
+                         for name, lam in zip(lens_modes, lambdas)]
+            for m, decode_mode, bias in runs:
                 seg, results = fill_template(
-                    m, full, tpl_start, edit_pos, gold_seg,
-                    editor, za, zs, marker_ids, args.device)
+                    decode_mode, full, tpl_start, edit_pos, gold_seg,
+                    editor, za, zs, marker_ids, args.device,
+                    logit_bias=bias)
                 out_ids = ([bos_id] if offset else []) + seg
                 out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
                 pm = pair_metrics(out_text, src, tgt)
@@ -354,9 +394,11 @@ def main():
                "gold_mismatch": gold_mismatch, "conditions": {}}
     for c in conditions:
         payload["conditions"][c] = {}
-        for m in modes:
+        for m in all_modes:
             t = tok[c][m]
             pa = pairagg[c][m]
+            if not t["n"]:
+                continue                    # lens modes run under true only
             row = {
                 "tok_top1": _tokrow(t, "top1", "n"),
                 "tok_top5": _tokrow(t, "top5", "n"),
@@ -372,20 +414,21 @@ def main():
                 f"| {row['exact']:.4f} | {row['sim_target']:.4f} |")
     lines.append("")
 
+    bmodes = [m for m in all_modes if btok[m]]
     lines += ["## Multi-site breakdown (condition = true)", "",
               "| n_edit | pairs | "
-              + " | ".join(f"{m} top-1" for m in modes) + " | "
-              + " | ".join(f"{m} exact" for m in modes) + " |",
-              "|---|---|" + "---|" * (2 * len(modes))]
+              + " | ".join(f"{m} top-1" for m in bmodes) + " | "
+              + " | ".join(f"{m} exact" for m in bmodes) + " |",
+              "|---|---|" + "---|" * (2 * len(bmodes))]
     payload["buckets"] = {}
     for _lo, _hi, name in EDIT_BUCKETS:
-        n_pairs = len(bpair[modes[0]][name]["exact"]) \
-            if modes and name in bpair[modes[0]] else 0
+        n_pairs = len(bpair[bmodes[0]][name]["exact"]) \
+            if bmodes and name in bpair[bmodes[0]] else 0
         if not n_pairs:
             continue
         row = {"pairs": n_pairs}
         cells_acc, cells_ex = [], []
-        for m in modes:
+        for m in bmodes:
             bt = btok[m][name]
             acc = _tokrow(bt, "top1", "n")
             ex = float(np.mean(bpair[m][name]["exact"]))
@@ -407,6 +450,11 @@ def main():
         "sequential infilling is the architectural fix.",
         "- both low, true ≈ empty → fill content itself does not transfer "
         "OOD; decode order is a sideshow.",
+        "- lens{λ} ≫ parallel → the SAE's own feature→token dictionary "
+        "(W_U · W_dec) recovers content the LEARNED readout cannot: "
+        "replace/augment the conditioning readout with the dictionary "
+        "instead of retraining on more data. λ too high degrades REPL "
+        "grammar fit — pick the knee.",
         "",
     ]
     (out_dir / "probe_report.md").write_text("\n".join(lines))
