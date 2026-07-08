@@ -393,8 +393,11 @@ class CorruptionDataset(IterableDataset):
                   f"(interrupted corruption run?) — using the readable "
                   f"prefix and continuing.")
 
-    def _record_families(self, rec: Dict) -> List[str]:
-        """Transform families a record touches ([] for lexical buckets)."""
+    @classmethod
+    def _record_families(cls, rec: Dict) -> List[str]:
+        """Transform families a record touches ([] for lexical buckets).
+        Classmethod so CorruptionCollator can label batches without a
+        dataset instance (per-family eval breakdown)."""
         if rec.get("bucket") != "transform":
             return []
         fam = rec.get("t_family")
@@ -406,7 +409,7 @@ class CorruptionDataset(IterableDataset):
         fams = []
         for part in tt.split("+"):
             pref = part.split("/", 1)[0].split(":", 1)[0]
-            fams.append(self._TTYPE_PREFIX2FAMILY.get(pref, pref))
+            fams.append(cls._TTYPE_PREFIX2FAMILY.get(pref, pref))
         return fams
 
     def _keep(self, rec: Dict) -> bool:
@@ -508,6 +511,11 @@ class CorruptionCollator:
       z_X                    (B, d_sae) float32    pool-max top-K_train
       z_X_prime              (B, d_sae) float32
       ins_span_length        (B,) long
+
+    Plus two non-tensor lists for per-family eval breakdowns:
+      families               List[List[str]]  transform families per record
+                             ([] for lexical buckets; 2 entries = composed)
+      buckets                List[str]        record bucket per record
     """
 
     def __init__(
@@ -603,4 +611,6 @@ class CorruptionCollator:
             "z_X": z_X,
             "z_X_prime": z_X_prime,
             "ins_span_length": ins_span_length,
+            "families": [CorruptionDataset._record_families(r) for r in batch],
+            "buckets": [str(r.get("bucket", "?")) for r in batch],
         }

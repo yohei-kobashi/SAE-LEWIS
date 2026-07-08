@@ -44,10 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data import CorruptionCollator, CorruptionDataset            # noqa: E402
 from editor import load_editor_from_checkpoint                    # noqa: E402
-from intervene import diff_to_sparse                              # noqa: E402
+from intervene import diff_to_sparse, draw_k, parse_k_spec        # noqa: E402
 
 K_LIST = (1, 5, 10, 50, 100)
-FEAT_BUCKETS = ("empty", "1-2", "3-4", "5-8")
+FEAT_BUCKETS = ("empty", "1-2", "3-4", "5-8", "9-16", "17-32", "33+")
 
 
 def parse_args():
@@ -59,6 +59,12 @@ def parse_args():
     p.add_argument("--max-samples", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--k-top", type=int, default=8)
+    p.add_argument("--k-amp", default="1-4",
+                   help="Per-sample k_amp draw ('LO-HI' uniform, "
+                        "'log:LO-HI', or a fixed int). Measure at the "
+                        "eval operating point, not just the training draw.")
+    p.add_argument("--k-sup", default="1-4",
+                   help="Per-sample k_sup draw; same syntax as --k-amp.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
@@ -68,11 +74,11 @@ def parse_args():
 def feat_bucket(n: int) -> str:
     if n == 0:
         return "empty"
-    if n <= 2:
-        return "1-2"
-    if n <= 4:
-        return "3-4"
-    return "5-8"
+    for hi, name in ((2, "1-2"), (4, "3-4"), (8, "5-8"),
+                     (16, "9-16"), (32, "17-32")):
+        if n <= hi:
+            return name
+    return "33+"
 
 
 def main():
@@ -106,6 +112,8 @@ def main():
                         collate_fn=coll)
 
     rng = np.random.default_rng(args.seed)
+    amp_spec = parse_k_spec(args.k_amp)
+    sup_spec = parse_k_spec(args.k_sup)
     max_k = max(K_LIST)
     # hits[cond][pos_type][bucket][k] ; n[cond][pos_type][bucket]
     hits = {c: {pt: defaultdict(lambda: defaultdict(int))
@@ -120,8 +128,8 @@ def main():
         z_sup = torch.zeros_like(batch["z_X"])
         n_feats = []
         for b in range(B):
-            k_amp = int(rng.integers(1, 5))
-            k_sup = int(rng.integers(1, 5))
+            k_amp = draw_k(rng, amp_spec)
+            k_sup = draw_k(rng, sup_spec)
             a, s = diff_to_sparse(
                 batch["z_X"][b], batch["z_X_prime"][b],
                 k_top=args.k_top, k_amp=k_amp, k_sup=k_sup,
@@ -177,7 +185,9 @@ def main():
         return n, row
 
     lines = ["# Editor headroom: gold-in-top-k", "",
-             f"samples: {seen}  (cache: {args.corruption_dir})", ""]
+             f"samples: {seen}  (cache: {args.corruption_dir})",
+             f"conditioning: k_top={args.k_top} k_amp={args.k_amp} "
+             f"k_sup={args.k_sup}", ""]
     payload = {"n_samples": seen, "tables": {}}
     for pt in ("repl", "ins"):
         lines += [f"## {pt.upper()} positions", "",
@@ -189,7 +199,9 @@ def main():
         lines.append(f"| true (all) | {n} |" +
                      "".join(f" {row[k]:.4f} |" for k in K_LIST))
         tbl["true_all"] = {"n": n, **{f"top{k}": row[k] for k in K_LIST}}
-        for b in ("1-2", "3-4", "5-8"):
+        for b in FEAT_BUCKETS:
+            if b == "empty" or not counts["true"][pt][b]:
+                continue
             n, row = agg("true", pt, [b])
             lines.append(f"| true, {b} feats | {n} |" +
                          "".join(f" {row[k]:.4f} |" for k in K_LIST))

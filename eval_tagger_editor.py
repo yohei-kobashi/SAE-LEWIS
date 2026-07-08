@@ -88,6 +88,11 @@ def parse_args():
                    help="Comma list of transforms.FAMILIES keys: evaluate "
                         "ONLY transform records touching these families "
                         "(the held-out side of a LOFO experiment).")
+    p.add_argument("--per-family", action="store_true",
+                   help="Additionally break Level-1 metrics down by "
+                        "transform family / lexical bucket (true condition "
+                        "only, single pass; composed records count toward "
+                        "each constituent family and a '(composed)' row).")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     p.add_argument("--seed", type=int, default=42)
@@ -159,6 +164,19 @@ def build_conditions(
     return {c: all_variants[c] for c in conditions}
 
 
+def _sample_groups(batch: Dict, b: int) -> List[str]:
+    """Breakdown groups one sample belongs to. Transform records map to
+    their family (both constituents for composed records, plus a
+    '(composed)' aggregate row); lexical records map to their bucket."""
+    fams = batch["families"][b]
+    if not fams:
+        return [f"lex:{batch['buckets'][b]}"]
+    groups = list(fams)
+    if len(fams) > 1:
+        groups.append("(composed)")
+    return groups
+
+
 # ---------------------------------------------------------------------------
 # Tagger evaluation
 # ---------------------------------------------------------------------------
@@ -194,6 +212,11 @@ def eval_tagger(args, d_sae: int, loader, tagger=None,
                for c in conds_list}                        # tp/fp/fn/tn
     iou_sum = {c: 0.0 for c in conds_list}
     iou_n = {c: 0 for c in conds_list}
+    per_fam = bool(getattr(args, "per_family", False)) and "true" in conds_list
+    fam_conf = defaultdict(lambda: np.zeros((NUM_OPS3, NUM_OPS3), dtype=np.int64))
+    fam_ins = defaultdict(lambda: defaultdict(int))        # primary threshold
+    fam_iou = defaultdict(lambda: [0.0, 0])
+    fam_n = defaultdict(int)
     seen = 0
 
     for batch in tqdm(loader, desc="[eval:tagger]", unit="batch"):
@@ -239,9 +262,26 @@ def eval_tagger(args, d_sae: int, loader, tagger=None,
                 pe = set(((op_pred[b][v] > 0) | (ins_pred[b][v] == 1))
                          .nonzero(as_tuple=True)[0].tolist())
                 union = ge | pe
-                if union:
-                    iou_sum[c] += len(ge & pe) / len(union)
+                iou_b = len(ge & pe) / len(union) if union else None
+                if iou_b is not None:
+                    iou_sum[c] += iou_b
                     iou_n[c] += 1
+                if not (per_fam and c == "true"):
+                    continue
+                gb = op_gold[b][v].numpy()
+                pb = op_pred[b][v].numpy()
+                igb = ins_gold[b][v]
+                ipb = ins_pred[b][v]
+                for grp in _sample_groups(batch, b):
+                    fam_n[grp] += 1
+                    np.add.at(fam_conf[grp], (gb, pb), 1)
+                    ic = fam_ins[grp]
+                    ic["tp"] += int(((igb == 1) & (ipb == 1)).sum())
+                    ic["fp"] += int(((igb == 0) & (ipb == 1)).sum())
+                    ic["fn"] += int(((igb == 1) & (ipb == 0)).sum())
+                    if iou_b is not None:
+                        fam_iou[grp][0] += iou_b
+                        fam_iou[grp][1] += 1
 
         seen += ids.shape[0]
         if seen >= args.max_samples:
@@ -257,6 +297,17 @@ def eval_tagger(args, d_sae: int, loader, tagger=None,
             m["ins_by_threshold"] = {
                 f"{t:g}": _prf_binary(ins_cnt[c][t]) for t in thresholds}
         metrics["conditions"][c] = m
+
+    if per_fam:
+        metrics["per_family"] = {
+            grp: {
+                "n_samples": fam_n[grp],
+                "macro_f1": _prf_from_confusion(fam_conf[grp])["macro_f1"],
+                "ins_f1": _prf_binary(fam_ins[grp])["f1"],
+                "span_iou": fam_iou[grp][0] / max(1, fam_iou[grp][1]),
+            }
+            for grp in sorted(fam_n, key=fam_n.get, reverse=True)
+        }
 
     # All-KEEP baseline from the gold marginal (same for every condition)
     gold_counts = conf["true"].sum(axis=1)
@@ -331,6 +382,8 @@ def eval_editor(args, d_sae: int, loader, tok, editor=None,
 
     rng = np.random.default_rng(args.seed)
     agg = {c: defaultdict(float) for c in conds_list}
+    per_fam = bool(getattr(args, "per_family", False)) and "true" in conds_list
+    fam_cnt = defaultdict(lambda: defaultdict(int))
     seen = 0
 
     for batch in tqdm(loader, desc="[eval:editor]", unit="batch"):
@@ -378,6 +431,19 @@ def eval_editor(args, d_sae: int, loader, tok, editor=None,
             a["marker_emit"] += int(
                 torch.isin(pred1[valid], marker_ids).sum())
 
+            if per_fam and c == "true":
+                for b in range(ids.shape[0]):
+                    hits = {}
+                    for key, m in (("repl", is_repl[b]), ("ins", is_ins[b])):
+                        hits[f"{key}_n"] = int(m.sum())
+                        hits[f"{key}_top1"] = int(
+                            (pred1[b][m] == tgt[b][m]).sum())
+                    for grp in _sample_groups(batch, b):
+                        fc = fam_cnt[grp]
+                        fc["n_samples"] += 1
+                        for k2, v2 in hits.items():
+                            fc[k2] += v2
+
         seen += ids.shape[0]
         if seen >= args.max_samples:
             break
@@ -394,6 +460,19 @@ def eval_editor(args, d_sae: int, loader, tok, editor=None,
             m[f"{key}_top5_acc"] = a[f"{key}_top5"] / max(1, int(a[f"{key}_n"]))
         m["marker_emission_rate"] = a["marker_emit"] / max(1, int(a["loss_n"]))
         metrics["conditions"][c] = m
+
+    if per_fam:
+        metrics["per_family"] = {
+            grp: {
+                "n_samples": int(fc["n_samples"]),
+                "repl_top1_acc": fc["repl_top1"] / max(1, fc["repl_n"]),
+                "repl_positions": int(fc["repl_n"]),
+                "ins_top1_acc": fc["ins_top1"] / max(1, fc["ins_n"]),
+                "ins_positions": int(fc["ins_n"]),
+            }
+            for grp, fc in sorted(fam_cnt.items(),
+                                  key=lambda kv: -kv[1]["n_samples"])
+        }
 
     metrics["diagnostics"] = {
         "cond_scale": float(editor.cond_scale.item()),
@@ -518,6 +597,31 @@ def write_report(out_dir: Path, tagger_m, editor_m, verdicts) -> None:
         if d["delta_emb_norms"]:
             lines.append("delta_emb row norms: " + ", ".join(
                 f"{k}={v:.3f}" for k, v in d["delta_emb_norms"].items()))
+        lines.append("")
+
+    if (tagger_m and tagger_m.get("per_family")) or \
+            (editor_m and editor_m.get("per_family")):
+        lines += ["## Per-family breakdown (condition = true)", "",
+                  "Composed records count toward each constituent family "
+                  "and the `(composed)` row; `lex:*` rows are the "
+                  "non-transform corruption buckets.", ""]
+        tf = (tagger_m or {}).get("per_family") or {}
+        ef = (editor_m or {}).get("per_family") or {}
+        groups = sorted(set(tf) | set(ef),
+                        key=lambda g: -(tf.get(g, ef.get(g))["n_samples"]))
+        lines += ["| group | n | tagger macro-F1 | tagger INS F1 | span IoU "
+                  "| editor REPL top-1 | editor INS top-1 |",
+                  "|---|---|---|---|---|---|---|"]
+        for g in groups:
+            t = tf.get(g)
+            e = ef.get(g)
+            n = (t or e)["n_samples"]
+            def _f(d, k):
+                return f"{d[k]:.4f}" if d else "—"
+            lines.append(
+                f"| {g} | {n} | {_f(t, 'macro_f1')} | {_f(t, 'ins_f1')} "
+                f"| {_f(t, 'span_iou')} | {_f(e, 'repl_top1_acc')} "
+                f"| {_f(e, 'ins_top1_acc')} |")
         lines.append("")
 
     lines += ["## Conditioning causality (Level 2)", ""]
