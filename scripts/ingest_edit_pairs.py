@@ -123,7 +123,10 @@ def iter_pairs(source: str, seed: int, coedit_tasks: str = "all"):
     """Yield (src_text, tgt_text, t_type, reversible)."""
     from datasets import load_dataset
     if source == "paws":
-        ds = load_dataset("paws", "labeled_final", split="train")
+        # Namespaced id: newer huggingface_hub rejects the canonical
+        # namespace-less "paws".
+        ds = load_dataset("google-research-datasets/paws", "labeled_final",
+                          split="train")
         ds = ds.shuffle(seed=seed)
         for r in ds:
             if int(r["label"]) == 1:
