@@ -990,6 +990,159 @@ def propose_quotinv(doc, text, rng) -> List[Proposal]:
 
 
 # ---------------------------------------------------------------------------
+# v6 — probabilistic word-class families (README §6.2.11-to-be).
+#
+# Unlike the structural families above (one hand-coded transformation
+# each), these edit at the WORD-CLASS level: swap a function word within
+# its grammatical class, or reinflect a non-subject noun. Both sides stay
+# grammatical while the meaning changes, so the output is context-
+# UNDERDETERMINED and only the conditioning decides it — the training
+# regime the gold-template probe (§13.6) found missing. Predicates are
+# trivially satisfiable, so these families are high-availability; the
+# family-priority pick in corruption.py keeps them from crowding out the
+# rare structural families.
+# ---------------------------------------------------------------------------
+DET_SING = ["the", "this", "that", "some", "no", "every", "each",
+            "another", "a"]
+DET_PLUR = ["the", "these", "those", "some", "no", "all", "many", "few",
+            "several", "most"]
+PREP_GROUPS = [
+    ["in", "on", "at", "near", "by"],
+    ["during", "after", "before"],
+    ["over", "under", "above", "below"],
+]
+MODAL_SWAP = ["can", "may", "must", "should", "might", "could", "will",
+              "would"]
+POSS_PRON = ["his", "her", "its", "their", "our", "my", "your"]
+OBJ_PRON = ["him", "her", "them", "us", "me"]
+SUBJ_3SG = ["he", "she"]            # no expletive-prone "it"
+SUBJ_PL = ["we", "they", "you"]     # same verb agreement class
+
+
+def _det_surface(alt: str, tok, doc) -> str:
+    """Render a determiner alternative: a/an choice + capitalisation."""
+    if alt == "a" and tok.i + 1 < len(doc) \
+            and doc[tok.i + 1].text[:1].lower() in "aeiou":
+        alt = "an"
+    return _cap(alt) if tok.text[:1].isupper() else alt
+
+
+def propose_funcswap(doc, text, rng) -> List[Proposal]:
+    """Function-word swap within a grammatical class (det / prep / modal /
+    pronoun). Grammaticality is preserved by construction; the meaning
+    change is the point. ALL class alternatives are emitted so the
+    round-trip check finds the reverse swap deterministically."""
+    out = []
+    for tok in doc:
+        low = tok.lower_
+        # determiners, number-matched to the head noun
+        if tok.dep_ == "det" and tok.head.pos_ == "NOUN":
+            cls = None
+            if tok.head.tag_ == "NN":
+                cls = DET_SING
+            elif tok.head.tag_ == "NNS":
+                cls = DET_PLUR
+            src = "a" if low == "an" else low
+            if cls and src in cls:
+                for alt in cls:
+                    if alt == src:
+                        continue
+                    T = _splice(text, [_tok_edit(tok, _det_surface(
+                        alt, tok, doc))])
+                    out.append(Proposal("FS:DET", "FUNCSWAP", T, True))
+        # prepositions within a semantic group
+        elif tok.dep_ == "prep":
+            for grp in PREP_GROUPS:
+                if low in grp:
+                    for alt in grp:
+                        if alt == low:
+                            continue
+                        a = _cap(alt) if tok.text[:1].isupper() else alt
+                        T = _splice(text, [_tok_edit(tok, a)])
+                        out.append(Proposal("FS:PREP", "FUNCSWAP", T, True))
+                    break
+        # modals (full forms only — contraction pieces are not in the set)
+        elif tok.tag_ == "MD" and low in MODAL_SWAP:
+            for alt in MODAL_SWAP:
+                if alt == low:
+                    continue
+                a = _cap(alt) if tok.text[:1].isupper() else alt
+                T = _splice(text, [_tok_edit(tok, a)])
+                out.append(Proposal("FS:MOD", "FUNCSWAP", T, True))
+        # possessive pronouns ("her" as poss is disambiguated by dep_)
+        elif tok.dep_ == "poss" and low in POSS_PRON:
+            for alt in POSS_PRON:
+                if alt == low:
+                    continue
+                a = _cap(alt) if tok.text[:1].isupper() else alt
+                T = _splice(text, [_tok_edit(tok, a)])
+                out.append(Proposal("FS:POSS", "FUNCSWAP", T, True))
+        # object pronouns (verb agreement is untouched)
+        elif tok.pos_ == "PRON" and tok.dep_ in ("dobj", "pobj", "dative",
+                                                 "iobj") and low in OBJ_PRON:
+            for alt in OBJ_PRON:
+                if alt == low:
+                    continue
+                a = _cap(alt) if tok.text[:1].isupper() else alt
+                T = _splice(text, [_tok_edit(tok, a)])
+                out.append(Proposal("FS:OPRON", "FUNCSWAP", T, True))
+        # subject pronouns within one agreement class
+        elif tok.dep_ == "nsubj" and (low in SUBJ_3SG or low in SUBJ_PL):
+            cls = SUBJ_3SG if low in SUBJ_3SG else SUBJ_PL
+            for alt in cls:
+                if alt == low:
+                    continue
+                a = _cap(alt) if tok.text[:1].isupper() else alt
+                T = _splice(text, [_tok_edit(tok, a)])
+                out.append(Proposal("FS:SPRON", "FUNCSWAP", T, True))
+    return out
+
+
+# Determiners that force one number on the head noun: a flip under them
+# would be ungrammatical, so MORPH skips those NPs.
+_SING_ONLY_DETS = {"a", "an", "another", "every", "each", "this", "that",
+                   "one"}
+_PLUR_ONLY_DETS = {"these", "those", "many", "few", "several", "both"}
+_FLIP_OK_DETS = {"the", "some", "no"}
+
+
+def propose_morph(doc, text, rng) -> List[Proposal]:
+    """Number flip on a NON-subject noun (dobj/pobj/attr) — NUMBER (v4a)
+    only handles subjects, where verb agreement must move too. Object
+    position needs no agreement, but the determiner must license both
+    numbers, so flips are limited to the/some/no/possessive NPs (a bare
+    plural → bare singular count noun would be ungrammatical)."""
+    out = []
+    for tok in doc:
+        if tok.pos_ != "NOUN" or tok.tag_ not in ("NN", "NNS") \
+                or tok.dep_ not in ("dobj", "pobj", "attr"):
+            continue
+        if any(c.dep_ == "nummod" for c in tok.children):
+            continue
+        dets = [c for c in tok.children if c.dep_ in ("det", "poss")]
+        if len(dets) != 1:
+            continue
+        d = dets[0]
+        if not (d.dep_ == "poss" or d.lower_ in _FLIP_OK_DETS):
+            continue
+        if d.lower_ in _SING_ONLY_DETS or d.lower_ in _PLUR_ONLY_DETS:
+            continue
+        if tok.tag_ == "NN":
+            form = _inflect(tok.lemma_, "NNS")
+            tt = "MO:SG->PL"
+        else:
+            form = _inflect(tok.lemma_, "NN") or tok.lemma_
+            tt = "MO:PL->SG"
+        if not form or form == tok.text:
+            continue
+        if tok.text[:1].isupper():
+            form = _cap(form)
+        T = _splice(text, [_tok_edit(tok, form)])
+        out.append(Proposal(tt, "MORPH", T, True))
+    return out
+
+
+# ---------------------------------------------------------------------------
 FAMILIES: Dict[str, Callable] = {
     # v4a
     "TENSE": propose_tense,
@@ -1019,6 +1172,9 @@ FAMILIES: Dict[str, Callable] = {
     "COMPZR": propose_compzr,
     "NONFIN": propose_nonfin,
     "QUOTINV": propose_quotinv,
+    # v6 — probabilistic word-class edits (context-underdetermined content)
+    "FUNCSWAP": propose_funcswap,
+    "MORPH": propose_morph,
 }
 
 

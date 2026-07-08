@@ -225,6 +225,16 @@ def parse_args():
                         "transformation ops (0 disables v4).")
     p.add_argument("--transform-families", default="all",
                    help="'all' or comma list of transforms.FAMILIES keys.")
+    p.add_argument("--family-priority-pick", action="store_true",
+                   help="Weight the per-sentence family pick by inverse "
+                        "running acceptance count (1/(1+accepted)) instead "
+                        "of uniform-over-available. Rare structural "
+                        "families (their predicates seldom fire) get "
+                        "picked whenever they ARE available, and the "
+                        "high-availability v6 word-class families "
+                        "self-throttle. Fixes the v5 rare-family "
+                        "starvation (PARTICLE 0.25%, QUOTINV absent — "
+                        "README §13.6).")
     p.add_argument("--transform-compose-prob", type=float, default=0.15,
                    help="Given an accepted transform T1(X), probability of "
                         "chaining a SECOND family T2 (re-parsed, per-step "
@@ -2267,6 +2277,36 @@ def main():
 
     emit_counts: Counter = Counter()
     ttype_counts: Counter = Counter()
+    fam_accepts: Counter = Counter()   # accepted records per family
+                                       # (drives --family-priority-pick)
+
+    def pick_family(by_fam: Dict[str, list]) -> str:
+        """Pick a family among those available on this sentence: uniform,
+        or inverse-acceptance-weighted under --family-priority-pick."""
+        fams = sorted(by_fam)
+        if not args.family_priority_pick or len(fams) == 1:
+            return fams[rng.randrange(len(fams))]
+        weights = [1.0 / (1.0 + fam_accepts[f]) for f in fams]
+        r = rng.random() * sum(weights)
+        for f, w in zip(fams, weights):
+            r -= w
+            if r <= 0:
+                return f
+        return fams[-1]
+
+    def pick_proposal(by_fam: Dict[str, list]):
+        """Family pick, then t_type-balanced pick within the family, then
+        uniform among that t_type's proposals. The inner balance stops
+        prolific sub-rules from crowding out their siblings (FS:DET emits
+        |class|−1 alternatives per determiner and would otherwise dominate
+        FUNCSWAP)."""
+        fam_props = by_fam[pick_family(by_fam)]
+        by_tt: Dict[str, list] = {}
+        for pr in fam_props:
+            by_tt.setdefault(pr.t_type, []).append(pr)
+        tts = sorted(by_tt)
+        tt_props = by_tt[tts[rng.randrange(len(tts))]]
+        return tt_props[rng.randrange(len(tt_props))]
 
     def write_record(rec: Dict):
         """Write one record; rotate shards and log at shard boundaries."""
@@ -2356,9 +2396,7 @@ def main():
                 by_fam: Dict[str, list] = {}
                 for pr in props:
                     by_fam.setdefault(pr.family, []).append(pr)
-                fams = sorted(by_fam)
-                fam_props = by_fam[fams[rng.randrange(len(fams))]]
-                prop = fam_props[rng.randrange(len(fam_props))]
+                prop = pick_proposal(by_fam)
                 ttype_counts[f"prop:{prop.t_type}"] += 1
                 if not roundtrip_ok(stage.spacy_full, prop, sent, rng):
                     ttype_counts[f"rtfail:{prop.family}"] += 1
@@ -2382,9 +2420,7 @@ def main():
                             if pr2.out_text != sent:
                                 by_fam2.setdefault(pr2.family, []).append(pr2)
                         if by_fam2:
-                            fams2s = sorted(by_fam2)
-                            fp2 = by_fam2[fams2s[rng.randrange(len(fams2s))]]
-                            prop2 = fp2[rng.randrange(len(fp2))]
+                            prop2 = pick_proposal(by_fam2)
                             if roundtrip_ok(stage.spacy_full, prop2,
                                             out_text, rng):
                                 out_text = prop2.out_text
@@ -2415,6 +2451,8 @@ def main():
                             write_record(pf)
                             ttype_counts[f"acc:{tt}"] += 1
                             wrote_t += 1
+                            for f in t_family.split("+"):
+                                fam_accepts[f] += 1
                     # null record: corrupted side, all-KEEP, zero diff
                     if wrote_t and rng.random() < args.emit_null                             and written < args.target_samples:
                         ns, nr = build_identity_sample(stage, out_text)

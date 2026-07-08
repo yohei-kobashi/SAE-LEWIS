@@ -340,6 +340,7 @@ class CorruptionDataset(IterableDataset):
         "PRT": "PARTICLE", "DAT": "DATIVE", "ADV": "ADVPLACE",
         "PP": "PPFRONT", "CTR": "CONTRACT", "CZR": "COMPZR",
         "NF": "NONFIN", "QI": "QUOTINV",
+        "FS": "FUNCSWAP", "MO": "MORPH",
     }
 
     def __init__(
@@ -397,12 +398,15 @@ class CorruptionDataset(IterableDataset):
     def _record_families(cls, rec: Dict) -> List[str]:
         """Transform families a record touches ([] for lexical buckets).
         Classmethod so CorruptionCollator can label batches without a
-        dataset instance (per-family eval breakdown)."""
-        if rec.get("bucket") != "transform":
-            return []
+        dataset instance (per-family eval breakdown). An explicit t_family
+        wins regardless of bucket, so ingested natural-edit records
+        (bucket='natural_edit', t_family='PAWS'/'WIKIEDIT') participate in
+        the same LOFO filters and per-family breakdowns."""
         fam = rec.get("t_family")
         if fam:
             return fam.split("+")
+        if rec.get("bucket") != "transform":
+            return []
         tt = rec.get("t_type", "")
         if not tt or tt == "null":
             return []

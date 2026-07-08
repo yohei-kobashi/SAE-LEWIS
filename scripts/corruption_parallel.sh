@@ -74,6 +74,12 @@ OP_WEIGHT_DEL=${OP_WEIGHT_DEL:-0.06}
 TRANSFORM_PROB=${TRANSFORM_PROB:-0.35}
 TRANSFORM_FAMILIES=${TRANSFORM_FAMILIES:-all}
 TRANSFORM_COMPOSE_PROB=${TRANSFORM_COMPOSE_PROB:-0.15}
+# v6: inverse-acceptance family pick (1 = pass --family-priority-pick).
+FAMILY_PRIORITY_PICK=${FAMILY_PRIORITY_PICK:-0}
+PRIORITY_ARGS=()
+if [[ "$FAMILY_PRIORITY_PICK" == "1" ]]; then
+    PRIORITY_ARGS=(--family-priority-pick)
+fi
 BLOCKLIST=${BLOCKLIST:-""}
 BLOCKLIST_ARGS=()
 if [[ -n "$BLOCKLIST" ]]; then
@@ -161,6 +167,7 @@ for i in $(seq 0 $((WORKERS - 1))); do
         --transform-prob "$TRANSFORM_PROB" \
         --transform-families "$TRANSFORM_FAMILIES" \
         --transform-compose-prob "$TRANSFORM_COMPOSE_PROB" \
+        "${PRIORITY_ARGS[@]}" \
         "${BLOCKLIST_ARGS[@]}" \
         --target-samples "$PER_WORKER" \
         --samples-per-shard "$CORRUPTION_SHARD" \
