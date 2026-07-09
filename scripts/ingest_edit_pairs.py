@@ -84,6 +84,12 @@ def parse_args():
                         "coherence, clarity).")
     p.add_argument("--shard-size", type=int, default=2000)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--skip-source-ids-glob", default="",
+                   help="Glob of existing .jsonl.gz shards; pairs whose "
+                        "source id ('<source>:<scan_idx>', deterministic "
+                        "under the same seed) already appear there are "
+                        "skipped. Use for a full ingest on top of the "
+                        "pilot's records already merged into the cache.")
 
     # SAE / models (corruption.py defaults)
     p.add_argument("--llm", default="google/gemma-2-2b")
@@ -206,12 +212,29 @@ def main():
         cur = gzip.open(path, "wt", encoding="utf-8")
         shard_idx += 1
 
+    skip_ids = set()
+    if args.skip_source_ids_glob:
+        import glob as _glob
+        for p_ in sorted(_glob.glob(args.skip_source_ids_glob)):
+            with gzip.open(p_, "rt", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        sid = json.loads(line).get("source_sent_id")
+                    except json.JSONDecodeError:
+                        continue
+                    if sid:
+                        skip_ids.add(sid)
+        print(f"[ingest] dedup: {len(skip_ids)} source ids already ingested")
+
     open_shard()
     pairs_used = 0
     pair_iter = iter_pairs(args.source, args.seed, args.coedit_tasks)
     for pair_i, (a, b, tt, reversible) in enumerate(pair_iter):
         if pairs_used >= args.max_pairs:
             break
+        if f"{args.source}:{pair_i}" in skip_ids:
+            reasons["already_ingested"] += 1
+            continue
         a, b = (a or "").strip(), (b or "").strip()
         if not a or not b or a.casefold() == b.casefold():
             reasons["identical_or_empty"] += 1
