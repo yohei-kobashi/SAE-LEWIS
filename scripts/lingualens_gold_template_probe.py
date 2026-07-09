@@ -87,6 +87,22 @@ def parse_args():
     p.add_argument("--k-amp", type=int, default=64)
     p.add_argument("--k-sup", type=int, default=64)
     p.add_argument("--pool-topk", type=int, default=64)
+    p.add_argument("--cond-scope", choices=["global", "local"],
+                   default="global",
+                   help="Conditioning extraction scope. 'global' matches "
+                        "eval_lingualens.py (whole-sentence pool-max diff). "
+                        "'local' matches TRAINING (corruption.py "
+                        "cond_scope=local since v4): pool-max over only "
+                        "the tokens overlapping the edited char ranges on "
+                        "each side, from the gold alignment. Global "
+                        "pooling hides an edit's features whenever the "
+                        "same feature fires elsewhere in the sentence — "
+                        "a train/eval extraction mismatch that could "
+                        "alone explain true≈empty OOD.")
+    p.add_argument("--blocklist", default="",
+                   help="blocklist.npy — masked before the conditioning "
+                        "top-k, as in training. Pass it together with "
+                        "--cond-scope local for full training parity.")
     p.add_argument("--conditions", default="true,empty")
     p.add_argument("--modes", default=",".join(MODES))
     p.add_argument("--steer-lambdas", default="",
@@ -108,8 +124,8 @@ def parse_args():
 # ---------------------------------------------------------------------------
 def build_gold_template(
     src_ids: List[int], tgt_ids: List[int], mask_id: int, ins_id: int,
-) -> Tuple[List[int], List[int], List[str]]:
-    """(template ids, gold ids, per-position op in {'K','R','I'}).
+) -> Tuple[List[int], List[int], List[str], List[tuple]]:
+    """(template ids, gold ids, per-position op in {'K','R','I'}, opcodes).
 
     DEL runs are dropped from the template (v2 convention: deletion is the
     tagger's decision; the editor never sees deleted tokens). A replace
@@ -121,7 +137,8 @@ def build_gold_template(
     gold: List[int] = []
     ops: List[str] = []
     sm = difflib.SequenceMatcher(None, src_ids, tgt_ids, autojunk=False)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    opcodes = sm.get_opcodes()
+    for tag, i1, i2, j1, j2 in opcodes:
         if tag == "equal":
             tpl += src_ids[i1:i2]
             gold += tgt_ids[j1:j2]
@@ -142,7 +159,62 @@ def build_gold_template(
             gold += tgt_ids[j1:j2]
             ops += ["I"] * (j2 - j1)
         # 'delete': dropped
-    return tpl, gold, ops
+    return tpl, gold, ops, opcodes
+
+
+# ---------------------------------------------------------------------------
+# Edit-local conditioning (training parity — corruption.py cond_scope=local)
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def sae_z_with_offsets(extractor, text: str, device: str):
+    """Per-token SAE activations + char offsets (extractor's tokenizer).
+    Mirrors corruption.sae_encode_with_offsets without needing a Stage."""
+    enc = extractor.llm_tokenizer(
+        text, return_tensors="pt", truncation=True, max_length=256,
+        return_offsets_mapping=True, add_special_tokens=True,
+    )
+    offsets = [tuple(o) for o in enc["offset_mapping"][0].tolist()]
+    inp = {k: v.to(device) for k, v in enc.items()
+           if k in ("input_ids", "attention_mask")}
+    out = extractor.llm(**inp, output_hidden_states=True, use_cache=False)
+    h = out.hidden_states[extractor.layer_idx][0]
+    z = extractor.sae.encode(h.to(extractor.sae.W_enc.dtype))
+    return offsets, z                                      # (T, d_sae)
+
+
+def edit_char_ranges(opcodes, src_off, tgt_off):
+    """Char ranges touched by the alignment, per side (skips specials)."""
+    src_r, tgt_r = [], []
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            continue
+        if i2 > i1:
+            spans = [src_off[i] for i in range(i1, min(i2, len(src_off)))
+                     if src_off[i] != (0, 0)]
+            if spans:
+                src_r.append((spans[0][0], spans[-1][1]))
+        if j2 > j1:
+            spans = [tgt_off[j] for j in range(j1, min(j2, len(tgt_off)))
+                     if tgt_off[j] != (0, 0)]
+            if spans:
+                tgt_r.append((spans[0][0], spans[-1][1]))
+    return src_r, tgt_r
+
+
+def local_pool_topk(z, offsets, char_ranges, k, blocklist=None):
+    """Pool-max over tokens overlapping char_ranges, blocklist-mask, keep
+    top-k. Falls back to global pooling when no position matches."""
+    pos = [ti for ti, (ts, te) in enumerate(offsets)
+           if not (ts == 0 and te == 0)
+           and any(ts < ce and te > cs for cs, ce in char_ranges)]
+    zp = (z[pos] if pos else z).max(dim=0).values.float()
+    if blocklist is not None:
+        zp[blocklist.to(zp.device)] = 0.0
+    out = torch.zeros_like(zp)
+    v, i = zp.topk(min(k, zp.numel()))
+    keep = v > 0
+    out[i[keep]] = v[keep]
+    return out.cpu()
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +332,12 @@ def main():
     # A-1 logit-lens machinery: feature row f of W_dec is a residual
     # direction; unembedding it gives the token distribution that feature
     # pushes — a feature→content dictionary that needs no training.
+    blk = None
+    if args.blocklist:
+        _bl = np.load(args.blocklist)
+        blk = torch.as_tensor(np.asarray(_bl, dtype=np.int64))
+        print(f"[probe] blocklist: {len(_bl)} features masked before top-k")
+
     w_dec = head_w = None
     if lambdas:
         from model import load_sae_w_dec
@@ -291,7 +369,8 @@ def main():
         src_ids = tokenizer(src, add_special_tokens=True).input_ids
         tgt_ids = tokenizer(tgt, add_special_tokens=True).input_ids
 
-        tpl, gold, ops = build_gold_template(src_ids, tgt_ids, mask_id, ins_id)
+        tpl, gold, ops, opcodes = build_gold_template(
+            src_ids, tgt_ids, mask_id, ins_id)
         offset = 1 if (bos_id is not None and tpl and tpl[0] == bos_id) else 0
         tpl_seg, gold_seg, ops_seg = tpl[offset:], gold[offset:], ops[offset:]
         edit_pos = [j for j, o in enumerate(ops_seg) if o != "K"]
@@ -310,10 +389,26 @@ def main():
         bucket = _bucket(n_edit)
 
         with torch.no_grad():
-            z_src = extractor.pool_max_topk(
-                extractor.encode_text(src), args.pool_topk).float().cpu()
-            z_tgt = extractor.pool_max_topk(
-                extractor.encode_text(tgt), args.pool_topk).float().cpu()
+            if args.cond_scope == "local" or blk is not None:
+                s_off, z_s = sae_z_with_offsets(extractor, src, args.device)
+                t_off, z_t = sae_z_with_offsets(extractor, tgt, args.device)
+                if args.cond_scope == "local":
+                    om_s = [tuple(o) for o in tokenizer(
+                        src, add_special_tokens=True,
+                        return_offsets_mapping=True)["offset_mapping"]]
+                    om_t = [tuple(o) for o in tokenizer(
+                        tgt, add_special_tokens=True,
+                        return_offsets_mapping=True)["offset_mapping"]]
+                    sr, tr = edit_char_ranges(opcodes, om_s, om_t)
+                else:
+                    sr, tr = [], []          # [] → global pool fallback
+                z_src = local_pool_topk(z_s, s_off, sr, args.pool_topk, blk)
+                z_tgt = local_pool_topk(z_t, t_off, tr, args.pool_topk, blk)
+            else:
+                z_src = extractor.pool_max_topk(
+                    extractor.encode_text(src), args.pool_topk).float().cpu()
+                z_tgt = extractor.pool_max_topk(
+                    extractor.encode_text(tgt), args.pool_topk).float().cpu()
         z_amp_t, z_sup_t = diff_intervention(
             z_src, z_tgt, args.k_amp, args.k_sup)
         zvar = {
@@ -383,7 +478,9 @@ def main():
              f"pairs scored: {n_scored}  "
              f"(skipped, no fill positions: {skipped_no_fill}; "
              f"gold-reconstruction mismatches: {gold_mismatch})",
-             f"conditioning: k_amp={args.k_amp} k_sup={args.k_sup} "
+             f"conditioning: scope={args.cond_scope} "
+             f"blocklist={'yes' if blk is not None else 'no'} "
+             f"k_amp={args.k_amp} k_sup={args.k_sup} "
              f"pool_topk={args.pool_topk}; editor: {args.editor_ckpt}", ""]
 
     lines += ["## Fill accuracy over gold templates", "",
