@@ -111,6 +111,13 @@ def parse_args():
                         "Applied per condition (empty stays unbiased; "
                         "random gets its random features' bias — part of "
                         "the causality control).")
+    p.add_argument("--fill-iterative", type=int, default=0,
+                   help="T>1 decodes every template with iterative "
+                        "Mask-Predict (cmlm, README §13.7 C1-0) instead of "
+                        "one-shot parallel argmax; the lens bias is applied "
+                        "at every round. Iteration amplifies per-round fill "
+                        "quality, so pair it with --steer-lambda (probe: "
+                        "cmlm8+lens1 exact 0.447 vs lens1 0.416). 0 = off.")
     p.add_argument("--conditions", default="true,empty",
                    help=f"Comma list from {CONDITIONS_ALL}.")
 
@@ -485,6 +492,7 @@ def main():
                         fill_topk=args.fill_topk,
                         max_fill_variants=args.max_fill_variants,
                         logit_bias=lens_bias(za, zs),
+                        cmlm_steps=args.fill_iterative,
                         return_details=args.dump_details,
                         verbose=False,
                     )
@@ -570,6 +578,7 @@ def main():
              f"intervention: diff-based, scope={args.cond_scope} "
              f"blocklist={'yes' if blk is not None else 'no'} "
              f"steer_lambda={args.steer_lambda:g} "
+             f"fill_iterative={args.fill_iterative} "
              f"k_amp={args.k_amp} k_sup={args.k_sup} "
              f"pool_topk={args.pool_topk}; l_max={args.l_max} "
              f"ins_threshold={args.ins_threshold}; refine_passes="

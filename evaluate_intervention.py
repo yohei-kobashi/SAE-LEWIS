@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -87,6 +88,11 @@ def parse_args():
                         "fills, ranked by the SAE-grounded ranker. 1 "
                         "disables refinement.")
     p.add_argument("--max-fill-variants", type=int, default=32)
+    p.add_argument("--fill-iterative", type=int, default=0,
+                   help="T>1 decodes each template with iterative "
+                        "Mask-Predict (cmlm) instead of one-shot parallel "
+                        "argmax; pair with a lens bias (README §13.7 C1-0). "
+                        "0 = off.")
     p.add_argument("--refine-passes", type=int, default=1,
                    help="Iterative refinement: re-run the whole "
                         "tagger→editor→ranker loop on the output under the "
@@ -127,6 +133,7 @@ def edit_once(
     fill_topk: int = 5,
     max_fill_variants: int = 32,
     logit_bias: Optional[torch.Tensor] = None,
+    cmlm_steps: int = 0,
     return_details: bool = False,
     verbose: bool = True,
 ):
@@ -149,6 +156,15 @@ def edit_once(
     sae_align picks the fill that actually moves the features. Division of
     labor: tagger (SAE-GROUNDED) decides where, ranker (the SAE itself)
     decides what.
+
+    Iterative fill (`cmlm_steps` > 1): every template is decoded with
+    Mask-Predict instead of one-shot parallel argmax — fill all edit
+    positions, re-mask the lowest-confidence cosine-schedule fraction
+    (restoring the original marker) and re-predict it conditioned on the
+    kept fills, with fixed-point early exit. The lens `logit_bias` is
+    applied at every round. C1-0 (README §13.7): iteration amplifies
+    per-round fill quality, so it only pays combined with the lens —
+    use cmlm_steps=8 together with steer-lambda 1.
 
     Returns the edited text, or (text, details) if return_details — details
     carries per-candidate token ids / decoded texts / raw ranker components
@@ -201,6 +217,55 @@ def edit_once(
         plans.append((tau, op3, ins_before))
 
     marker_ids = [mask_id, ins_id, sep_id, del_id]
+
+    def fill_segment(full: List[int], tpl_start: int, tpl_ops_seg):
+        """Decode one template segment; returns (argmax ids, logits) where
+        each edit position's logits row is from the LAST round it was
+        predicted (== first round unless cmlm_steps > 1)."""
+        ids = torch.tensor([full], dtype=torch.long, device=device)
+        attn_m = torch.ones_like(ids)
+
+        def fwd():
+            out = editor(input_ids=ids, attention_mask=attn_m,
+                         z_amp=z_amp_dev, z_sup=z_sup_dev)
+            lg = out["logits"][0, tpl_start:]
+            lg[:, marker_ids] = float("-inf")
+            if logit_bias is not None:
+                lg = lg + logit_bias.to(lg.dtype)
+            return lg
+
+        lg = fwd()
+        edit_pos = [j for j, op in enumerate(tpl_ops_seg)
+                    if int(op) != OP_KEEP_CACHE]
+        if cmlm_steps <= 1 or len(edit_pos) <= 1:
+            return lg.argmax(dim=-1).cpu().numpy(), lg
+        final_lg = lg.clone()
+        n = len(edit_pos)
+        conf, preds = {}, {}
+        cur = list(edit_pos)
+        for s in range(cmlm_steps):
+            if s > 0:
+                lg = fwd()
+            changed = False
+            for p in cur:
+                row = lg[p]
+                pred = int(row.argmax())
+                conf[p] = float(torch.softmax(row.float(), dim=-1).max())
+                if preds.get(p) != pred:
+                    changed = True
+                preds[p] = pred
+                ids[0, tpl_start + p] = pred
+                final_lg[p] = row
+            if s > 0 and not changed:
+                break                       # fixed point — argmax decode
+            n_remask = int(n * math.cos(math.pi / 2 * (s + 1) / cmlm_steps))
+            if s == cmlm_steps - 1 or n_remask <= 0:
+                break
+            cur = sorted(edit_pos, key=conf.__getitem__)[:n_remask]
+            for p in cur:
+                ids[0, tpl_start + p] = full[tpl_start + p]
+        return final_lg.argmax(dim=-1).cpu().numpy(), final_lg
+
     candidates: List[List[int]] = []
     ins_counts: List[int] = []
     cand_meta: List[Optional[dict]] = []   # template info for fill refinement
@@ -245,17 +310,7 @@ def edit_once(
             full = token_ids + [sep_id] + tpl_ids[offset:]
             tpl_start = len(token_ids) + 1
 
-            ids = torch.tensor([full], dtype=torch.long, device=device)
-            mask = torch.ones_like(ids)
-            out = editor(
-                input_ids=ids, attention_mask=mask,
-                z_amp=z_amp_dev, z_sup=z_sup_dev,
-            )
-            logits = out["logits"][0, tpl_start:]           # template segment
-            logits[:, marker_ids] = float("-inf")           # never emit markers
-            if logit_bias is not None:
-                logits = logits + logit_bias.to(logits.dtype)
-            argmax = logits.argmax(dim=-1).cpu().numpy()
+            argmax, _ = fill_segment(full, tpl_start, tpl_ops[offset:])
             decoded = decode_editor_output(
                 np.asarray(tpl_ids[offset:], dtype=np.int64), argmax,
                 tpl_ops[offset:],
@@ -286,15 +341,11 @@ def edit_once(
         edit_pos = [j for j, op in enumerate(meta["tpl_ops"])
                     if int(op) != OP_KEEP_CACHE]
         if edit_pos:
-            ids = torch.tensor([meta["full"]], dtype=torch.long, device=device)
-            out = editor(
-                input_ids=ids, attention_mask=torch.ones_like(ids),
-                z_amp=z_amp_dev, z_sup=z_sup_dev,
-            )
-            logits = out["logits"][0, meta["tpl_start"]:]
-            logits[:, marker_ids] = float("-inf")
-            if logit_bias is not None:
-                logits = logits + logit_bias.to(logits.dtype)
+            # Same deterministic decode as the main loop (cmlm-aware), so
+            # each position's top-k alternatives come from the context the
+            # parent's fills were actually chosen in.
+            _, logits = fill_segment(
+                meta["full"], meta["tpl_start"], meta["tpl_ops"])
             parent = candidates[edited_best]
             dec_off = 1 if meta["offset"] else 0   # parent has <bos> prepended
             n_var = 0
@@ -413,6 +464,7 @@ def main():
         ins_threshold=args.ins_threshold, op_thresholds=op_taus,
         max_templates=args.max_templates,
         fill_topk=args.fill_topk, max_fill_variants=args.max_fill_variants,
+        cmlm_steps=args.fill_iterative,
     )
     print("== edited ==")
     print(out)
