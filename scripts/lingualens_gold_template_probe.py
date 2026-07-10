@@ -20,6 +20,16 @@ three decode modes over the SAME template:
             up to the correctness of previous fills
   seq-conf  same, but fill the currently most-confident position first
             (MaskGIT-style)
+  cmlm{T}   iterative Mask-Predict (V7_PLAN C1-0): fill everything, then
+            for up to T rounds re-mask the lowest-confidence fraction
+            (cosine schedule) and re-predict it conditioned on the rest.
+            Early-exits once a round changes nothing, so n_edit=1 pairs
+            cost ~2 forwards. `cmlm{T}+lens{λ}` adds the logit-lens bias
+            at EVERY round (the constant-λ special case of C2). This is
+            inference-only — the editor was trained at ρ=0 (all edit
+            positions masked), so revealed-gold inputs are off-distribution
+            for it; a negative result here does NOT kill C1, but a positive
+            one raises its expected value cheaply.
 
 If parallel ≈ sequential ≈ high: fill is fine → the OOD bottleneck is
 localization (tagger coverage/data). If parallel ≪ sequential: the
@@ -40,11 +50,13 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import math
 import random
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -61,8 +73,22 @@ from eval_lingualens import (                                      # noqa: E402
 from model import SAEFeatureExtractor                              # noqa: E402
 
 MODES = ("parallel", "seq-ltr", "seq-conf")
+CMLM_RE = re.compile(r"^cmlm(\d+)(?:\+lens([\d.]+))?$")
 EDIT_BUCKETS = ((1, 1, "1"), (2, 3, "2-3"), (4, 8, "4-8"),
                 (9, 10 ** 9, "9+"))
+
+
+def parse_mode(m: str) -> Dict:
+    """Mode string → {name, decode, steps, lam}. lam≠None runs true-only."""
+    if m in MODES:
+        return {"name": m, "decode": m, "steps": 0, "lam": None}
+    g = CMLM_RE.match(m)
+    if g:
+        lam = float(g.group(2)) if g.group(2) else None
+        return {"name": m, "decode": "cmlm", "steps": int(g.group(1)),
+                "lam": lam}
+    raise SystemExit(f"unknown mode {m!r}; pick from {MODES} or "
+                     f"cmlm{{T}}[+lens{{λ}}] (e.g. cmlm8, cmlm8+lens1)")
 
 
 def parse_args():
@@ -181,10 +207,12 @@ def fill_template(
     marker_ids: List[int],
     device: str,
     logit_bias: torch.Tensor = None,   # (V,) added at every edit position
+    cmlm_steps: int = 0,               # mode == "cmlm" only
 ) -> Tuple[List[int], List[Dict]]:
     """Fill the template's edit positions; return (filled template-segment
     ids, per-position results). top-5 is taken from the logits available
-    at the moment each position is filled."""
+    at the moment each position is filled (for cmlm: the LAST time it was
+    predicted)."""
     ids = torch.tensor([full_ids], dtype=torch.long, device=device)
     attn = torch.ones_like(ids)
 
@@ -207,6 +235,39 @@ def fill_template(
             results.append({"pos": p, "pred": pred, "gold": gold_seg[p],
                             "top1": pred == gold_seg[p],
                             "top5": gold_seg[p] in top5})
+    elif mode == "cmlm":
+        # Mask-Predict: fill every masked position, then re-mask the
+        # lowest-confidence cosine-schedule fraction and re-predict it
+        # conditioned on the kept fills. Re-masking restores the position's
+        # ORIGINAL marker ([MASK]/[INS]) so op identity is preserved.
+        n = len(edit_pos)
+        conf: Dict[int, float] = {}
+        info: Dict[int, Dict] = {}
+        cur = list(edit_pos)
+        for s in range(max(1, cmlm_steps)):
+            lg = forward_logits()
+            changed = False
+            for p in cur:
+                probs = torch.softmax(lg[p], dim=-1)
+                top5 = lg[p].topk(5).indices.tolist()
+                pred = top5[0]
+                if p not in info or info[p]["pred"] != pred:
+                    changed = True
+                ids[0, tpl_start + p] = pred
+                conf[p] = float(probs[pred])
+                info[p] = {"pos": p, "pred": pred, "gold": gold_seg[p],
+                           "top1": pred == gold_seg[p],
+                           "top5": gold_seg[p] in top5}
+            if s > 0 and not changed:
+                break                       # fixed point — argmax decode
+            n_remask = int(n * math.cos(
+                math.pi / 2 * (s + 1) / max(1, cmlm_steps)))
+            if s == max(1, cmlm_steps) - 1 or n_remask <= 0:
+                break
+            cur = sorted(edit_pos, key=lambda q: conf[q])[:n_remask]
+            for p in cur:
+                ids[0, tpl_start + p] = full_ids[tpl_start + p]
+        results = [info[p] for p in edit_pos]
     else:
         remaining = list(edit_pos)
         while remaining:
@@ -237,13 +298,13 @@ def _bucket(n: int) -> str:
 def main():
     args = parse_args()
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
-    for m in modes:
-        if m not in MODES:
-            raise SystemExit(f"unknown mode {m!r}; pick from {MODES}")
+    mode_specs = [parse_mode(m.strip())
+                  for m in args.modes.split(",") if m.strip()]
     lambdas = [float(x) for x in args.steer_lambdas.split(",") if x.strip()]
     lens_modes = [f"lens{lam:g}" for lam in lambdas]
-    all_modes = modes + lens_modes
+    all_modes = [sp["name"] for sp in mode_specs] + lens_modes
+    need_lens = bool(lambdas) or any(sp["lam"] is not None
+                                     for sp in mode_specs)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
@@ -287,11 +348,12 @@ def main():
         print(f"[probe] blocklist: {len(_bl)} features masked before top-k")
 
     w_dec = head_w = None
-    if lambdas:
+    if need_lens:
         from model import load_sae_w_dec
         w_dec = load_sae_w_dec(args.sae_repo, args.sae_path).to(args.device)
         head_w = editor.lm_head.weight.detach().float().to(args.device)
         print(f"[probe] logit-lens bias enabled: λ ∈ {lambdas} "
+              f"+ mode-embedded λ "
               f"(W_dec {tuple(w_dec.shape)} → vocab {head_w.shape[0]})")
 
     def lens_bias(z_amp_v: torch.Tensor, z_sup_v: torch.Tensor):
@@ -372,17 +434,24 @@ def main():
             za = zvar[c][0].unsqueeze(0).to(args.device)
             zs = zvar[c][1].unsqueeze(0).to(args.device)
             rec["outputs"][c] = {}
-            runs = [(m, m, None) for m in modes]
-            if lambdas and c == "true":
+            lb = None
+            if need_lens and c == "true":
                 with torch.no_grad():
                     lb = lens_bias(zvar[c][0], zvar[c][1])
-                runs += [(name, "parallel", lam * lb)
+            runs = []
+            for sp in mode_specs:
+                if sp["lam"] is not None and c != "true":
+                    continue                # lens-composed: true only
+                bias = sp["lam"] * lb if sp["lam"] is not None else None
+                runs.append((sp["name"], sp["decode"], bias, sp["steps"]))
+            if lambdas and c == "true":
+                runs += [(name, "parallel", lam * lb, 0)
                          for name, lam in zip(lens_modes, lambdas)]
-            for m, decode_mode, bias in runs:
+            for m, decode_mode, bias, steps in runs:
                 seg, results = fill_template(
                     decode_mode, full, tpl_start, edit_pos, gold_seg,
                     editor, za, zs, marker_ids, args.device,
-                    logit_bias=bias)
+                    logit_bias=bias, cmlm_steps=steps)
                 out_ids = ([bos_id] if offset else []) + seg
                 out_text = tokenizer.decode(out_ids, skip_special_tokens=True)
                 pm = pair_metrics(out_text, src, tgt)
@@ -500,6 +569,11 @@ def main():
         "replace/augment the conditioning readout with the dictionary "
         "instead of retraining on more data. λ too high degrades REPL "
         "grammar fit — pick the knee.",
+        "- cmlm{T} > parallel at n_edit ≥ 2 (esp. exact) → iterative "
+        "refinement coordinates multi-site fills even without "
+        "reveal-curriculum training: C1 expected value HIGH. cmlm ≈ "
+        "parallel → inconclusive (the editor never saw revealed gold in "
+        "training; C1's NO-GO still requires the trained comparison).",
         "",
     ]
     (out_dir / "probe_report.md").write_text("\n".join(lines))
