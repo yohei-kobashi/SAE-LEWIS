@@ -129,7 +129,9 @@ classifier-free guidance と同型の**毎ステップガイダンス**として
 
 ### 判定ゲート A2
 
-- per-family 評価の reordering 系 span IoU(現状 ADVPLACE 0.375 / PARTICLE 0.45)と、
+- per-family 評価の reordering 系 span IoU(v6 実測: ADVPLACE 0.330 / PARTICLE 0.271 /
+  DATIVE 0.243 — priority pick で供給は回復済みなのに IoU が回復しない =
+  DEL+INS 分解そのものが原因と確定、A2 の根拠が強化された)と、
   LinguaLens 語順系現象の exact。
 
 ---
