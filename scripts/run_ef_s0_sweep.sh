@@ -13,6 +13,9 @@ LLM2VEC=runs/mcgill_gemma_repro_3k/final
 BLOCKLIST=${BLOCKLIST:-runs/blocklist/blocklist.npy}
 OUT=$V6/editflow_pilot/probe_s0
 
+# Mid-run kills resume per pair (the probe's records.partial.jsonl);
+# this guard makes a rerun AFTER completion a no-op instead of a redo.
+if [ ! -f "$OUT/probe_report.md" ]; then
 python scripts/editflow_probe.py \
     --llm2vec-dir "$LLM2VEC" \
     --editflow-ckpt "$V6/editflow_pilot/editflow-final.pt" \
@@ -23,6 +26,7 @@ python scripts/editflow_probe.py \
     --conditions true \
     --decode thr0.02,det@cfg2,det@cfg3,thr0.02@cfg2,thr0.02@cfg3,bo4@temp0.7,bo4@temp0.7@cfg2 \
     --device cuda
+fi
 
 echo "==================== S0 SWEEP DONE ===================="
 sed -n '/## Decode quality/,$p' "$OUT/probe_report.md"
