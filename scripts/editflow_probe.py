@@ -272,8 +272,6 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
              "float32": torch.float32}[args.llm_dtype]
-    rng = np.random.default_rng(args.seed)
-    srng = random.Random(args.seed)
 
     from datasets import load_dataset
     print(f"[ef-probe] loading {args.dataset}")
@@ -335,15 +333,34 @@ def main():
             return None
         return args.steer_lambda * lb / (s + 1e-8)
 
-    agg = {c: {m: defaultdict(list) for m in modes} for c in conditions}
-    iou_agg = {c: [] for c in conditions}
-    tagger_iou_agg = []
     T_DIAG = (0.3, 0.5, 0.7, 0.9)
-    lam_diag = {t: [] for t in T_DIAG}    # mean λ at top-|gold| sites, true
-    bpair = {m: defaultdict(lambda: defaultdict(list)) for m in modes}
-    records = []
+
+    # Resume: every finished pair is flushed to records.partial.jsonl with
+    # ALL its metrics self-contained; on restart, done pairs are skipped
+    # and the report aggregates are rebuilt from the records. Per-pair
+    # RNGs (seeded on idx) make `random` / stoch draws resume-invariant.
+    partial_path = out_dir / "records.partial.jsonl"
+    records: List[Dict] = []
+    done_idx = set()
+    if partial_path.exists():
+        with open(partial_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue                 # torn tail line from a kill
+                records.append(r)
+                done_idx.add(int(r["idx"]))
+        print(f"[ef-probe] RESUME: {len(records)} pairs loaded from "
+              f"{partial_path.name}")
+    pf = open(partial_path, "a")
 
     for step_i, k in enumerate(chosen_idx):
+        if int(k) in done_idx:
+            continue
         ex = ds[int(k)]
         src, tgt = ex["sentence1"], ex["sentence2"]
         src_ids = tokenizer(src, add_special_tokens=True).input_ids
@@ -353,7 +370,8 @@ def main():
         if n_ops == 0:
             continue
         gold_pos = gold_edit_positions(slots)
-        bucket = _bucket(n_ops)
+        prng = np.random.default_rng(args.seed * 1000003 + int(k))
+        srng = random.Random(args.seed * 1000003 + int(k))
 
         # Conditioning (training parity — same construction as the probes)
         with torch.no_grad():
@@ -386,8 +404,8 @@ def main():
         za_t, zs_t = diff_intervention(z_src, z_tgt, args.k_amp, args.k_sup)
         zvar = {"true": (za_t, zs_t),
                 "empty": (torch.zeros_like(za_t), torch.zeros_like(zs_t)),
-                "random": (randomize_intervention(za_t, rng),
-                           randomize_intervention(zs_t, rng))}
+                "random": (randomize_intervention(za_t, prng),
+                           randomize_intervention(zs_t, prng))}
 
         rec = {"idx": int(k), "src": src, "tgt": tgt, "n_ops": n_ops,
                "outputs": {}}
@@ -399,18 +417,17 @@ def main():
             lam, _ = rates(model, src_ids, za, zs, args.iou_t, args.device)
             lam_tot = lam.sum(dim=-1).cpu().tolist()
             iou = lambda_iou(lam_tot, gold_pos)
-            if iou == iou:
-                iou_agg[c].append(iou)
 
             if c == "true":
                 # rate-magnitude diagnostic: mean top-|gold| λ across t —
                 # compare against the training target w(t)
+                rec["rate_diag"] = {}
                 for td in T_DIAG:
                     lam_d, _ = rates(model, src_ids, za, zs, td,
                                      args.device)
                     tot = lam_d.sum(dim=-1)
                     topv = tot.topk(min(len(gold_pos), tot.shape[0])).values
-                    lam_diag[td].append(float(topv.mean()))
+                    rec["rate_diag"][str(td)] = float(topv.mean())
                 if tagger is not None:
                     x_in = torch.tensor([src_ids], dtype=torch.long,
                                         device=args.device)
@@ -425,7 +442,7 @@ def main():
                     score[:-1] = torch.maximum(score[:-1], insp[1:])
                     tiou = lambda_iou(score.cpu().tolist(), gold_pos)
                     if tiou == tiou:
-                        tagger_iou_agg.append(tiou)
+                        rec["tagger_iou"] = tiou
 
             lb = lens_bias(zvar[c][0], zvar[c][1]) if c != "empty" else None
             rec["outputs"][c] = {"lambda_iou": iou}
@@ -443,21 +460,53 @@ def main():
                 out_text = tokenizer.decode(out_ids,
                                             skip_special_tokens=True)
                 pm = pair_metrics(out_text, src, tgt)
-                a = agg[c][m]
-                a["exact"].append(pm["exact_match"])
-                a["sim_target"].append(pm["sim_target"])
-                a["copy"].append(pm["copy_rate"])
-                a["no_edit"].append(float(out_ids == src_ids))
-                if c == "true":
-                    bp = bpair[m][bucket]
-                    bp["exact"].append(pm["exact_match"])
-                    bp["sim_target"].append(pm["sim_target"])
                 rec["outputs"][c][m] = {
                     "text": out_text, "exact": pm["exact_match"],
-                    "sim_target": pm["sim_target"]}
+                    "sim_target": pm["sim_target"],
+                    "copy": pm["copy_rate"],
+                    "no_edit": float(out_ids == src_ids)}
         records.append(rec)
+        pf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        pf.flush()
         if (step_i + 1) % 10 == 0:
-            print(f"[ef-probe] {step_i + 1}/{len(chosen_idx)} pairs")
+            print(f"[ef-probe] {step_i + 1}/{len(chosen_idx)} pairs "
+                  f"({len(records)} scored)")
+    pf.close()
+
+    # ---- aggregates (rebuilt from records — resume-safe) ----------------
+    agg = {c: {m: defaultdict(list) for m in modes} for c in conditions}
+    iou_agg = {c: [] for c in conditions}
+    tagger_iou_agg = []
+    lam_diag = {t: [] for t in T_DIAG}
+    bpair = {m: defaultdict(lambda: defaultdict(list)) for m in modes}
+    for r in records:
+        b = _bucket(int(r["n_ops"]))
+        if r.get("tagger_iou") is not None:
+            tagger_iou_agg.append(float(r["tagger_iou"]))
+        for td in T_DIAG:
+            v = (r.get("rate_diag") or {}).get(str(td))
+            if v is not None:
+                lam_diag[td].append(float(v))
+        for c in conditions:
+            co = r["outputs"].get(c)
+            if not co:
+                continue
+            li = co.get("lambda_iou")
+            if li is not None and li == li:
+                iou_agg[c].append(float(li))
+            for m in modes:
+                mo = co.get(m)
+                if not isinstance(mo, dict):
+                    continue
+                a = agg[c][m]
+                a["exact"].append(mo["exact"])
+                a["sim_target"].append(mo["sim_target"])
+                a["copy"].append(mo.get("copy", float("nan")))
+                a["no_edit"].append(mo.get("no_edit", float("nan")))
+                if c == "true":
+                    bp = bpair[m][b]
+                    bp["exact"].append(mo["exact"])
+                    bp["sim_target"].append(mo["sim_target"])
 
     # ---- report -------------------------------------------------------
     n_scored = len(records)
@@ -562,6 +611,7 @@ def main():
     with open(out_dir / "records.jsonl", "w") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    partial_path.unlink(missing_ok=True)     # complete → partial retired
     print("\n".join(lines))
     print(f"[ef-probe] wrote {out_dir}/probe_report.md, probe_metrics.json, "
           f"records.jsonl")
