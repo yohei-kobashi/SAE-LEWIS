@@ -123,12 +123,17 @@ flow_loss の勾配経路)。実行入口は `train_editflow_pilot.sh`(qsub、~2
 EF の優位性の根拠は「localization の知識」ではなく「決定経路が単一の
 較正可能スカラー(λ ≥ F·w(t))であること」に更新。
 (c) **完全合格** — empty 無編集 1.0000、さらに random でも 1.0000。
-(b)/総合 — **未判定**: λ ヘッドは目標 w(t) の ~1/10 で、しかも **t に
-伴う成長を追従しない**(ratio 0.119→0.027、λ≈0.25 で飽和 — t トークン
-1個では強度変調が弱い)。recal 第1回の thr 数値は stall-exit バグ
-(全デコードが t≈0.12 で打ち切り)で無効 — 修正済み、
-`run_editflow_recal_v6.sh`(probe_recal2、thr{0.02,0.05,0.1})で再測。
-回復しなければ rate-head LR 増 + t 注入強化(λ ヘッドへの FiLM)で再学習。
+(b)/総合 — **recal2(stall バグ修正後)で実質達成**: thr0.02 で
+exact **0.1407**(パイプライン e2e 0.112 超え)、thr0.1 で sim 0.6424
+(margin +0.042 vs パイプライン +0.056)。tagger・テンプレート・ranker・
+refine なしの 30k プロトタイプ + 推論側較正パッチでこの水準。
+(b) の det/stoch 比較は thr{F} が本番デコードとなったことで置換 —
+F が exact↔sim↔premise 厳格性(random 漏れ 12%@0.02 → 0.5%@0.1)の
+単一ノブ。多サイト尾部(4-8: 0.013–0.026)は Z3 の標的として残存。
+→ **プロトタイプ規模での昇格判定は通過。EDIT_FLOWS_ZERO の Z1
+(t-FiLM + rate-head LR 分離 + 特徴トークン条件付け)に進む。**
+同一ペア厳密比較は `scripts/compare_ef_pipeline.py`(records.jsonl の
+idx 結合、GPU 不要)。
 
 | 条件 | 指標 | 合格ライン |
 |---|---|---|
