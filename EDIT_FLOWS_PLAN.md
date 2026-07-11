@@ -114,6 +114,16 @@ flow_loss の勾配経路)。実行入口は `train_editflow_pilot.sh`(qsub、~2
 
 ## 5. 判定ゲート(昇格条件 — レビューで特定した3未知の実測)
 
+**パイロット実測(2026-07、30k steps、README §13.8)**:
+(a) **合格・大差** — λ-IoU true 0.7337 / empty 0.2034 / random 0.2963
+(tagger の OOD iou ~0.30 の約 2.4 倍; count-oracle 差の検証は recal probe)。
+(c) **完全合格** — empty 無編集 1.0000、さらに random でも 1.0000。
+(b)/総合 — **未判定**: λ ヘッドの絶対値が目標 w(t) の ~1/8 でデコードが
+ほぼ発火せず(exact 0.00)。位置ランキングは正しく大きさだけ小さい =
+較正問題。学習ゼロの修正 `thr{F}` デコード(λ ≥ F·w(t) で発火)を
+`run_editflow_recal_v6.sh` で測定 → 回復すれば推論ノブで解決、
+しなければ rate-head LR 増で再学習後に (b)/総合を判定。
+
 | 条件 | 指標 | 合格ライン |
 |---|---|---|
 | (a) λ の OOD localization | λ-IoU vs tagger span IoU(LinguaLens) | tagger 同等以上 |

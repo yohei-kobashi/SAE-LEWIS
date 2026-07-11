@@ -40,7 +40,7 @@ from transformers import AutoTokenizer                             # noqa: E402
 from editflow import load_editflow_from_checkpoint                 # noqa: E402
 from editflow_ops import (                                         # noqa: E402
     KIND_DEL, KIND_INS, KIND_SUB, align_pair, apply_step_ops,
-    gold_edit_positions, lambda_iou, slot_ops,
+    gold_edit_positions, lambda_iou, slot_ops, w_weight,
 )
 from eval_lingualens import (                                      # noqa: E402
     diff_intervention, edit_char_ranges, local_pool_topk, pair_metrics,
@@ -82,9 +82,20 @@ def parse_args():
 
     p.add_argument("--steps", type=int, default=48)
     p.add_argument("--decode", default="det,stoch",
-                   help="det = expected-count top-rate ops per step; "
-                        "stoch = Bernoulli fires + temperature-1 Q samples "
-                        "(true condition only).")
+                   help="Comma list: det = expected-count top-rate ops per "
+                        "step; stoch = Bernoulli fires + temperature-1 Q "
+                        "samples (true condition only); thr{F} = fire ops "
+                        "whose rate ≥ F·w(t) — CALIBRATED thresholding "
+                        "against the training target (a pending op's "
+                        "optimal rate IS w(t)), robust to a globally "
+                        "under-scaled λ head. E.g. 'det,thr0.1,thr0.25'.")
+    p.add_argument("--w-max", type=float, default=20.0,
+                   help="w(t) clip — must match training --w-max.")
+    p.add_argument("--tagger-ckpt", default="",
+                   help="Optional SAETagger checkpoint: adds the tagger's "
+                        "COUNT-ORACLE IoU on the same pairs / gold sets, "
+                        "making gate (a) apples-to-apples (the e2e iou "
+                        "~0.30 is threshold-based, a lower bar).")
     p.add_argument("--steer-lambda", type=float, default=1.0,
                    help="Logit-lens bias on Q^sub/Q^ins at every step; "
                         "0 = off.")
@@ -124,6 +135,8 @@ def rates(model, ids: List[int], za, zs, t: float, device: str):
 def decode_flow(
     model, src_ids: List[int], za, zs, *,
     steps: int, device: str, mode: str = "det",
+    thr_frac: float = 0.0, w_max: float = 20.0,
+    thr_abs_floor: float = 0.05,
     lens_bias: Optional[torch.Tensor] = None,
     cfg_scale: float = 1.0,
     max_ops_per_step: int = 8, max_grow: int = 24,
@@ -136,6 +149,7 @@ def decode_flow(
     zse = torch.zeros_like(zs)
     h_step = 1.0 / steps
     carry = 0.0
+    stall = 0
     for step in range(steps):
         if len(x) - len(src_ids) >= max_grow:
             break
@@ -150,6 +164,15 @@ def decode_flow(
         lam[0, KIND_SUB] = 0.0
 
         flat = lam.reshape(-1)                       # (L*3,)
+        # Stall exit: rates this small can never fire anything real; six
+        # consecutive dead steps (empty / satisfied conditioning) end the
+        # decode instead of burning the remaining forwards.
+        if float(flat.max()) < 0.02:
+            stall += 1
+            if stall >= 6:
+                break
+            continue
+        stall = 0
         if mode == "det":
             # Expected fire count this step (with fractional carry so mass
             # < 1 per step still integrates), taken from the TOP rates only:
@@ -166,6 +189,21 @@ def decode_flow(
             order = [i for i in
                      torch.argsort(flat, descending=True).tolist()
                      if float(flat[i]) >= floor_val]
+        elif mode == "thr":
+            # Calibrated firing: training's per-op optimum at a pending
+            # site is λ* = w(t), so "λ ≥ F·w(t)" reads the model's own
+            # magnitude against its target instead of against the step
+            # budget — immune to a globally under-scaled rate head. The
+            # absolute floor keeps noise rates from firing near t=0 where
+            # w(t) → 0 makes any relative threshold vacuous.
+            floor_val = max(thr_frac * w_weight(t, w_max), thr_abs_floor)
+            cand = [i for i in range(len(flat))
+                    if float(flat[i]) >= floor_val]
+            cand.sort(key=lambda i: -float(flat[i]))
+            order = cand
+            n_fire = min(len(cand), max_ops_per_step)
+            if n_fire <= 0:
+                continue
         else:
             p_fire = 1.0 - torch.exp(-h_step * flat)
             fires = [i for i in range(len(flat))
@@ -215,7 +253,18 @@ def decode_flow(
 def main():
     args = parse_args()
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
-    modes = [m.strip() for m in args.decode.split(",") if m.strip()]
+    mode_specs = []                       # (name, decode_mode, thr_frac)
+    for m in args.decode.split(","):
+        m = m.strip()
+        if not m:
+            continue
+        if m in ("det", "stoch"):
+            mode_specs.append((m, m, 0.0))
+        elif m.startswith("thr"):
+            mode_specs.append((m, "thr", float(m[3:])))
+        else:
+            raise SystemExit(f"unknown decode mode {m!r}")
+    modes = [name for name, _, _ in mode_specs]
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
@@ -251,6 +300,15 @@ def main():
         sae_layer=args.sae_layer, sae_type=args.sae_type, sae_k=args.sae_k,
     ).to(args.device).eval()
 
+    tagger = None
+    if args.tagger_ckpt:
+        from tagger import load_tagger_from_checkpoint
+        tagger = load_tagger_from_checkpoint(
+            args.llm2vec_dir, args.tagger_ckpt, d_sae=model.d_sae,
+            dtype=dtype).to(args.device).eval()
+        print(f"[ef-probe] tagger count-oracle comparison: "
+              f"{args.tagger_ckpt}")
+
     blk = None
     if args.blocklist:
         _bl = np.load(args.blocklist)
@@ -276,6 +334,9 @@ def main():
 
     agg = {c: {m: defaultdict(list) for m in modes} for c in conditions}
     iou_agg = {c: [] for c in conditions}
+    tagger_iou_agg = []
+    T_DIAG = (0.3, 0.5, 0.7, 0.9)
+    lam_diag = {t: [] for t in T_DIAG}    # mean λ at top-|gold| sites, true
     bpair = {m: defaultdict(lambda: defaultdict(list)) for m in modes}
     records = []
 
@@ -338,14 +399,40 @@ def main():
             if iou == iou:
                 iou_agg[c].append(iou)
 
+            if c == "true":
+                # rate-magnitude diagnostic: mean top-|gold| λ across t —
+                # compare against the training target w(t)
+                for td in T_DIAG:
+                    lam_d, _ = rates(model, src_ids, za, zs, td,
+                                     args.device)
+                    tot = lam_d.sum(dim=-1)
+                    topv = tot.topk(min(len(gold_pos), tot.shape[0])).values
+                    lam_diag[td].append(float(topv.mean()))
+                if tagger is not None:
+                    x_in = torch.tensor([src_ids], dtype=torch.long,
+                                        device=args.device)
+                    t_out = tagger(x_in, torch.ones_like(x_in), za, zs)
+                    opp = torch.softmax(
+                        t_out["op_logits"].float(), dim=-1)[0]     # (T,3)
+                    insp = torch.sigmoid(
+                        t_out["ins_logits"].float())[0]            # (T,)
+                    score = (1.0 - opp[:, 0]).clone()
+                    # ins-before token j = insert AFTER j-1 → anchor j-1,
+                    # matching gold_edit_positions' ins convention
+                    score[:-1] = torch.maximum(score[:-1], insp[1:])
+                    tiou = lambda_iou(score.cpu().tolist(), gold_pos)
+                    if tiou == tiou:
+                        tagger_iou_agg.append(tiou)
+
             lb = lens_bias(zvar[c][0], zvar[c][1]) if c != "empty" else None
             rec["outputs"][c] = {"lambda_iou": iou}
-            for m in modes:
+            for m, dmode, frac in mode_specs:
                 if m == "stoch" and c != "true":
                     continue
                 out_ids = decode_flow(
                     model, src_ids, za, zs, steps=args.steps,
-                    device=args.device, mode=m, lens_bias=lb,
+                    device=args.device, mode=dmode, thr_frac=frac,
+                    w_max=args.w_max, lens_bias=lb,
                     cfg_scale=args.cfg_scale,
                     max_ops_per_step=args.max_ops_per_step,
                     max_grow=args.max_grow, suppress_ids=suppress,
@@ -389,8 +476,29 @@ def main():
         v = float(np.mean(iou_agg[c])) if iou_agg[c] else float("nan")
         payload["lambda_iou"][c] = v
         lines.append(f"| {c} | {v:.4f} | {len(iou_agg[c])} |")
+    if tagger_iou_agg:
+        tv = float(np.mean(tagger_iou_agg))
+        payload["lambda_iou"]["tagger_count_oracle"] = tv
+        lines.append(f"| tagger (count-oracle, same pairs) | {tv:.4f} "
+                     f"| {len(tagger_iou_agg)} |")
     lines += ["", "Compare with tagger OOD span IoU ≈ 0.30 "
-              "(README §13.7 e2e).", ""]
+              "(README §13.7 e2e; threshold-based — the count-oracle row "
+              "above is the apples-to-apples bar).", ""]
+
+    lines += ["## Rate magnitude vs training target (condition = true)", "",
+              "λ head calibration: at a pending site the training optimum "
+              "is λ* = w(t). Ratios ≪ 1 mean the decode's expected-count "
+              "rule under-fires (use thr{F} decode or retrain with a "
+              "larger rate-head LR).", "",
+              "| t | w(t) target | mean top-|gold| λ | ratio |",
+              "|---|---|---|---|"]
+    payload["rate_calibration"] = {}
+    for td in T_DIAG:
+        wt = w_weight(td, args.w_max)
+        mv = float(np.mean(lam_diag[td])) if lam_diag[td] else float("nan")
+        payload["rate_calibration"][str(td)] = {"w": wt, "mean_top_lam": mv}
+        lines.append(f"| {td:g} | {wt:.3f} | {mv:.4f} | {mv / wt:.3f} |")
+    lines.append("")
 
     lines += ["## Decode quality (gates (b), (c))", "",
               "| condition | mode | exact | sim_target | copy | no_edit |",
