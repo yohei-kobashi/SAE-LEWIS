@@ -307,13 +307,20 @@ class SAEEditFlow(nn.Module):
             self.cond_scale.data.copy_(sd["cond_scale"])
         lora_sd = {k[len("lora::"):]: v for k, v in sd.items()
                    if k.startswith("lora::")}
-        if lora_sd and self.lora_cfg is not None:
+        ck_r = next((int(v.shape[0]) for k, v in lora_sd.items()
+                     if k.endswith("lora_A")), None)
+        if lora_sd and self.lora_cfg is not None \
+                and ck_r == self.lora_cfg["r"]:
             load_lora_state_dict(self.encoder.backbone, lora_sd)
             print(f"[editflow] init: conditioning + {len(lora_sd)} LoRA "
                   f"tensors from {editor_ckpt}")
         else:
+            why = (f"LoRA r mismatch: ckpt r={ck_r} vs model "
+                   f"r={self.lora_cfg['r']} — LoRA starts fresh"
+                   if lora_sd and self.lora_cfg is not None
+                   else "no LoRA transfer")
             print(f"[editflow] init: conditioning from {editor_ckpt} "
-                  f"(no LoRA transfer)")
+                  f"({why})")
 
     # ------------------------------------------------------------------
     def trainable_state_dict(self) -> Dict[str, torch.Tensor]:
