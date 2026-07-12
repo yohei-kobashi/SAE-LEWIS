@@ -39,8 +39,9 @@ from transformers import AutoTokenizer                             # noqa: E402
 
 from editflow import load_editflow_from_checkpoint                 # noqa: E402
 from editflow_ops import (                                         # noqa: E402
-    KIND_DEL, KIND_INS, KIND_SUB, align_pair, apply_step_ops, build_xt,
-    gold_edit_positions, lambda_iou, slot_ops, w_weight,
+    KIND_DEL, KIND_INS, KIND_SUB, adj_counts, align_pair, apply_step_ops,
+    build_xt, edited_marks_xt, gold_edit_positions, lambda_iou, slot_ops,
+    w_weight,
 )
 from eval_lingualens import (                                      # noqa: E402
     diff_intervention, edit_char_ranges, local_pool_topk, pair_metrics,
@@ -153,12 +154,17 @@ def parse_decode(m: str) -> Dict:
 
 
 @torch.no_grad()
-def rates(model, ids: List[int], za, zs, t: float, device: str):
-    """One forward → (lam (L,3) float32, hidden (L,d))."""
+def rates(model, ids: List[int], za, zs, t: float, device: str,
+          adj: Optional[List[int]] = None):
+    """One forward → (lam (L,3) float32, hidden (L,d)). adj (S3): per-token
+    count of already-edited neighbors; ignored by non-localized models."""
     x = torch.tensor([ids], dtype=torch.long, device=device)
     attn = torch.ones_like(x)
+    adj_t = None
+    if adj is not None:
+        adj_t = torch.tensor([adj], dtype=torch.long, device=device)
     out = model(input_ids=x, attention_mask=attn, z_amp=za, z_sup=zs,
-                t=torch.tensor([t], device=device))
+                t=torch.tensor([t], device=device), adj=adj_t)
     return out["lambda"][0], out["hidden"][0]
 
 
@@ -176,6 +182,8 @@ def decode_flow(
 ) -> List[int]:
     """Integrate the rate model from t=0 to 1 over `steps` steps."""
     x = list(src_ids)
+    edited = [False] * len(x)          # S3 adjacency tracking (see below)
+    use_adj = float(getattr(model, "lam_prop", 0.0)) > 0
     zae = torch.zeros_like(za)
     zse = torch.zeros_like(zs)
     h_step = 1.0 / steps
@@ -185,9 +193,13 @@ def decode_flow(
         if len(x) - len(src_ids) >= max_grow:
             break
         t = (step + 0.5) * h_step
-        lam, hid = rates(model, x, za, zs, t, device)
+        adj_l = None
+        if use_adj:
+            marks = {i for i, e in enumerate(edited) if e}
+            adj_l = adj_counts(marks, len(x))
+        lam, hid = rates(model, x, za, zs, t, device, adj=adj_l)
         if cfg_scale != 1.0:
-            lam_e, hid_e = rates(model, x, zae, zse, t, device)
+            lam_e, hid_e = rates(model, x, zae, zse, t, device, adj=adj_l)
             lam = torch.clamp(lam_e + cfg_scale * (lam - lam_e), min=0.0)
         L = lam.shape[0]
         lam = lam.clone()
@@ -280,7 +292,7 @@ def decode_flow(
             chosen.append({"kind": kind, "pos": pos, "tok": tok})
         if not chosen:
             continue
-        x = apply_step_ops(x, chosen)
+        x, edited = apply_step_ops(x, chosen, edited)
     return x
 
 
@@ -482,10 +494,15 @@ def main():
                     topv = tot.topk(min(len(gold_pos), tot.shape[0])).values
                     rec["rate_diag"][str(td)] = float(topv.mean())
                     fired = [prng.random() < td ** 3 for _ in ops_all]
+                    adj_o = None
+                    if float(getattr(model, "lam_prop", 0.0)) > 0:
+                        marks_o, xl_o = edited_marks_xt(slots, ops_all,
+                                                        fired)
+                        adj_o = adj_counts(marks_o, xl_o)
                     x_t, pend = build_xt(slots, ops_all, fired)
                     if pend:
                         lam_o, _ = rates(model, x_t, za, zs, td,
-                                         args.device)
+                                         args.device, adj=adj_o)
                         vals = [float(lam_o[op["pos"], op["kind"]])
                                 for op in pend]
                         rec["rate_diag_ondist"][str(td)] = (

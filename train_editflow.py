@@ -39,8 +39,8 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup, set_see
 from data import CorruptionDataset, _dense_topk
 from editflow import SAEEditFlow
 from editflow_ops import (
-    KIND_INS, KIND_SUB, align_pair, build_xt, cache_slots, kappa, slot_ops,
-    w_weight,
+    KIND_INS, KIND_SUB, adj_counts, align_pair, build_xt, cache_slots,
+    edited_marks_xt, kappa, sample_localized_fired, slot_ops, w_weight,
 )
 from intervene import diff_to_sparse, draw_k, parse_k_spec
 from model import load_sae_w_dec
@@ -81,6 +81,12 @@ def parse_args():
                         "(the ops that GENERATED the pair) instead of "
                         "difflib; falls back per record when they don't "
                         "reconstruct (x0, x1).")
+    p.add_argument("--lam-prop", type=float, default=0.0,
+                   help="S3 (paper C.1, Localized Edit Flows): propagation "
+                        "rate λ_prop. >0 switches training to localized "
+                        "paths — clustered firing, per-op λ_eff weights, "
+                        "adjacency feature + hazard base boost. 0 = off "
+                        "(exactly the factorized process).")
     p.add_argument("--rate-param", default="free",
                    choices=["free", "hazard"],
                    help="S1 (EDIT_FLOWS_ZERO §5): 'hazard' = λ = "
@@ -159,7 +165,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
     """Sample (t, fired) per record and assemble padded x_t tensors plus
     flat pending-op index lists. Records longer than --max-len are dropped
     (skipped indices simply don't contribute)."""
-    xs, ts, pend_all = [], [], []
+    xs, ts, pend_all, pend_w_all, adj_all = [], [], [], [], []
     za_l, zs_l = [], []
     for b in range(len(batch["x0"])):
         x0, x1 = batch["x0"][b], batch["x1"][b]
@@ -174,8 +180,25 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
         ops = slot_ops(slots)
         t = float(fixed_t[len(xs) % len(fixed_t)]) if fixed_t \
             else float(rng.random())
-        fired = [bool(rng.random() < kappa(t)) for _ in ops]
+        lam_prop = float(getattr(args, "lam_prop", 0.0))
+        if lam_prop > 0:
+            # S3 localized propagation paths (paper C.1): clustered firing
+            # + per-op effective weights λ_eff = w(t) + λ_prop·(#adjacent
+            # coverage sources); adjacency feature from the visible edits.
+            fired, lam_eff = sample_localized_fired(
+                slots, ops, t, lam_prop, rng, w_max=args.w_max)
+        else:
+            fired = [bool(rng.random() < kappa(t)) for _ in ops]
+            lam_eff = None
         x_t, pending = build_xt(slots, ops, fired)
+        w_t = w_weight(t, args.w_max)
+        pend_w = [w_t if lam_eff is None else lam_eff[op["op"]]
+                  for op in pending]
+        if lam_prop > 0:
+            marks, xl = edited_marks_xt(slots, ops, fired)
+            adj = adj_counts(marks, xl)
+        else:
+            adj = None
         k_amp = draw_k(rng, args._k_amp)
         k_sup = draw_k(rng, args._k_sup)
         a, s = diff_to_sparse(
@@ -186,6 +209,8 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
         xs.append(x_t)
         ts.append(t)
         pend_all.append(pending)
+        pend_w_all.append(pend_w)
+        adj_all.append(adj)
         za_l.append(a)
         zs_l.append(s)
     if not xs:
@@ -197,39 +222,47 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
     for b, x in enumerate(xs):
         ids[b, :len(x)] = torch.tensor(x, dtype=torch.long)
         attn[b, :len(x)] = 1
+    adj_t = None
+    if any(a is not None for a in adj_all):
+        adj_t = torch.zeros((B, T), dtype=torch.long)
+        for b, a in enumerate(adj_all):
+            if a:
+                adj_t[b, :len(a)] = torch.tensor(a, dtype=torch.long)
     return {
         "input_ids": ids, "attention_mask": attn,
         "t": torch.tensor(ts, dtype=torch.float32),
         "z_amp": torch.stack(za_l), "z_sup": torch.stack(zs_l),
-        "pending": pend_all,
+        "pending": pend_all, "pend_w": pend_w_all, "adj": adj_t,
     }
 
 
 def flow_loss(model, built: Dict, args, device: str,
               return_metrics: bool = False):
+    adj = built.get("adj")
     out = model(
         input_ids=built["input_ids"].to(device),
         attention_mask=built["attention_mask"].to(device),
         z_amp=built["z_amp"].to(device),
         z_sup=built["z_sup"].to(device),
         t=built["t"].to(device),
+        adj=adj.to(device) if adj is not None else None,
     )
     lam, h = out["lambda"], out["hidden"]                # (B,T,3), (B,T,d)
     B = lam.shape[0]
     eps = 1e-8
 
     rate_sum = lam.sum(dim=(1, 2))                       # (B,)
-    w = torch.tensor([w_weight(float(t), args.w_max) for t in built["t"]],
-                     device=device)                       # (B,)
 
-    # Flat pending indices (t_idx = Q target token, -1 for DEL)
-    b_idx, p_idx, k_idx, t_idx = [], [], [], []
+    # Flat pending indices (t_idx = Q target token, -1 for DEL) and per-op
+    # weights (w(t) in the factorized case; λ_eff under localized paths).
+    b_idx, p_idx, k_idx, t_idx, w_op = [], [], [], [], []
     for b, pend in enumerate(built["pending"]):
-        for op in pend:
+        for op, wt in zip(pend, built["pend_w"][b]):
             b_idx.append(b)
             p_idx.append(op["pos"])
             k_idx.append(op["kind"])
             t_idx.append(-1 if op["tgt"] is None else int(op["tgt"]))
+            w_op.append(float(wt))
 
     ce = torch.zeros(B, device=device)
     metrics = {}
@@ -238,9 +271,10 @@ def flow_loss(model, built: Dict, args, device: str,
         bi = torch.tensor(b_idx, device=device)
         pi = torch.tensor(p_idx, device=device)
         ki = torch.tensor(k_idx, device=device)
+        wo = torch.tensor(w_op, device=device)           # (N,)
         lam_sel = lam[bi, pi, ki]                        # (N,)
         log_lam = torch.log(lam_sel + eps)
-        ce.index_add_(0, bi, log_lam)
+        ce.index_add_(0, bi, wo * log_lam)
 
         # Q terms, grouped by kind so lm_head runs once per kind
         for kind_val, kind_name in ((KIND_SUB, "sub"), (KIND_INS, "ins")):
@@ -250,10 +284,11 @@ def flow_loss(model, built: Dict, args, device: str,
             rb = torch.tensor([b_idx[i] for i in rows], device=device)
             rp = torch.tensor([p_idx[i] for i in rows], device=device)
             tgt = torch.tensor([t_idx[i] for i in rows], device=device)
+            rw = torch.tensor([w_op[i] for i in rows], device=device)
             logits = model.q_logits(h[rb, rp], kind_name)     # (N, V)
             logq = torch.log_softmax(logits, dim=-1)
             logq_sel = logq.gather(1, tgt.unsqueeze(1)).squeeze(1)
-            ce.index_add_(0, rb, logq_sel)
+            ce.index_add_(0, rb, rw * logq_sel)
             if return_metrics:
                 metrics[f"q_{kind_name}_top1"] = float(
                     (logits.argmax(dim=-1) == tgt).float().mean())
@@ -263,7 +298,7 @@ def flow_loss(model, built: Dict, args, device: str,
             metrics["kind_acc"] = float(
                 (lam[bi, pi].argmax(dim=-1) == ki).float().mean())
 
-    loss_b = rate_sum - w * ce                           # (B,)
+    loss_b = rate_sum - ce                               # (B,)
     loss = loss_b.mean()
     if return_metrics:
         mask = built["attention_mask"].to(device).float()
@@ -314,14 +349,19 @@ def main():
         lora_dropout=args.lora_dropout, proj_a_rank=args.proj_a_rank,
         w_dec=w_dec, t_film=args.t_film, cond_mode=args.cond_mode,
         rate_param=args.rate_param, w_max=args.w_max,
+        lam_prop=args.lam_prop,
     )
+    if args.lam_prop > 0 and args.rate_param != "hazard":
+        raise SystemExit("--lam-prop requires --rate-param hazard (the "
+                         "localized base boost extends the hazard factor)")
     if args.init_from_editor:
         model.init_from_editor(args.init_from_editor)
     if args.init_from_editflow:
         model.init_from_editflow(args.init_from_editflow)
     model = model.to(args.device)
     print(f"[editflow] t_film={args.t_film} cond_mode={args.cond_mode} "
-          f"true_align={args.true_align} rate_param={args.rate_param}")
+          f"true_align={args.true_align} rate_param={args.rate_param} "
+          f"lam_prop={args.lam_prop:g}")
 
     lora_params = [p for n, p in model.named_parameters() if "lora_" in n]
     rate_names = ("lam_head.", "lam_film.")

@@ -65,6 +65,7 @@ class SAEEditFlow(nn.Module):
         cond_mode: str = "pooled",
         rate_param: str = "free",
         w_max: float = 20.0,
+        lam_prop: float = 0.0,
     ):
         """t_film (Z1a): modulate the λ head's input with FiLM(t) — REFUTED
         + premise-breaking (README §13.8 Z1 verdict; the additive β(t) is an
@@ -81,7 +82,16 @@ class SAEEditFlow(nn.Module):
         analytically and learn ONLY P(pending). Magnitude tracking becomes
         exact by construction, the thr{F} decode reads as p ≥ F (a
         calibrated probability), and there is no input-independent rate
-        path to leak premise protection."""
+        path to leak premise protection.
+        lam_prop (S3, paper appendix C.1 — Localized Edit Flows): under
+        localized propagation paths the target rate at a pending site
+        adjacent to fired edits is λ_eff = w(t) + λ_prop·(#adjacent
+        coverage sources), not w(t). We extend the analytic hazard base to
+        b = w(t) + λ_prop·adj (adj = observable count of already-edited
+        neighbors, 0..2) so λ = b·sigmoid(head) keeps p a probability and
+        thr{F} ≡ p ≥ F. adj also enters the encoder via a zero-init
+        embedding (deletion boundaries are invisible in x_t tokens
+        alone)."""
         super().__init__()
         self.encoder = BidirectionalLLM(llm2vec_dir, dtype=dtype)
         self.encoder.eval()
@@ -115,6 +125,7 @@ class SAEEditFlow(nn.Module):
             raise ValueError(f"unknown rate_param {rate_param!r}")
         self.rate_param = rate_param
         self.w_max = float(w_max)
+        self.lam_prop = float(lam_prop)
 
         # Conditioning — identical structure to SAEEditor (wdec-frozen mode)
         # so a v6 editor checkpoint initializes it 1:1.
@@ -169,6 +180,12 @@ class SAEEditFlow(nn.Module):
             self.mag_proj = nn.Linear(1, d_model)
             nn.init.zeros_(self.mag_proj.weight)
             nn.init.zeros_(self.mag_proj.bias)
+        # S3: adjacency-to-fired-edits feature (0/1/2). Zero-init → exact
+        # identity at step 0 (an S2 checkpoint warm-starts unchanged).
+        self.adj_emb = None
+        if self.lam_prop > 0:
+            self.adj_emb = nn.Embedding(3, d_model)
+            nn.init.zeros_(self.adj_emb.weight)
 
     # ------------------------------------------------------------------
     def _calibrate(self, x: torch.Tensor, scale: bool = True) -> torch.Tensor:
@@ -237,10 +254,13 @@ class SAEEditFlow(nn.Module):
         z_amp: torch.Tensor,            # (B, d_sae)
         z_sup: torch.Tensor,            # (B, d_sae)
         t: torch.Tensor,                # (B,) in [0, 1]
+        adj: Optional[torch.Tensor] = None,  # (B, T) long 0..2 — S3 only
     ) -> Dict[str, torch.Tensor]:
         B, T = input_ids.shape
         with torch.no_grad():
             tok = self.encoder.get_input_embeddings()(input_ids)
+        if self.adj_emb is not None and adj is not None:
+            tok = tok + self.adj_emb(adj).to(tok.dtype)
         if self.cond_mode == "feature-tokens":
             cond, cond_mask = self.feature_token_embeds(z_amp, z_sup)
             cond = cond.to(tok.dtype)
@@ -267,12 +287,17 @@ class SAEEditFlow(nn.Module):
             lam_in = lam_in * (1.0 + gamma.unsqueeze(1)) + beta.unsqueeze(1)
         logits3 = self.lam_head(lam_in)                 # (B, T, 3) float32
         if self.rate_param == "hazard":
-            # λ = w(t)·P(pending): analytic hazard × learned probability.
+            # λ = b·P(pending): analytic hazard base × learned probability.
+            # Base is w(t), plus the localized-propagation boost
+            # λ_prop·adj at sites neighboring already-fired edits (S3).
             tt = t.float().clamp(0.0, 1.0)
             w = (3.0 * tt * tt / (1.0 - tt ** 3).clamp_min(1e-9)
                  ).clamp(max=self.w_max)                # (B,)
+            base = w.view(-1, 1).expand(B, T)           # (B, T)
+            if self.lam_prop > 0 and adj is not None:
+                base = base + self.lam_prop * adj.float()
             p = torch.sigmoid(logits3)
-            lam = w.view(-1, 1, 1) * p
+            lam = base.unsqueeze(-1) * p
         else:
             p = None
             lam = F.softplus(logits3)
@@ -344,6 +369,8 @@ class SAEEditFlow(nn.Module):
         if self.mag_proj is not None:
             sd["mag_proj.weight"] = self.mag_proj.weight.detach().cpu()
             sd["mag_proj.bias"] = self.mag_proj.bias.detach().cpu()
+        if self.adj_emb is not None:
+            sd["adj_emb.weight"] = self.adj_emb.weight.detach().cpu()
         if self.lora_cfg is not None:
             for n, tns in lora_state_dict(self.encoder.backbone).items():
                 sd[f"lora::{n}"] = tns
@@ -354,7 +381,7 @@ class SAEEditFlow(nn.Module):
         "type_emb.weight", "cond_scale", "t_proj.weight", "t_proj.bias",
         "lam_head.weight", "lam_head.bias", "sub_shift", "ins_shift",
         "lam_film.weight", "lam_film.bias", "mag_proj.weight",
-        "mag_proj.bias",
+        "mag_proj.bias", "adj_emb.weight",
     )
 
     def load_trainable(self, sd: Dict[str, torch.Tensor],
@@ -411,6 +438,7 @@ class SAEEditFlow(nn.Module):
             "cond_mode": self.cond_mode,
             "rate_param": self.rate_param,
             "w_max": float(self.w_max),
+            "lam_prop": float(self.lam_prop),
         }, path)
 
 
@@ -431,6 +459,7 @@ def load_editflow_from_checkpoint(
         cond_mode=blob.get("cond_mode", "pooled"),
         rate_param=blob.get("rate_param", "free"),
         w_max=float(blob.get("w_max", 20.0)),
+        lam_prop=float(blob.get("lam_prop", 0.0)),
     )
     model.load_trainable(blob["trainable"])
     return model
