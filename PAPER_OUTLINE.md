@@ -100,6 +100,20 @@
 - 指標: exact / sim_target / copy(+empty・random統制、λ-IoU count-oracle)。
 - ペア統計: Δexactは不一致ペアのsign test、Δsimはpaired 95% CI
   (`scripts/compare_ef_pipeline.py`、全システムrecords.jsonlをidxで結合)。
+- **FRR(LinguaLens基準の判定、`scripts/judge_feature_realization.py`)**:
+  LinguaLensの介入評価はexactではなく**LLM判定の特徴顕著さ**(GPT-4o、
+  enhancement/ablation成功率+ランダム特徴対照+FIC; 公式repoに判定コードは
+  無く論文側プロトコル — repo確認済み 2026-07-14)。その編集regime適応:
+  gold方向 = judge(src vs tgt)(判定equalは除外、システム間でキャッシュ共有)、
+  システム判定 = judge(src vs 出力)(copyは自動equal)、
+  **FRR = P(判定方向 == gold方向)**。A/B提示順はシード付きランダム化。
+  exactはFRRの下界(exact一致は必ず実現)なので、**FRR−exactの差 =
+  「方向は正しいが不正確な編集」の量**として読む。random条件のFRRを
+  偽陽性フロアとして併記(論文のcontrol群の類似物)。判定はrecordsの
+  既存出力に対して走る(再生成なし)。パイロットはローカルjudge
+  (gemma-2-9b-it)、**論文表はGPT-4o**(judgeごとに別ディレクトリ)。
+  注意: B1(クランプ)とB2(プロンプト)はこの指標でこそ得点し得る —
+  C1/C2の判定はexactとFRRの両輪で行い、片方だけで主張しない。
 
 ## 5. ベースライン(比較対象)
 
