@@ -148,6 +148,11 @@ def main():
     p.add_argument("--gold-cache", required=True,
                    help="jsonl cache of gold (src vs tgt) judgments — "
                         "shared across systems FOR THE SAME JUDGE")
+    p.add_argument("--n-ops-ref", default="",
+                   help="records.jsonl whose n_ops is joined by idx for "
+                        "the bucket breakdown (pipeline records don't "
+                        "store n_ops — point this at the EF probe500 "
+                        "records)")
     p.add_argument("--judge", default="hf:google/gemma-2-9b-it")
     p.add_argument("--out", required=True)
     p.add_argument("--dataset", default="THU-KEG/LinguaLens-Data")
@@ -165,6 +170,14 @@ def main():
     with open(args.records) as f:
         recs = [json.loads(l) for l in f if l.strip()]
     print(f"[frr] {len(recs)} records from {args.records}")
+    nref = {}
+    if args.n_ops_ref:
+        with open(args.n_ops_ref) as f:
+            for line in f:
+                if line.strip():
+                    r = json.loads(line)
+                    nref[int(r["idx"])] = int(r.get("n_ops", 1))
+        print(f"[frr] n_ops joined from {args.n_ops_ref} ({len(nref)})")
 
     if args.judge.startswith("hf:"):
         judge = HFJudge(args.judge[3:], args.device, args.llm_dtype)
@@ -206,7 +219,11 @@ def main():
             continue
         ex = ds[k]
         feature = ex.get("feature") or ex.get("categories") or "?"
-        src, tgt = rec["src"], rec["tgt"]
+        # probe/B2 records use src/tgt; pipeline records use source/target
+        src = rec.get("src") or rec.get("source")
+        tgt = rec.get("tgt") or rec.get("target")
+        if src is None or tgt is None:
+            raise SystemExit(f"record idx {k} has no src/source field")
         o = rec["outputs"].get(args.condition)
         if o is None:
             continue
@@ -239,7 +256,7 @@ def main():
             realized = sysj == "out"
         else:
             realized = sysj == "src" and norm(out_text) != norm(src)
-        row = {"idx": k, "n_ops": rec.get("n_ops", 1),
+        row = {"idx": k, "n_ops": rec.get("n_ops") or nref.get(k, 1),
                "feature": feature, "gold": gold[k], "sys": sysj,
                "copy": float(norm(out_text) == norm(src)),
                "realized": realized}

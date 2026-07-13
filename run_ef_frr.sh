@@ -28,11 +28,14 @@ TAG=$(echo "$JUDGE" | tr ':/' '__')
 FRR=runs/frr/$TAG
 GOLD=$FRR/gold.jsonl
 
+NREF=$V6/editflow_s3/probe500/records.jsonl   # n_ops source for buckets
+
 run_frr () {  # label records mode condition
     echo "-------- FRR: $1 (condition $4) --------"
     python scripts/judge_feature_realization.py \
         --records "$2" --mode "$3" --condition "$4" \
         --gold-cache "$GOLD" --judge "$JUDGE" \
+        --n-ops-ref "$NREF" \
         --out "$FRR/$1.jsonl" --device cuda
 }
 
@@ -43,9 +46,17 @@ run_frr pipeline      "$V6/eval_lingualens_final/records.jsonl"     ""        tr
 run_frr b2_prompt8    "$V6/prompt_baseline500/records.jsonl"        "prompt8" true
 
 # random-conditioning control (the paper's control-group analog):
-# FRR here reads as the judge/prior false-positive floor
+# FRR here reads as the judge/prior false-positive floor.
+# NOTE: the v6 pipeline eval ran --conditions true,empty (default), so a
+# pipeline-random row would need an eval_lingualens rerun — recorded as
+# an accepted asymmetry unless the paper table demands it.
 run_frr ef_s3_thr01_rnd "$V6/editflow_s3/probe500/records.jsonl"    "thr0.1"  random
+run_frr ef_s3_thr05_rnd "$V6/editflow_s3/probe500/records.jsonl"    "thr0.5"  random
 run_frr b2_prompt8_rnd  "$V6/prompt_baseline500/records.jsonl"      "prompt8" random
+# B2 empty: it edits ~52% of sentences with NO request — does that
+# unconditional editing accidentally realize features? (EF/pipeline
+# empty rows are copies -> FRR trivially ~0, stated analytically.)
+run_frr b2_prompt8_empty "$V6/prompt_baseline500/records.jsonl"     "prompt8" empty
 
 echo "==================== FRR DONE ===================="
 echo "Reading: FRR = P(judged prominence moved in the gold direction),"
