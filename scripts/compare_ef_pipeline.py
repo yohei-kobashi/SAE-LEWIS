@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 
 
@@ -106,6 +107,33 @@ def main():
         if n_b:
             print(f"{b:8s}" + "".join(f"{c:>22s}" for c in cells)
                   + f"   (n={n_b})")
+
+    # Paired per-pair differences vs the pipeline: exact as discordant
+    # counts (ef-only wins / pipeline-only wins — the sign-test cells),
+    # sim as mean Δ with a 95% normal CI. Same pairs, so this is the
+    # rigorous version of comparing the aggregate rows above.
+    print("\npaired vs pipeline (per-pair Δ = ef − pipeline):")
+    print(f"{'system':16s} {'Δexact':>8s} {'ef+/pl+':>9s} "
+          f"{'Δsim':>8s} {'95% CI':>20s}")
+    for m in ef_modes:
+        de, ds = [], []
+        for k in common:
+            eo = ef[k]["outputs"][args.condition].get(m)
+            if not isinstance(eo, dict):
+                continue
+            po = pl[k]["outputs"][args.condition]
+            de.append(eo["exact"] - po["exact_match"])
+            ds.append(eo["sim_target"] - po["sim_target"])
+        n = len(ds)
+        if n < 2:
+            continue
+        wins = sum(1 for d in de if d > 0)
+        losses = sum(1 for d in de if d < 0)
+        md = sum(ds) / n
+        sd = math.sqrt(sum((x - md) ** 2 for x in ds) / (n - 1))
+        half = 1.96 * sd / math.sqrt(n)
+        print(f"ef:{m:13s} {sum(de)/n:+8.4f} {wins:>4d}/{losses:<4d} "
+              f"{md:+8.4f} [{md-half:+.4f}, {md+half:+.4f}]")
 
 
 if __name__ == "__main__":
