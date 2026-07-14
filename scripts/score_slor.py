@@ -36,6 +36,12 @@ def parse_args():
                         "pipeline-format records")
     p.add_argument("--condition", default="true")
     p.add_argument("--unigram", required=True)
+    p.add_argument("--score-target", action="store_true",
+                   help="additionally score the GOLD target as a pseudo-"
+                        "mode 'gold' — the reference dSLOR a correct "
+                        "minimal-pair edit is SUPPOSED to have (many "
+                        "counterfactual targets are less fluent than the "
+                        "source by construction)")
     p.add_argument("--llm", default="google/gemma-2-2b")
     p.add_argument("--out", required=True)
     p.add_argument("--device", default="cuda")
@@ -81,6 +87,12 @@ def main():
     with open(args.records) as f:
         recs = [json.loads(l) for l in f if l.strip()]
     modes = [m for m in args.modes.split(",")] if args.modes else [""]
+    if args.score_target:
+        for r in recs:
+            tgt = r.get("tgt") or r.get("target")
+            r["outputs"].setdefault(args.condition, {})["__gold__"] = \
+                {"text": tgt}
+        modes = ["__gold__"] + modes
 
     def norm(s):
         return " ".join(s.split())
