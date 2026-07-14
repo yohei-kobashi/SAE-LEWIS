@@ -135,8 +135,10 @@ def parse_answer(text: str):
     m = re.search(r"\bANSWER\s*(?:IS|:)?\s*([ABC])\b", t)
     if m:
         return m.group(1)
-    m = re.search(r"\b([ABC])\b", t)
-    return m.group(1) if m else None
+    # last resort: LAST standalone letter — verbose judges put the verdict
+    # at the end, and this avoids the mid-text article-"A" false positive
+    ms = re.findall(r"\b([ABC])\b", t)
+    return ms[-1] if ms else None
 
 
 def compare(judge, feature: str, x: str, y: str, rng) -> str:
