@@ -91,23 +91,51 @@ class OpenAIJudge:
         if not self.key:
             raise SystemExit("openai judge needs OPENAI_API_KEY")
         self.urllib = urllib.request
+        # GPT-5 / o-series require max_completion_tokens and may reject
+        # temperature; GPT-4-era models keep the legacy params.
+        self.modern = not self.model.startswith(("gpt-4", "gpt-3"))
 
-    def __call__(self, prompt: str) -> str:
+    def _call_once(self, body: dict) -> str:
         req = self.urllib.Request(
             "https://api.openai.com/v1/chat/completions",
-            data=json.dumps({
-                "model": self.model, "temperature": 0,
-                "max_tokens": 4,
-                "messages": [{"role": "user", "content": prompt}],
-            }).encode(),
+            data=json.dumps(body).encode(),
             headers={"Authorization": f"Bearer {self.key}",
                      "Content-Type": "application/json"})
-        with self.urllib.urlopen(req, timeout=120) as r:
+        with self.urllib.urlopen(req, timeout=180) as r:
             return json.load(r)["choices"][0]["message"]["content"]
+
+    def __call__(self, prompt: str) -> str:
+        body = {"model": self.model,
+                "messages": [{"role": "user", "content": prompt}]}
+        if self.modern:
+            # headroom for models that spend tokens before answering
+            body["max_completion_tokens"] = 64
+        else:
+            body["temperature"] = 0
+            body["max_tokens"] = 4
+        import urllib.error
+        try:
+            return self._call_once(body)
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and not self.modern:
+                # legacy params rejected — retry with the modern schema
+                body.pop("temperature", None)
+                body.pop("max_tokens", None)
+                body["max_completion_tokens"] = 64
+                return self._call_once(body)
+            raise
 
 
 def parse_answer(text: str):
-    m = re.search(r"\b([ABC])\b", text.strip().upper())
+    t = text.strip().strip('"\'`* ').upper()
+    # prefer a letter at the very start ("B", "B.", "B) because ...") —
+    # avoids the article-"A" false positive in explanatory outputs
+    if t[:1] in ("A", "B", "C") and (len(t) == 1 or not t[1].isalpha()):
+        return t[0]
+    m = re.search(r"\bANSWER\s*(?:IS|:)?\s*([ABC])\b", t)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b([ABC])\b", t)
     return m.group(1) if m else None
 
 
