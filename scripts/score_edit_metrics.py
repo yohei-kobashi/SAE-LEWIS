@@ -97,6 +97,10 @@ def parse_args():
     p.add_argument("--out", required=True,
                    help="output prefix: <out>.md, <out>_per_feature.csv, "
                         "<out>.json")
+    p.add_argument("--emit-routed-records", default="",
+                   help="materialize the routed system as a probe-format "
+                        "records.jsonl (mode 'routed', + 'picked' field) "
+                        "so FRR/SLOR/compare treat it like any system")
     return p.parse_args()
 
 
@@ -161,6 +165,7 @@ def main():
         pair_rows[k] = row
 
     # routed pseudo-system (the confirmed count-rule)
+    picked_of = {}
     if args.router_head and args.router_fallback:
         head = dict((n, (r, m)) for n, r, m in cands)[args.router_head]
         for k in common:
@@ -175,6 +180,27 @@ def main():
                 else args.router_fallback
             if pick in pair_rows[k]:
                 pair_rows[k]["routed"] = dict(pair_rows[k][pick])
+                picked_of[k] = pick
+
+    if args.emit_routed_records and picked_of:
+        rp = Path(args.emit_routed_records)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        with open(rp, "w") as f:
+            for k in common:
+                if k not in picked_of:
+                    continue
+                base = cands[0][1][k]
+                src, tgt = st(base)
+                v = pair_rows[k]["routed"]
+                f.write(json.dumps({
+                    "idx": int(k), "src": src, "tgt": tgt,
+                    "n_ops": base.get("n_ops", 1),
+                    "picked": picked_of[k],
+                    "outputs": {args.condition: {"routed": {
+                        "text": v["text"], "exact": v["exact"],
+                        "sim_target": v["sim"],
+                    }}}}, ensure_ascii=False) + "\n")
+        print(f"[metrics] routed records -> {rp} ({len(picked_of)})")
 
     sys_names = [n for n, _, _ in cands]
     if args.router_head:

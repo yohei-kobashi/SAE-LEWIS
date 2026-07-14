@@ -229,8 +229,7 @@ def main():
             continue
         node = o if not args.mode else o.get(args.mode)
         if not isinstance(node, dict) or "text" not in node:
-            raise SystemExit(f"no text at outputs[{args.condition}]"
-                             f"[{args.mode or ''}] — check --mode")
+            continue          # mode absent on this record (mixed sweeps)
         out_text = node["text"]
 
         rng = random.Random(args.seed * 1000003 + k)
