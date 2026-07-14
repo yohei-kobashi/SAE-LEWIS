@@ -144,6 +144,33 @@
 - B1–B3は全てrecords.jsonl形式で出力 → compare_ef_pipeline.pyがそのまま
   matched-pair統計まで出す。**200ペアprobeで当たり→500ペア本番**の2段階。
 
+## 6b. 主表の確定値(runs/tables/main_metrics_{499,997}、2026-07-14)
+
+- **997ペア(確認ブロック込み)**: routed **exact 0.2839 / SARI 65.88 / sim
+  0.6554** — ef32(0.2237/63.20/0.5809)とsteer(0.2337/58.94/0.6016)を
+  **3指標すべてで**上回る。ルーターは勝者を拾うだけでなく正しいregimeを
+  選ぶため、副次指標も同時に改善する。oracle(exact@2候補)0.3872。
+- 499ペア(全システム): routed 0.2786/66.36/0.6517、oracle(6系)0.5210。
+  pipelineのSARI 40.99(copy 0.63の代償 — SARIはcopyを強く罰する)。
+  BLEU/chrF列はsacrebleu未導入でnan(pip install sacrebleuで埋まる)。
+- **feature別の構造(997、_per_feature.csv)— 論文の中心図**:
+  - **EF(離散編集)が支配: 形態・屈折の単一トークン現象** — noun_plural
+    0.727 vs steer 0.000、past_tense 0.700 vs 0、anaphor 0.875 vs 0.125、
+    superlative 0.667、adjectival_suffix 0.500 vs 0、third_person_singular、
+    comparative、negation_prefix、existential_quantifiers…
+  - **steer(操舵再生成)が支配: 構造・多語現象** — interrogative 0.700 vs
+    EF 0、cleft_sentences 0.643 vs 0.071、passive_voice 0.583 vs 0、
+    of_genitive 0.667、clausal_subjects 0.625、future_perfect 0.917、
+    subject_auxiliary_inversion 0.500…
+  - **routedはfeature別でも概ねmax(EF, steer)を回収**(passive 0.583、
+    interrogative 0.500 等 — λ場が「形態=1ハンク/構造=多ハンク」を
+    教師なしで見分けている direct evidence)。
+  - **両者ゼロの残余フロンティア**: 比喩系(metaphor, personification,
+    hyperbole)、省略・外置(elliptical, extraposition, appositives)、
+    談話(indirect_speech, echo_questions)、一部の項構造
+    (direct_object, factives, resultative)— oracle 0.39が1.0でない理由の
+    現象名リスト。in/near/out対応表はこのCSVから作る。
+
 ## 6. Results(確定済み数値 — 出典 README §13.8 S4 verdict)
 
 - 主表(matched 499 / holdout 300):
