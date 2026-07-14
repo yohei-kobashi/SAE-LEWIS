@@ -56,6 +56,13 @@ def parse_args():
     p.add_argument("--prefix-records", required=True,
                    help="records whose idx set is the TUNING prefix "
                         "(e.g. the 200-pair probe); the rest is holdout")
+    p.add_argument("--count-cand", default="",
+                   help="candidate whose OUTPUT edit-hunk count (vs src, "
+                        "unsupervised) drives the count-rule router: "
+                        "hunks <= T -> that candidate, else --route-to. "
+                        "T swept over {1,2,3}.")
+    p.add_argument("--route-to", default="steer",
+                   help="fallback candidate of the count-rule router")
     p.add_argument("--condition", default="true")
     p.add_argument("--out", required=True)
     p.add_argument("--llm", default="google/gemma-2-2b")
@@ -183,6 +190,24 @@ def main():
 
     names = [n for n, _, _ in cands]
 
+    # Count-rule router: the count candidate's own edit-hunk count vs src
+    # (difflib on tokens — fully unsupervised) decides the regime. Hunks
+    # are computed at report time from the records (CPU, no cache).
+    hunks_of = {}
+    if args.count_cand:
+        crecs = dict((n, (r, m)) for n, r, m in cands)[args.count_cand]
+        crec, cmode = crecs
+        for r in rows:
+            k = r["idx"]
+            base = crec[k]
+            src = base.get("src") or base.get("source")
+            text = base["outputs"][args.condition][cmode]["text"]
+            a = tokenizer(src, add_special_tokens=False).input_ids
+            b = tokenizer(text, add_special_tokens=False).input_ids
+            ops = [t for t, *_ in difflib.SequenceMatcher(
+                None, a, b, autojunk=False).get_opcodes() if t != "equal"]
+            hunks_of[k] = len(ops)
+
     def report(subset, label):
         lines = [f"## {label} (n={len(subset)})", ""]
         for n in names:
@@ -203,6 +228,25 @@ def main():
             r_ex.append(r["cands"][best]["exact"])
         lines.append(f"- **gain-router: {np.mean(r_ex):.4f}** "
                      f"(picks: {dict(picks)})")
+        # 2-way gain router (head candidate vs fallback only)
+        if args.count_cand and args.route_to in names:
+            g2 = []
+            for r in subset:
+                a, b = r["cands"][args.count_cand], r["cands"][args.route_to]
+                g2.append((a if a["gain"] >= b["gain"] else b)["exact"])
+            lines.append(f"- gain-router 2way ({args.count_cand} vs "
+                         f"{args.route_to}): {np.mean(g2):.4f}")
+            for T in (0, 1, 2, 3):
+                ex, n_head = [], 0
+                for r in subset:
+                    if hunks_of.get(r["idx"], 99) <= T:
+                        ex.append(r["cands"][args.count_cand]["exact"])
+                        n_head += 1
+                    else:
+                        ex.append(r["cands"][args.route_to]["exact"])
+                lines.append(f"- **count-rule T={T}** ({args.count_cand} "
+                             f"if own hunks<=T else {args.route_to}): "
+                             f"{np.mean(ex):.4f} (head picks {n_head})")
         # per-bucket
         byb = defaultdict(list)
         for r in subset:
