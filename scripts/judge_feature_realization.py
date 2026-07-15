@@ -262,9 +262,22 @@ def main():
             continue          # mode absent on this record (mixed sweeps)
         out_text = node["text"]
 
-        rng = random.Random(args.seed * 1000003 + k)
+        # SEPARATE rng streams for the gold and system comparisons. They
+        # used to share one stream, which made the system's presentation
+        # order depend on gold-CACHE STATE: the first system judged (the
+        # one that populates the cache) spent draw #1 on gold and drew #2
+        # for itself, while every later system skipped the gold call and
+        # so drew #1 — the very order gold had used. A position-biased
+        # judge then agreed with itself more often on those later systems,
+        # inflating their FRR relative to the first one. Keying both
+        # streams on idx alone gives every system the same order, drawn
+        # independently of gold's, whatever the cache state.
+        # rng_gold reproduces the old first draw exactly, so gold caches
+        # written before this fix stay valid.
+        rng_gold = random.Random(args.seed * 1000003 + k)
+        rng_sys = random.Random(args.seed * 1000003 + k + 500000011)
         if k not in gold:
-            g = compare(judge, feature, src, tgt, rng)   # 'x'=src,'y'=tgt
+            g = compare(judge, feature, src, tgt, rng_gold)  # 'x'=src,'y'=tgt
             gold[k] = {"x": "src", "y": "tgt",
                        "equal": "equal"}[g]
             gf.write(json.dumps({"idx": k, "gold": gold[k],
@@ -273,7 +286,7 @@ def main():
         if norm(out_text) == norm(src):
             sysj = "equal"                                # copy
         else:
-            s = compare(judge, feature, src, out_text, rng)
+            s = compare(judge, feature, src, out_text, rng_sys)
             sysj = {"x": "src", "y": "out", "equal": "equal"}[s]
         # gold 'tgt' means the TARGET side exhibits the feature more →
         # realization = the OUTPUT side exhibits it more; gold 'src'
