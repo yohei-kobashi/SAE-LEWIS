@@ -138,12 +138,56 @@ going negative — a sharper form of the same failure.** Their study covers
 CAA on Llama-2/Qwen-1.5 in a multiple-choice setting and involves no SAEs,
 so we cite it for the phenomenon, not as a measurement of SAE steering.
 
-### D.5 Evaluation and routing 🚧 **(c)(d) 第3ラウンド待ち — 未確定**
+### D.5 Judging the judge (反例(c): 部分的に確定)
 
-> **書けない状態**: judge自己一致率(c)と編集サイズによるルーティング(d)の
-> 反例探索が未完。第3ラウンドの結果が出るまで「先行研究はない」と書かない。
-> 位置バイアス文献 [Wang et al. 2023; Zheng et al. 2023] の引用と、
-> McNemar/attenuation の慣行の記述もここに入る。
+LLM judges carry position bias [Wang et al. 2023; Zheng et al. 2023] and are
+self-inconsistent under repeated identical queries [Stureborg et al. 2024;
+Haldar & Hockenmaier 2025 "Rating Roulette"]. Standard mitigations swap the
+presentation order and average, or keep only order-consistent verdicts; we
+instead randomize A/B order per pair under a fixed seed, and measure what is
+left.
+
+Our contribution here is not a new reliability metric but **an existing
+one obtained for free from the evaluation data**: because a pair whose output
+exactly matches the target makes judge(src, out) and judge(src, tgt) the
+*same comparison*, FRR restricted to exact-match pairs *is* the judge's
+self-consistency — no repeated queries, no human labels.
+
+**The measurement then does double duty, and this is the part that matters.**
+Noisy-judge inference [Chen et al., arXiv:2601.05420] models judge error by
+sensitivity q1 and specificity q0 and corrects via Rogan–Gladen,
+`θ = (p + q0 − 1)/(q0 + q1 − 1)`. Inverting gives `p = (1−q0) + θ(q0+q1−1)`,
+so for two systems **the intercept cancels**:
+`p_A − p_B = (θ_A − θ_B)(q0 + q1 − 1)`. A paired gap is therefore *scaled*,
+never shifted — attenuated toward zero with its sign preserved — **provided
+the judge's error rates do not depend on the system** (non-differential
+misclassification). That assumption is not free in our setting: steer emits
+full regenerations while ef32 emits minimal edits, so judging difficulty
+could plausibly differ. **Our per-system self-consistency is exactly the
+diagnostic**: 0.9860 / 0.9926 / 0.9781 for ef32 / routed / steer under
+GPT-4o, a spread of 1.45 points, under which the worst-case gap remains
+attenuated. Unlike Chen et al.'s estimators we need no human calibration set,
+because we need only the sign and a lower bound, which non-differential error
+supplies for free.
+
+> **未確定**: (c)「評価データ内の同一比較を利用した人手ラベル不要のjudge
+> 信頼性測定」の**明示的な先行研究があるか**は第3ラウンドが2度停止したため
+> 未決着。**「先行研究はない」とはまだ書かない**。上の草稿は「新しい指標を
+> 提案するのではなく、既存の指標(self-consistency)を評価データから無料で
+> 得る」という**控えめな主張**にしてあるので、反例が出ても崩れない構成。
+> 検証待ちの候補: arXiv:2512.16041 (Sage/IPI — ただし位置バイアス軸=(c-3)で
+> あって同一比較の反復ではない、と検証者が指摘), arXiv:2606.19544
+> ("Reliability without Validity"), arXiv:2405.01724 (Stureborg et al.),
+> arXiv:2412.12509 (Schroeder & Wood-Doughty), arXiv:2510.27106
+> (Rating Roulette), arXiv:2511.21140, arXiv:2601.20913。
+
+### D.6 Routing 🚧 **反例(d) 未調査 — 書けない**
+
+> 編集サイズでSAE介入と離散編集を振り分ける先行研究の有無は**未調査**。
+> 第3ラウンドが2度停止し、(d)には到達しなかった。**「前例がない」と書かない**。
+> 最近接候補として調べるべき: text style transfer / GEC で「小編集なら
+> タグ付け編集モデル、大編集ならseq2seq」と切り替える研究、cascade routing /
+> easy-hard routing / RouteLLM 系。
 
 ---
 
