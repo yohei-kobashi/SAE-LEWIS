@@ -127,8 +127,9 @@ def main():
     if todo:
         extractor = SAEFeatureExtractor(
             llm_name=args.llm, sae_repo=args.sae_repo,
-            sae_path=args.sae_path, layer=args.sae_layer,
-            sae_type=args.sae_type, sae_k=args.sae_k, device=args.device)
+            sae_path=args.sae_path, sae_layer=args.sae_layer,
+            sae_type=args.sae_type, sae_k=args.sae_k,
+        ).to(args.device).eval()
 
         @torch.no_grad()
         def maxpool(text: str):
@@ -151,8 +152,14 @@ def main():
         af.close()
 
     by_ph = defaultdict(list)
+    n_skip = 0
     for r in done.values():
+        if int(r["idx"]) in eval_idx:
+            n_skip += 1          # defense against stale caches (cf. the FRC
+            continue             # leakage fix, 2026-07-16)
         by_ph[r["feature"]].append(r)
+    if n_skip:
+        print(f"[auroc] excluded {n_skip} cached eval-pair rows")
     print(f"[auroc] {len(by_ph)} phenomena")
 
     expl = {}

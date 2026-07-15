@@ -247,7 +247,9 @@ def propose_ops(lm, ids, hook, dvec_or_none, cv, pos_mask, args, W_dec,
         hook.enabled = True
         hook.dvec = dvec_or_none
         hook.alpha = float(cv)
-        hook.pos_mask = (pos_mask[:len(ids)] if pos_mask is not None else None)
+        hook.pos_mask = (torch.tensor(pos_mask[:len(ids)],
+                                      dtype=torch.bool)
+                         if pos_mask is not None else None)
     lp_int, logits_int = teacher_forced_logprobs(lm, ids, args.device)
     hook.enabled = False
 
@@ -333,10 +335,10 @@ def main():
 
     extractor = SAEFeatureExtractor(
         llm_name=args.llm, sae_repo=args.sae_repo, sae_path=args.sae_path,
-        layer=args.sae_layer, sae_type=args.sae_type, sae_k=args.sae_k,
-        device=args.device)
-    sae = load_sae(args.sae_repo, args.sae_path, args.sae_type,
-                   args.sae_k).to(args.device)
+        sae_layer=args.sae_layer, sae_type=args.sae_type, sae_k=args.sae_k,
+    ).to(args.device).eval()
+    sae = load_sae(args.sae_type, args.sae_repo, args.sae_path,
+                   sae_k=args.sae_k).to(args.device).eval()
 
     tok = AutoTokenizer.from_pretrained(args.llm)
     lm = AutoModelForCausalLM.from_pretrained(
@@ -435,15 +437,21 @@ def main():
                 # PURE FUNCTION apply_step_ops (no parameters -> the causal
                 # claim is untouched), re-read, repeat.
                 out_ids = list(ids)
+                mask_l = (pos_mask.tolist() if pos_mask is not None
+                          else None)
                 n_fire, dmin = 0, 0.0
                 for _ in range(max(1, args.steps)):
                     ops, dm = propose_ops(lm, out_ids, hook, dvec, cv,
-                                          pos_mask, args, W_dec, za, zs, sae)
+                                          mask_l, args, W_dec, za, zs, sae)
                     dmin = min(dmin, dm)
                     if not ops:
                         break
                     n_fire += len(ops)
-                    out_ids = apply_step_ops(out_ids, ops)
+                    if mask_l is not None:
+                        out_ids, mask_l = apply_step_ops(out_ids, ops,
+                                                         mask_l)
+                    else:
+                        out_ids = apply_step_ops(out_ids, ops)
                 out_text = tok.decode(out_ids, skip_special_tokens=True)
 
                 pm = pair_metrics(out_text, src, tgt)
