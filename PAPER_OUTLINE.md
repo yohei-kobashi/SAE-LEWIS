@@ -171,31 +171,70 @@
     (direct_object, factives, resultative)— oracle 0.39が1.0でない理由の
     現象名リスト。in/near/out対応表はこのCSVから作る。
 
-## 6c. 最終動作点のFRR(997ペア、judge=gemma-2-9b-itパイロット、
-runs/tables/frr_per_feature_*; GPT-4o最終判定は JUDGE 切替で取り直し)
+## 6c. 最終動作点のFRR(997ペア、**3 judge**、2026-07-15、
+runs/tables/frr_per_feature_{hf_google_gemma-2-9b-it,openai_gpt-4o,openai_gpt-5.4-nano}.*)
 
-- システム値: **ef32 0.8169** / steer0.5 0.7609(net **0.3192**、randomは
-  新規ブロックのみ判定)/ routed 0.7579。routedのrandom対照は構造的
-  (EF経路→copy; EF側フロアは旧ラウンドの0.095を引用)。
-- **非自明な構造: FRRとexactでシステム順位が逆転する** — ef32はFRR最高
-  (テール4-8でも0.83 vs steer 0.78: 離散編集は方向実現でも優る)が、
-  exactではsteerがテールを取る。routedはexact最適化の選択なのでFRRは
-  ef32単独に僅かに劣る。多軸報告の必然性の実例であり、「操舵再生成は
-  方向づけが上手いのではなく、当たった時に正確に着地する」が正しい読み。
+主判定=**GPT-4o**(LinguaLensに整合、「judgeを差し替えた」という査読反論を
+封じる)。gemma-2-9b-it(ローカル)と gpt-5.4-nano を頑健性判定として併走。
+
+| system | gemma-2-9b-it | **GPT-4o(主)** | gpt-5.4-nano | exact |
+|---|---|---|---|---|
+| ef32 | **0.8169** | **0.8765** | **0.7771** | 0.2237 |
+| routed | 0.7579 | 0.8306 | 0.7352 | **0.2839** |
+| steer0.5 | 0.7609 | 0.7459 | 0.7188 | 0.2337 |
+| steer net-FRR | 0.3192 | 0.4051 | 0.2425 | — |
+| steer_rnd(偽陽性フロア) | — | 0.3409 | 0.4763 | — |
+
+- **judge不変な主張(これを書く)**: **ef32が3 judge全てでFRR首位、routedが
+  3 judge全てでexact首位** — 「FRRとexactはシステムを異なる順位で並べる」
+  という多軸報告の必然性がjudge非依存に成立。gemmaの routed 0.7579 vs
+  steer 0.7609 のみ0.003の実質同点で、GPT-4o/nanoは両者を明確に分離
+  (EF系優位はむしろ強まる)。正しい読みは「操舵再生成は方向づけが上手い
+  のではなく、当たった時に正確に着地する」。
+- routedのrandom対照は構造的(EF経路→copy; EF側フロアは旧ラウンドの
+  ef64_rnd 0.095を引用)。steerのnet-FRRは3 judgeで0.24–0.41、いずれも
+  EF側0.69を大きく下回る=特異性はEFが上、という順序も不変。
 - **残余フロンティアの分解(exact=0現象 × FRR)**:
-  - **方向実現は可能・正確編集が不可能**: metaphor(FRR 1.00全系!)、
-    personification(0.91–1.00)、hyperbole、echo_questions(0.83–1.00)、
-    universal_quantifiers、resultative/appositives(steer 1.00)—
-    比喩・談話系は「介入としては効くがminimal pairとして打てない」。
-  - **方向実現すら低い(真に未到達)**: extraposition(0.25–0.42)が
-    ほぼ唯一。接辞形態系(nominal/verbal_suffix、quantitative_prefix、
-    FRR 0.33–0.67)は判定難度の可能性も併記。
-- **feature別net-FRRがsteerの見かけの実現を暴く**: past_tense(steer FRR
-  0.300・net −0.129 vs ef32 1.000)、expressive(net −0.50)、
-  subject_verb_inversion(−0.30)、past_tense_irregular(−0.25)—
-  randomでも同等以上に「実現」する=偽陽性支配の現象群。per-feature net
-  はsteer_rndが新規ブロックのみのため低n(付録扱い、GPT-4o判定で全997に
-  拡張可能)。
+  - **方向実現は可能・正確編集が不可能**(judge横断で安定): metaphor
+    (GPT-4o 0.90–1.00、nano 0.80–1.00、gemma 1.00全系)、personification、
+    hyperbole(1.00全系・全judge)、echo_questions、universal_quantifiers、
+    resultative(steer 0.80–1.00)— 比喩・談話系は「介入としては効くが
+    minimal pairとして打てない」。
+  - **judge依存で結論が割れる = 単独judgeで書けない**: `extraposition` は
+    gemma 0.25–0.42 / nano 0.25–0.50 で「真に未到達」だが、GPT-4o のみ
+    0.75–1.00 で「方向実現は可能」側。2:1でGPT-4oが外れ値。
+    **→ 「唯一の真に到達不能な現象=extraposition」という旧記述は撤回**し、
+    judge分裂の事実として報告する(§6eの自己一致率で重み付け)。
+  - 接辞形態系(nominal/verbal_suffix、quantitative_prefix、
+    adverbial_suffix 0.455全系)は3 judgeとも低く、判定難度の可能性を併記。
+- **feature別net-FRRがsteerの見かけの実現を暴く**(GPT-4o判定でも維持):
+  past_tense(steer FRR 0.200・net 0.200 vs ef32 1.000)、expressive
+  (net −0.400)、subject_verb_inversion(−0.300)、split_infinitives
+  (−0.308)、static_dynamic(−0.500)— randomでも同等以上に「実現」する
+  =偽陽性支配の現象群。per-feature net は steer_rnd が新規ブロックのみ
+  のため低n(付録扱い)。
+
+## 6e. judge信頼性 — exact一致ペア上の自己一致率(人手ラベル不要)
+
+**発見(2026-07-15)**: 出力がtargetと厳密一致するペアでは、システム判定
+`judge(src, out)` は gold判定 `judge(src, tgt)` と**同一の比較**(同じ特徴・
+同じ2文字列)。よって自己一致なjudgeは構成上必ず realized=True になる:
+
+> **exact一致ペアに限定したFRR = judgeの自己一致率**、その 1− が
+> **FRRのノイズ床**(これ以下のFRR差は解釈不可)。
+
+§4に「exactはFRRの下界」と書いていた不変条件の、直接の実測版。実際に
+GPT-4o判定で `negation_prefix` は exact 0.500 > FRR 0.400 と**下界を破って
+おり**、judge が同一比較で自己矛盾している証拠(goldとsystemでA/B提示順の
+ランダム化が異なる+APIの非決定性)。
+
+意義: **judge品質が人手ラベルなしで部分的に検証可能になる** — 同一比較で
+自分と矛盾するjudgeは、より難しい非exactペアを裁く信頼が無い。これが
+主judge選定の実証的根拠であり、§6cのextraposition分裂の重み付けにも使う。
+「judge品質は人手ラベル無しには検証不能」という以前の判断は**上方修正**。
+実装 `scripts/judge_selfconsistency.py`(stub検証済)、実行
+`bash run_judge_checks.sh`(CPU数秒、自己一致率3 judge + judge間一致率)。
+出力 `runs/tables/judge_selfconsistency_*.md`。
 
 ## 6d. M0 — 条件付け絞り込み仮説の棄却(FRR-by-k、2026-07-15)
 
