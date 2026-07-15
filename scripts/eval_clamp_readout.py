@@ -75,6 +75,64 @@ from model import SAEFeatureExtractor, load_sae                  # noqa: E402
 from scripts.eval_clamp_baseline import SaeClampHook             # noqa: E402
 
 
+class DeltaHook:
+    """B3-style intervention with an optional POSITION MASK.
+
+    Two things B1 gets wrong, both measurable:
+
+    1. Reconstruction. B1 clamps by encode->set->decode, replacing the
+       residual with the SAE reconstruction at every position. B3 adds the
+       commanded delta instead and touches nothing else. That difference
+       ALONE is worth +0.059 exact (B1 0.1743 -> B3 0.2337), so a causal
+       readout built on the clamp hook inherits a handicap for nothing.
+
+    2. Scope. LinguaLens intervenes at every position because it does not
+       know where the phenomenon lives. But a minimal-pair edit is local, so
+       intervening everywhere corrupts the parts that should be preserved.
+       The SAE says where: the suppressed features are ACTIVE at particular
+       source tokens. Mask the intervention to those positions. This needs no
+       training and no target — the activation pattern of the source is
+       enough.
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self.dvec = None             # (d_llm,)
+        self.alpha = 1.0
+        self.pos_mask = None         # (T,) bool or None = all positions
+
+    def __call__(self, module, inputs, output):
+        if not self.enabled or self.dvec is None:
+            return None
+        h = output[0] if isinstance(output, tuple) else output
+        add = (self.alpha * self.dvec).to(h.dtype)          # (d,)
+        if self.pos_mask is None:
+            h_new = h + add
+        else:
+            m = self.pos_mask.to(h.device).view(1, -1, 1).to(h.dtype)
+            h_new = h + add.view(1, 1, -1) * m
+        if isinstance(output, tuple):
+            return (h_new,) + tuple(output[1:])
+        return h_new
+
+
+def local_position_mask(z_tok, zs_vec, n_tok):
+    """Positions where the SUPPRESSED features actually fire in the source.
+    That is where the phenomenon is realized, so that is where an
+    intervention should act. Falls back to all-positions when nothing fires
+    (then we genuinely do not know, and LinguaLens's everywhere is the
+    honest default)."""
+    sup = torch.nonzero(zs_vec > 0).flatten()
+    if sup.numel() == 0:
+        return None
+    act = (z_tok[:, sup.to(z_tok.device)] > 0).any(dim=1)   # (T,)
+    if not bool(act.any()):
+        return None
+    m = torch.zeros(n_tok, dtype=torch.bool)
+    m[:min(n_tok, act.shape[0])] = act[:min(n_tok, act.shape[0])].cpu()
+    return m
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--output-dir", required=True)
@@ -95,8 +153,17 @@ def parse_args():
     p.add_argument("--pool-topk", type=int, default=64)
     p.add_argument("--k-amp", type=int, default=32)
     p.add_argument("--k-sup", type=int, default=32)
+    p.add_argument("--intervention", default="delta",
+                   help="delta = h + alpha*dvec (B3-style, NO reconstruction "
+                        "damage — worth +0.059 exact over clamp); "
+                        "clamp = B1/LinguaLens encode->set->decode")
+    p.add_argument("--scope", default="local",
+                   help="local = intervene only where the suppressed features "
+                        "fire in the source (the SAE says where; no training, "
+                        "no target); all = every position (LinguaLens/AxBench)")
     p.add_argument("--clamp-values", default="10",
-                   help="comma-separated set values (LinguaLens uses 10)")
+                   help="clamp: set value (LinguaLens uses 10). "
+                        "delta: alpha (B3's best was 0.5)")
     p.add_argument("--delta-thr", type=float, default=-1.0,
                    help="edit position i when Delta_i < this (nats). More "
                         "negative = the intervention must object more "
@@ -153,10 +220,15 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.llm)
     lm = AutoModelForCausalLM.from_pretrained(
         args.llm, torch_dtype=dtype).to(args.device).eval()
-    hook = SaeClampHook(sae)
+    hook = SaeClampHook(sae) if args.intervention == "clamp" else DeltaHook()
     lm.model.layers[args.sae_layer].register_forward_hook(hook)
-    print(f"[readout] intervening on {args.llm} layers[{args.sae_layer}]; "
-          f"clean baseline = recon passthrough (isolates the SET)")
+    W_dec = sae.W_dec.float()                       # (d_sae, d_llm)
+    print(f"[readout] intervening on {args.llm} layers[{args.sae_layer}] "
+          f"via {args.intervention}, scope={args.scope}")
+    print("[readout] clean baseline = "
+          + ("recon passthrough (isolates the SET)" if args.intervention == "clamp"
+             else "NO-OP (delta adds nothing when the spec is empty, so the "
+                  "unintervened forward IS the right baseline)"))
 
     clamp_vals = [float(v) for v in args.clamp_values.split(",")]
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
@@ -200,21 +272,40 @@ def main():
         for cond in conditions:
             za, zs = zvar[cond]
             rec["outputs"][cond] = {}
+            pos_mask = None
+            if args.scope == "local":
+                pos_mask = local_position_mask(z_s, zs, len(ids))
             for cv in clamp_vals:
-                # ---- clean = RECON passthrough: hook on, nothing set -----
-                hook.enabled = True
-                hook.amp_idx = hook.sup_idx = None
-                hook.amp_val = None
-                lp_recon, _ = teacher_forced_logprobs(lm, ids, args.device)
-                # ---- intervened: same recon path, features SET -----------
-                hook.amp_idx = torch.nonzero(za > 0).flatten().to(args.device)
-                hook.amp_val = float(cv)
-                hook.sup_idx = torch.nonzero(zs > 0).flatten().to(args.device)
-                lp_int, logits_int = teacher_forced_logprobs(
-                    lm, ids, args.device)
+                if args.intervention == "clamp":
+                    # clean = RECON passthrough, so Delta isolates the SET
+                    # rather than mixing in reconstruction damage.
+                    hook.enabled = True
+                    hook.amp_idx = hook.sup_idx = None
+                    hook.amp_val = None
+                    lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
+                    hook.amp_idx = torch.nonzero(za > 0).flatten().to(
+                        args.device)
+                    hook.amp_val = float(cv)
+                    hook.sup_idx = torch.nonzero(zs > 0).flatten().to(
+                        args.device)
+                    lp_int, logits_int = teacher_forced_logprobs(
+                        lm, ids, args.device)
+                else:
+                    # delta adds nothing when the spec is empty, so the
+                    # unintervened forward IS the right baseline — no
+                    # reconstruction damage to cancel.
+                    hook.enabled = False
+                    lp_base, _ = teacher_forced_logprobs(lm, ids, args.device)
+                    hook.enabled = True
+                    hook.dvec = (za.to(args.device).float() @ W_dec
+                                 - zs.to(args.device).float() @ W_dec)
+                    hook.alpha = float(cv)
+                    hook.pos_mask = pos_mask
+                    lp_int, logits_int = teacher_forced_logprobs(
+                        lm, ids, args.device)
                 hook.enabled = False
 
-                delta = (lp_int - lp_recon)                    # (T-1,)
+                delta = (lp_int - lp_base)                    # (T-1,)
                 fire = (delta < args.delta_thr).nonzero().flatten().tolist()
                 out_ids = list(ids)
                 for j in fire:                                  # j scores ids[j+1]
@@ -226,6 +317,8 @@ def main():
                     "text": out_text, "exact": pm["exact_match"],
                     "sim_target": pm["sim_target"], "copy": pm["copy_rate"],
                     "n_fire": len(fire),
+                    "n_masked": (int(pos_mask.sum()) if pos_mask is not None
+                                 else len(ids)),
                     "delta_min": float(delta.min()) if len(delta) else 0.0,
                 }
         records.append(rec)
