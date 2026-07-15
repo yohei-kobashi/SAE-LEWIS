@@ -15,18 +15,23 @@ set -eo pipefail
 
 # P-D: "how many features does it take to COMMAND an edit?"
 #
-# One curve that answers every single-latent objection at once, on our own
-# model and our own SAE, by measurement instead of argument:
-#   AxBench   conditions on 1 latent per CONCEPT      -> detection 0.695 (11/12)
-#   LinguaLens conditions on 3 base vectors/phenomenon -> intervention
-#   our P-B   conditions on FRC phenomenon features    -> editing collapses ~10x
-#   this work conditions on k=32 per INSTANCE          -> exact 0.2237
-# If exact and FRR both collapse as k -> 1, then the single-latent regime those
-# papers measure is demonstrably not the regime this system operates in — which
-# is currently only a structural argument in the Related Work.
+# SCOPE (corrected 2026-07-15 — read this before reading the numbers):
+# This curve does NOT answer AxBench's detection 0.695. That number is about
+# concept->latent lookup, which this pipeline never performs: our conditioning
+# is top-k of (z_tgt - z_src), an instance-level encoding of an observed
+# difference. The answer to AxBench's detection axis is P-B plus a scoped
+# claim (see PAPER_OUTLINE section 8), not this sweep.
 #
-# It also unifies results we already have: P-A (k selection), P-B (phenomenon
-# features), M0 (narrowing hypothesis refuted) all become points on this curve.
+# What this curve DOES answer is "why k=32?" — currently an arbitrary-looking
+# default. It measures how many INSTANCE-LEVEL features the editor needs, and
+# folds three scattered results onto one axis: P-A (k selection), M0 (narrowing
+# refuted: k8/k16/k32 FRR 0.7753/0.7895/0.8169 with exact 0.060/0.126/0.210),
+# and the k=1 endpoint we never measured.
+#
+# The separate, sharper contrast — instance-level encoding vs concept-level
+# identification — is P-B (FRC phenomenon features collapse editing ~10x) and
+# lives on a different axis from this one. Do not conflate them: a small-k
+# point is still instance-level.
 #
 # exact is FREE: run_paper_todo.sh already swept --k-grid 1,2,4,8,16,32,64 over
 # the original block. Only the FRR arm costs judge calls, and gold is cached.
@@ -84,11 +89,10 @@ python scripts/frr_paired_test.py --label "kcurve_$TAG" "${FR[@]}" \
 echo
 echo "==================== K-CURVE DONE ===================="
 echo "Reading: pair runs/tables/kcurve_exact.md with kcurve_frr_$TAG.md."
-echo "  The claim to check: exact AND FRR both collapse as k -> 1. If so, the"
-echo "  single-latent protocol AxBench uses (1 latent/concept, detection 0.695)"
-echo "  and LinguaLens's 3-base-vector intervention sit in a regime where OUR"
-echo "  editor also fails — so their negative/positive results about few-feature"
-echo "  conditioning do not transfer to the k=32 set this system needs. That"
-echo "  turns a structural argument in Related Work into a measurement."
-echo "  If instead k=1 works nearly as well as k=32, the k=32 default is"
-echo "  unjustified and the paper must say so."
+echo "  This answers 'why k=32?', NOT AxBench's detection 0.695 (that one is"
+echo "  concept->latent lookup, which we never do — see PAPER_OUTLINE section 8)."
+echo "  Expected, from M0's k8/k16/k32 trend: exact and FRR both fall as k -> 1,"
+echo "  which makes k=32 a measured choice rather than a default, and gives the"
+echo "  paper the number of instance-level features editing actually requires."
+echo "  If instead k=1 works nearly as well as k=32, then k=32 is unjustified,"
+echo "  the conditioning is doing less than we claim, and the paper must say so."
