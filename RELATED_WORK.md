@@ -90,14 +90,30 @@ representation steering is still far behind simple prompting and finetuning
 baselines". Its two axes are concept detection and steering (`h + αw`); its
 method set contains no editing method.
 
-**AxBench's own data separates the axes we need separated**: "better
-classification does not directly lead to better steering". Supervised-
-selected SAE-A detects at 0.917 against vanilla SAE's 0.695 yet steers
-*worse* (0.157 vs 0.165); Probe detects at 0.940 and steers at 0.098.
-Detection rank and steering rank do not align. **We do not claim this
-directly licenses our use** — AxBench never evaluates an editing condition —
-but it does establish that a negative result on the steering axis is not a
-negative result about SAE features as such, which is the axis we occupy.
+**AxBench runs the detect-then-intervene loop on the same latent, and it comes
+apart.** Its SAE-A condition selects, per concept, the latent that best
+*detects* it — "compute AUROC over the dataset given true labels, and select
+the highest-scoring feature by this metric" — and then steers with that same
+latent, since "we steer using SAEs by adding their decoder features directly
+to the residual stream". Both conditions are evaluated on both axes. Selecting
+for detection works: 0.695 → **0.917**, a 32% relative gain. Steering with the
+selected latent does not: 0.165 → **0.157**, and SAE-A wins only 48.8% against
+the very latents it was chosen to beat. The authors state it plainly: "**better
+classification does not directly lead to better steering**." The pattern is not
+confined to SAEs — Probe detects at 0.940 and steers at 0.098; SSV detects at
+0.912 and steers at 0.026 — and their Figure 1 accordingly plots the two as
+orthogonal axes.
+
+This is the same experiment as our P-B, in a different modality. AxBench
+improves *identification* of a concept by a third and gains nothing when it
+*acts* through the identified feature; we condition our editor on the features
+LinguaLens's FRC identifies as representing a phenomenon and watch exact match
+collapse ~10×. Both say the feature that best identifies a phenomenon is not
+the feature that best commands it — measured once through activation steering,
+once through discrete editing. **We do not claim AxBench licenses our
+conditioning** — it never evaluates an editing condition — but its result is
+the reason a negative finding on the steering axis is not a negative finding
+about SAE features as such, which is the axis we occupy.
 
 AxBench's second axis, **concept detection**, asks whether one SAE latent can
 identify a concept in a passage — the direct test of the monosemanticity
