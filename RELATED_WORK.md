@@ -214,10 +214,26 @@ choice". **The specification there is a surface terminology dictionary; ours
 is a feature dictionary recovered from the model's own internals.** The
 contribution is the *kind* of specification, not the existence of one.
 
-Edit Flows [Havasi et al. 2025] supplies our generative machinery — a
-discrete flow over sequences via a CTMC, with the hazard factorization and
-localization of its Appendix C.1 — but generates from scratch rather than
-against a source, and conditions only on prefixes, images, or a CFG scale.
+Edit Flows [Havasi et al. 2025] supplies our generative machinery: a discrete
+flow over sequences via a CTMC in which "the model predicts the rate of each
+possible edit" and sampling means "simulating the CTMC defined with the
+learned rate". Applying an edit is therefore not learned in either their
+setting or ours — in a CTMC over sequences, applying a transition *is* moving
+to the next state, and the word "decoder" does not occur in their paper. They
+draw the contrast themselves: "Unlike Edit Flows, DiffusER uses a causal
+masked model to fill in insertions and substitutions autoregressively".
+
+**We inherit their factorization rather than proposing one.** Their rate for
+inserting token `a` at position `i` is `u_t(ins(x,i,a)|x) = λ_{t,i}(x) ·
+Q_{t,i}(a|x)`, and our two heads — a rate head over (position, kind) and a
+token head Q — are exactly that product; our "insert after position i" is
+their `ins(x,i,a)`, "inserting the token value a to the right side of
+position i". What we change is elsewhere: they generate from scratch (their
+headline model is insert-only from the empty sequence) whereas we anchor on a
+source; they draw random alignments whereas we take the deterministic
+min-edit alignment, natural when path length equals edit distance; they learn
+a free rate whereas we supply the hazard analytically (§Method); and they
+condition only on prefixes, images, or a CFG scale.
 
 ### D.4 Steering and its per-input unreliability
 
