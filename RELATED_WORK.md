@@ -138,20 +138,82 @@ going negative — a sharper form of the same failure.** Their study covers
 CAA on Llama-2/Qwen-1.5 in a multiple-choice setting and involves no SAEs,
 so we cite it for the phenomenon, not as a measurement of SAE steering.
 
-### D.5 Judging the judge (反例(c): 部分的に確定)
+### D.5 Judging the judge (反例(c): **確定**、2026-07-15 第3ラウンド)
 
-LLM judges carry position bias [Wang et al. 2023; Zheng et al. 2023] and are
-self-inconsistent under repeated identical queries [Stureborg et al. 2024;
-Haldar & Hockenmaier 2025 "Rating Roulette"]. Standard mitigations swap the
-presentation order and average, or keep only order-consistent verdicts; we
-instead randomize A/B order per pair under a fixed seed, and measure what is
-left.
+> **🔴 新規性の置き場所を全面的に移した。** 「人手ラベル不要のjudge評価」も
+> 「同一比較の反復による一致率」も**既に取られている**:
+> - **Sage** (arXiv:2512.16041): "assesses the quality of LLM judges
+>   **without necessitating any human annotation**... local self-consistency
+>   (pair-wise preference stability) and global logical consistency" —
+>   **ラベルフリーjudge評価という上位概念は先行**。ただし専用650問を新規
+>   キュレーションし 19,500 judgments を回す。
+> - **Shi et al.** (AACL-IJCNLP 2025) **Repetition Stability**: "evaluates
+>   the reliability of LLM judges when presented with **identical queries
+>   multiple times**... percentage of the most frequent selections across
+>   multiple trials" — **(c)-2の字義通りの先行例**。専用サブセット+専用予算。
+> - **Haldar & Hockenmaier** (Findings of EMNLP 2025, "Rating Roulette"):
+>   "we ran each judge LLM on the same set of generations **independently for
+>   three runs**... to measure **intra-rater variance**" / "we define
+>   **self-reliability** as the agreement of a judge with itself over multiple
+>   runs with the same settings"、intra-rater Krippendorff's α。**MT-Bench部は
+>   pairwise 3値 = 我々のFRRと同型**。3倍コスト。
+> - **Wang et al.** (ACL 2024) **Conflict Rate**: "the proportion of
+>   conflicting results given by the same evaluator when simply changing the
+>   position of two models" — ラベルフリー診断量。順序入替=2倍のAPI呼び出し。
+> - **Norman et al.** (arXiv:2606.19544) MVVP: "N∈[3,5] independent
+>   evaluations per item... reports **test–retest reliability,
+>   self-consistency, and position flip rate**"。
+>
+> **残る差分は限界コストのみ**: 先行研究はすべて**専用の再実行予算**
+> (2〜20倍のjudge推論)を払って重複を**人工的に作る**。我々は**評価データ内に
+> 自然発生する exact 一致ペアから追加コストゼロで回収**する。5系統の検索で
+> この構成の先行例は発見できず。→ **(c)の主張は「無償の自然発生重複の回収」
+> にのみ置く**。「ラベルフリー」「反復一致率」を新規性として書いたら潰される。
+>
+> **🔴 用語を直す**: 「judge**品質**を測れる」と書いてはならない。Norman et
+> al. の題名がそのまま反論 — **"Reliability without Validity"**。我々が測るのは
+> **reliability** であって **validity** ではない。
+>
+> **🟢 ただし consistency–bias paradox は我々には効かない(検算済み)**:
+> 「常に位置Aを選ぶ degenerate judge が自己一致指標で満点を取る」という
+> 標準的反論は、gold順とsystem順が**相関する**場合にのみ成立する。我々は
+> `rng_gold`/`rng_sys` を分離済み(§6e-1のバグ修正)なので **always-A judge は
+> 0.50 = チャンスに落ちる**。観測値(GPT-4o 0.9860 / gemma 0.9717 /
+> nano 0.8789)は全て0.5から大きく上。**rngバグ下なら 1.00 を取っていた** —
+> gemmaの「1.0000 / flips=0」列はまさにその退化だった。**バグ修正が、この
+> 反論に対する免疫そのもの**であり、論文でそう書ける。
+>
+> **🔴 順序ランダム化に新規性を主張しない**: Zheng et al. (NeurIPS 2023 D&B)
+> が既に "more aggressive approach" として明示している既知の選択肢。
+>
+> **🟢 (c)-4 attenuation は新規性が残る**: LLM judge文脈で同じ議論を明示的に
+> 行った先行研究は見つからず(§6e-4)。ただし arXiv:2601.05420 が実データで
+> **q0≠q1(非対称誤り率)を観測**しているため、非差異性の前提を明示すること。
 
-Our contribution here is not a new reliability metric but **an existing
-one obtained for free from the evaluation data**: because a pair whose output
-exactly matches the target makes judge(src, out) and judge(src, tgt) the
-*same comparison*, FRR restricted to exact-match pairs *is* the judge's
-self-consistency — no repeated queries, no human labels.
+LLM judges carry position bias [Wang et al., ACL 2024; Zheng et al., NeurIPS
+2023 D&B] and are self-inconsistent under repeated identical queries
+[Stureborg et al. 2024; Shi et al., AACL 2025; Haldar & Hockenmaier,
+Findings of EMNLP 2025]. Measuring that reliability without human labels is
+established practice: Conflict Rate [Wang et al.] re-queries with the
+positions swapped, Repetition Stability [Shi et al.] re-queries "identical
+queries multiple times", Rating Roulette [Haldar & Hockenmaier] runs each
+judge three times to obtain intra-rater Krippendorff's α, and Sage [Feng et
+al. 2025] assesses judges "without necessitating any human annotation". We
+follow this line rather than depart from it; our order randomization is the
+"more aggressive approach" already named by Zheng et al.
+
+**Our only contribution here is a marginal-cost one.** Every method above
+manufactures its duplicates and pays a dedicated re-run budget of 2–20×
+judge inference. We pay nothing: because a pair whose output exactly matches
+the target makes judge(src, out) and judge(src, tgt) the *same comparison*,
+FRR restricted to exact-match pairs *is* the judge's self-consistency —
+recovered from duplicates that the evaluation already contains. We are
+careful about what this licenses: following Norman et al. [2026], what we
+obtain is **reliability, not validity**. It also escapes the standard
+degeneracy objection — a judge that always picks position A would score
+perfectly on a consistency metric — only because we draw the gold and system
+presentation orders from independent streams, under which such a judge
+scores 0.50; had the two orders been coupled it would score 1.00.
 
 **The measurement then does double duty, and this is the part that matters.**
 Noisy-judge inference [Chen et al., arXiv:2601.05420] models judge error by
