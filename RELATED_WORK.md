@@ -1,4 +1,151 @@
-# Related Work — サーベイ確定分と、書いてはいけないこと
+# Related Work — 草稿・サーベイ確定分・書いてはいけないこと
+
+> **§D に英語草稿**(確定分のみで執筆可能。(c)(d)は第3ラウンド待ちのため
+> プレースホルダ)。§0–Z は根拠と地雷の記録。
+
+---
+
+## D. 英語草稿(v1、2026-07-15。**全主張が一次資料で検証済み**)
+
+### D.0 骨格 — 2軸分類
+
+介入手法を **WHERE(作用位置の決め方)** × **WHAT(作用の型)** の2軸で
+分類すると、本研究の位置が一意に定まる。この表が Related Work の背骨。
+
+| 手法 | WHERE | WHAT | 条件付け信号 |
+|---|---|---|---|
+| LinguaLens (Jing+ 2025) | 選択なし(全位置一律・定数クランプ 0/10) | 連続 | **SAE特徴**(現象あたり**3本**) |
+| AxBench の SAE/SAE-A | 選択なし | 連続 (h+αw) | SAE特徴(概念あたり**1本**) |
+| ActAdd / CAA / RepE | 選択なし | 連続 | 対照ペア由来の方向 |
+| Levenshtein Transformer | 編集目標から推論 | **離散** | source sequence のみ |
+| LEWIS | 編集目標から推論 | **離散** | source + **スタイル分類器attention** |
+| Susanto+ / EDITOR | 編集目標から推論 | **離散** | **表層の用語辞書 / 語彙選好** |
+| **本研究** | 編集目標から推論(λ-IoU 0.74 vs empty 0.15 / random 0.33) | **離散** (INS/DEL/SUB) | **SAE特徴**(事例あたり k=32) |
+
+**空白は「離散 × SAE特徴条件付け」のセル**。左下(離散編集)は条件付けが
+表層に留まり、右上(SAE介入)は作用が連続に留まる。
+
+### D.1 SAE features: detection is not command
+
+Sparse autoencoders recover interpretable feature dictionaries from frozen
+LMs [Cunningham et al. 2023; Bricken et al. 2023; Templeton et al. 2024],
+and Gemma Scope [Lieberum et al. 2024] released JumpReLU SAEs for every
+layer of Gemma 2 — the weights this work builds on. LinguaLens [Jing et al.,
+EMNLP 2025] showed that linguistic phenomena are recoverable in this space:
+it ranks base vectors by Feature Representation Confidence, the harmonic
+mean of causal necessity and sufficiency, `FRC_k = 2·PS_k·PN_k/(PS_k+PN_k)`,
+after an EALE sensitivity pre-filter at the 75th percentile, and verifies
+the top-10 with an LLM agent.
+
+**Crucially, LinguaLens uses those features only as an activation-space
+knob**: it clamps a target feature's activation during the forward pass
+(0 for ablation, 10 for enhancement) and reads off free-form generated text.
+Editing appears in LinguaLens only on the *data-construction* side — its
+counterfactuals are "produced through a minimal edit that deletes or
+substitutes the trigger while preserving semantic content". **No prior work,
+to our knowledge, uses SAE features as the conditioning signal for a model
+that emits edit operations.**
+
+That a property is decodable does not mean it is usable. Amnesic probing
+[Elazar et al., TACL 2021] is a canonical statement of the point — "probing
+performance is not correlated to task importance" — and it, along with
+[Ravichander et al., EACL 2021; Hewitt & Liang, EMNLP 2019; Belinkov, CL
+2022], reframed the question from *what is encoded* to *how information is
+used*. Those works ask whether **the model itself** relies on a property
+internally; we ask the adjacent question of whether **we** can use a feature
+as an external command. Our P-B result extends the spirit rather than the
+letter: **the very features FRC identifies as representing a phenomenon are
+poor conditioning signals for editing it** — LinguaLens intervenes on 3 base
+vectors per phenomenon, whereas conditioning our editor on FRC-identified
+phenomenon features collapses exact match by ~10× relative to the k=32
+instance-level features it needs. Detecting a feature and commanding with it
+are different capabilities.
+
+### D.2 The skeptical evidence, and why it does not reach us
+
+The strongest negative results concern **steering specifically**. AxBench
+[Wu et al., PMLR v267] evaluates on Gemma-2-2B/9B with Gemma Scope — our own
+base model and SAE lineage — and concludes that "even at SAE scale,
+representation steering is still far behind simple prompting and finetuning
+baselines". Its two axes are concept detection and steering (`h + αw`); its
+method set contains no editing method.
+
+**AxBench's own data separates the axes we need separated**: "better
+classification does not directly lead to better steering". Supervised-
+selected SAE-A detects at 0.917 against vanilla SAE's 0.695 yet steers
+*worse* (0.157 vs 0.165); Probe detects at 0.940 and steers at 0.098.
+Detection rank and steering rank do not align. **We do not claim this
+directly licenses our use** — AxBench never evaluates an editing condition —
+but it does establish that a negative result on the steering axis is not a
+negative result about SAE features as such, which is the axis we occupy.
+
+Two threats remain live and we state them plainly. First, on **detection**,
+vanilla SAE is "significantly outperformed by five supervised methods"
+(0.695, 11th of 12). Our selection is unsupervised, so 0.695 is the relevant
+number, not 0.917. We note that AxBench's detection protocol uses **exactly
+one latent per concept**, so it measures single-feature identification, not
+conditioning by a k=32 instance-level set; how far 0.695 transfers to our
+regime is therefore not settled by that experiment. Second, [Kantamneni et
+al., ICML 2025] find SAE probes fail to consistently beat logistic
+regression across 113 datasets — though the finding is an absence of
+*consistent* advantage, with SAEs winning on individual datasets — and
+frozen/random-decoder baselines [arXiv:2602.14111] approach trained SAEs on
+sparse probing. On causal editing that paper's headline 0.73 comes from its
+Soft-Frozen variant, which still trains within a cosine-similarity ball; its
+fully-random Frozen Decoder falls to 0.55–0.62, below trained SAEs'
+0.72–0.74. DeepMind themselves listed whether SAEs beat fair baselines on
+real tasks as an open problem when releasing Gemma Scope.
+
+### D.3 Discrete editing: the operations are not the contribution
+
+Text-editing models "produce the output text by predicting edit operations
+which are applied to the inputs", in contrast to seq2seq methods that
+"produce the output from scratch, token by token" [Malmi et al., NAACL 2022
+tutorial]. The operation vocabulary is well-established: Levenshtein
+Transformer [Gu et al., NeurIPS 2019] made insertion and deletion atomic,
+LaserTagger [Malmi et al., EMNLP 2019] predicts tags over the input, and
+LEWIS [Reid & Zhong, Findings of ACL 2021] — whose name we borrow — uses
+insert/keep/replace/delete for style transfer. **We claim no novelty in the
+edit vocabulary.**
+
+What differs is the conditioning. LevT injects only the source sequence by
+cross-attention; LaserTagger encodes only the input; LEWIS adds a supervised
+style classifier's attention over a binary attribute. The closest prior work
+to ours **does** condition discrete edits on an external specification: the
+constrained-LevT lineage [Susanto et al., ACL 2020; Xu & Carpuat, TACL 2021]
+injects terminology constraints at inference time from Wiktionary and IATE
+dictionaries, and EDITOR lets users "specify preferences in output lexical
+choice". **The specification there is a surface terminology dictionary; ours
+is a feature dictionary recovered from the model's own internals.** The
+contribution is the *kind* of specification, not the existence of one.
+
+Edit Flows [Havasi et al. 2025] supplies our generative machinery — a
+discrete flow over sequences via a CTMC, with the hazard factorization and
+localization of its Appendix C.1 — but generates from scratch rather than
+against a source, and conditions only on prefixes, images, or a CFG scale.
+
+### D.4 Steering and its per-input unreliability
+
+Activation steering [ActAdd; CAA; ITI; RepE] adds a direction to the
+residual stream. Tan et al. [NeurIPS 2024] establish that "steerability
+takes on a large range of values across different inputs, including negative
+values, where SVs produce the opposite of the desired behaviour", coining
+*anti-steerability*; on some datasets nearly half of inputs are
+anti-steerable. **Their result is per-input within datasets whose mean
+steerability stays positive; our negative per-phenomenon net-FRR (past_tense
+−0.13, expressive −0.50, subject_verb_inversion −0.30) is an aggregate mean
+going negative — a sharper form of the same failure.** Their study covers
+CAA on Llama-2/Qwen-1.5 in a multiple-choice setting and involves no SAEs,
+so we cite it for the phenomenon, not as a measurement of SAE steering.
+
+### D.5 Evaluation and routing 🚧 **(c)(d) 第3ラウンド待ち — 未確定**
+
+> **書けない状態**: judge自己一致率(c)と編集サイズによるルーティング(d)の
+> 反例探索が未完。第3ラウンドの結果が出るまで「先行研究はない」と書かない。
+> 位置バイアス文献 [Wang et al. 2023; Zheng et al. 2023] の引用と、
+> McNemar/attenuation の慣行の記述もここに入る。
+
+---
 
 第1ラウンド(deep-research、2026-07-15): 6角度 → 26出典 → 130主張抽出 →
 25主張を3票の敵対的検証 → **12確定 / 13棄却**。棄却分は「使えない」の記録
