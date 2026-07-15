@@ -25,6 +25,56 @@
 **空白は「離散 × SAE特徴条件付け」のセル**。左下(離散編集)は条件付けが
 表層に留まり、右上(SAE介入)は作用が連続に留まる。
 
+### D.0b 3つの選択方式 — **kの値ではなく選び方が違う**(全て一次資料で確認)
+
+| | **本研究 (SAE-LEWIS)** | **LinguaLens** | **AxBench** |
+|---|---|---|---|
+| 選択の単位 | **この1ペア(事例)** | この現象(コーパス集約) | この概念(コーパス集約) |
+| **集約** | **なし** | **平均**(EALE = (1/N)Σ τ_k) | 平均/AUROC |
+| 活性の使い方 | 連続・**符号付きdelta** `z_tgt−z_src` | **二値(発火したか否か)** — 大きさを捨てる | 連続 **max-pooled** |
+| 測る場所 | **編集スパン内のトークンのみ**(local) | 文中どこでも | passage全体をmax-pool |
+| ラベル | **不要** | sentence1/sentence2 | SAE-A: 要(教師あり) / vanilla: 不要 |
+| 選択基準 | delta の大きさ top-k | 前段: \|EALE\|>75パーセンタイル → **FRC = H(PS,PN)** | **vanilla: 概念の出所latent**(探索なし)/ **SAE-A: AUROC最大** |
+| 人手/LLM検証 | なし | **GPT-4oがtop-10を検証** | なし |
+| 介入に使う本数 | **32**(事例あたり) | **3**(現象あたり) | **1**(概念あたり) |
+
+**非対称が5つあり、どれもkとは無関係**:
+1. **集約しないのは我々だけ**。他2つはコーパス平均で現象/概念レベルの答えを作る。
+   LinguaLensの原始量 τ_k(s) = a(1)−a(0) は**我々のdeltaそのもの**で、
+   彼らはそれを平均し、我々は平均しない。P-Bは「集約するか否か」のablation。
+2. **大きさを捨てるのはLinguaLensだけ**(二値の発火判定)。我々とAxBenchは連続値。
+3. **編集スパンに局在させるのは我々だけ**。他2つは文/passage全体をプール。
+4. **ラベルを一切使わないのは我々だけ**。
+5. **AxBenchのvanilla SAEは「探索」をしていない** — 概念は "sampled from the
+   Neuronpedia SAE concept list for GemmaScope" なので、**その概念を定義した
+   ラベルの持ち主のlatent**を使う。つまり **0.695 は「出所のlatentが自分自身の
+   概念を検出できていない」という数字**であり、選択失敗ではない。SAE-Aの
+   AUROC探索はそこから**より良いlatentを見つけて 0.917** に上げる —
+   にもかかわらずsteeringは改善しない。
+
+**🔴 LinguaLensは論文とコードが食い違う(2026-07-15、公式repoで確認)**:
+- 論文: `PS_k = Pr(Z(1)_k=1 | Z(0)_k=0)`、`PN_k = Pr(Z(0)_k=0 | Z(1)_k=1)` =
+  **条件付き**(因果的な枠組みで提示)
+- 公式repo `lingualens/metrics.py`: `ps = (# positive sentences containing the
+  base vector) / num_pos`、`pn = (# negative sentences NOT containing it) /
+  num_neg` = **周辺**
+- 両者は独立性が成り立つときのみ一致する(A=B·C なら PS=A/C=B, PN=A/B=C)。
+  s+ と s− は trigger 以外同一文なので活性は強く相関し、独立性は成立しない。
+  具体例: **両文で発火する話題特徴が半数のペアにある場合、論文の定義は
+  FRC=0.000、コードは FRC=0.500**。コード版はペア構造を使えない。
+- **我々のP-Bは repo(コード)側に忠実** → 人々が実際に走らせる成果物を再現
+  している。**P-Bは無傷**。ただし論文で「FRCは因果確率」と紹介するときは、
+  **実装は周辺比率であり因果量ではない**ことを1文で書く(彼らの do記法をそのまま
+  引くと、我々が測ったものと違うものを引くことになる)。
+
+**🟡 AxBench自身の留保(引用可、ただし限定的)**: "The concept lists ... were
+adapted from Neuronpedia's autointerpretability pipeline, which is often skewed
+towards token-level concepts and misses high-level abstractions. While we tried
+to do post-hoc SAE feature selection to mitigate this, **the poor performance of
+SAEs is at least partially a reflection of the limitations of
+auto-interpretability**." → **"at least partially"** であり、「SAEの不振は
+ラベルの artifact だ」と読み替えてはならない(その強い版はサーベイで0-3棄却済)。
+
 ### D.1 SAE features: detection is not command
 
 Sparse autoencoders recover interpretable feature dictionaries from frozen
