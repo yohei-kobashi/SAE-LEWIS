@@ -45,7 +45,7 @@ set -eo pipefail
 # matched |delta AND FRC| rather than against k=32.
 V6=./runs/prod_gemma_v6
 LLM2VEC=runs/mcgill_gemma_repro_3k/final
-BLOCKLIST=${BLOCKLIST:-runs/blocklist_l12_16k.json}
+BLOCKLIST=${BLOCKLIST:-runs/blocklist/blocklist.npy}
 
 for FM in intersect pure; do
     OUT="$V6/editflow_s3/probe500_frc_${FM}_ctrl"

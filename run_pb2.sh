@@ -44,7 +44,7 @@ set -eo pipefail
 V6=./runs/prod_gemma_v6
 LLM2VEC=runs/mcgill_gemma_repro_3k/final
 EXPL=runs/np_explanations/gemma-2-2b_12-res-16k.json
-BLOCKLIST=${BLOCKLIST:-runs/blocklist_l12_16k.json}
+BLOCKLIST=${BLOCKLIST:-runs/blocklist/blocklist.npy}
 RS=${RS:-1 3 16 32}
 
 # ---- selection (encoding cached in runs/auroc/auroc_acts.jsonl, shared) ----
