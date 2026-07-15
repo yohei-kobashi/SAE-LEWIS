@@ -98,16 +98,27 @@ def diff_to_sparse(
     k_sup: int,
     rng: np.random.Generator,
     empty_conditioning_prob: float = 0.15,
+    binarize_prob: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Construct training-time (z_amp, z_sup) from clean / corrupted SAE
     forwards via diff-based sub-sampling. See README §6.3.3.
 
     z_X / z_X_prime are (d_sae,) dense tensors holding sentence-level pool-max
     top-K_train sparse SAE vectors.
+
+    binarize_prob: with this probability, keep the selected feature IDs but
+    replace their magnitudes with a constant. This is a train-time simulation
+    of the ONE axis where LinguaLens's specification differs from ours that
+    needs no phenomenon label: their selection is driven by binary activity
+    ("Proportion of positive sentences containing the base vector"), so the
+    spec a concept-level method can hand us carries feature identities and no
+    magnitudes. A model trained only on magnitude-bearing specs has never seen
+    that input, which is exactly the mismatch that makes P-B uninterpretable.
     """
     if rng.random() < empty_conditioning_prob:
         zero = torch.zeros_like(z_X)
         return zero, zero.clone()
+    binarize = rng.random() < binarize_prob
 
     delta = z_X - z_X_prime
     pos = torch.clamp(delta, min=0.0)
@@ -136,5 +147,14 @@ def diff_to_sparse(
             for c in chosen:
                 idx = int(cand_i[int(c)].item())
                 z_sup[idx] = float(cand_v[int(c)].item())
+
+    if binarize:
+        # keep WHICH features, drop HOW MUCH. The constant is each side's own
+        # mean magnitude, so the conditioning encoder still sees the scale it
+        # was trained on and only the per-feature ordering is destroyed.
+        for z in (z_amp, z_sup):
+            nz = z > 0
+            if bool(nz.any()):
+                z[nz] = float(z[nz].mean())
 
     return z_amp, z_sup

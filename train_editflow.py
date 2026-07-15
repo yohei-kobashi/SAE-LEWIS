@@ -124,6 +124,21 @@ def parse_args():
     p.add_argument("--k-top", type=int, default=32)
     p.add_argument("--k-amp", default="log:1-32")
     p.add_argument("--k-sup", default="log:1-32")
+    p.add_argument("--spec-binarize-prob", type=float, default=0.0,
+                   help="prob. of dropping the spec's MAGNITUDES (keeping the "
+                        "feature IDs) for an example. Simulates LinguaLens's "
+                        "binary-activity selection, whose spec carries no "
+                        "magnitudes. Without this the model has only ever seen "
+                        "magnitude-bearing specs, which is why P-B's "
+                        "eval-time-only substitution is uninterpretable.")
+    p.add_argument("--spec-mix-prob", type=float, default=0.0,
+                   help="prob. of swapping part of the spec for features from "
+                        "another example's delta. Simulates the aggregation "
+                        "error of a corpus-averaged (phenomenon-level) spec: "
+                        "features typical of the phenomenon that did not "
+                        "actually move in THIS pair. Corruption has no "
+                        "phenomenon labels, so this is the closest we can get "
+                        "without rebuilding the cache.")
     p.add_argument("--empty-cond-prob", type=float, default=0.0,
                    help="Empty-conditioning dropout on NON-null records. "
                         "Default 0: the cache's null records are the only "
@@ -173,7 +188,8 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
     (skipped indices simply don't contribute)."""
     xs, ts, pend_all, pend_w_all, adj_all = [], [], [], [], []
     za_l, zs_l = [], []
-    for b in range(len(batch["x0"])):
+    B_ = len(batch["x0"])          # batch size; spec-mixing draws a partner from it
+    for b in range(B_):
         x0, x1 = batch["x0"][b], batch["x1"][b]
         if max(len(x0), len(x1)) > args.max_len:
             continue
@@ -213,7 +229,37 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
             batch["z_X"][b], batch["z_X_prime"][b], k_top=args.k_top,
             k_amp=k_amp, k_sup=k_sup, rng=rng,
             empty_conditioning_prob=args.empty_cond_prob,
+            binarize_prob=args.spec_binarize_prob,
         )
+        # Aggregation noise: a phenomenon-level spec is a corpus AVERAGE, so
+        # some of its features are typical of the phenomenon yet did not move
+        # in THIS pair. Corruption carries no phenomenon labels — its ops are
+        # generic UPOS-guided INS/DEL/SUB — so we cannot aggregate per
+        # phenomenon at training time. We can still simulate the resulting
+        # error: swap a fraction of this example's spec for features drawn
+        # from ANOTHER example's delta, which are plausible-but-absent here.
+        if args.spec_mix_prob > 0 and rng.random() < args.spec_mix_prob and B_ > 1:
+            o = int(rng.integers(0, B_))
+            while o == b:
+                o = int(rng.integers(0, B_))
+            oa, os_ = diff_to_sparse(
+                batch["z_X"][o], batch["z_X_prime"][o], k_top=args.k_top,
+                k_amp=k_amp, k_sup=k_sup, rng=rng,
+                empty_conditioning_prob=0.0,
+            )
+            for mine, other in ((a, oa), (s, os_)):
+                nz = (mine > 0).nonzero(as_tuple=True)[0]
+                onz = (other > 0).nonzero(as_tuple=True)[0]
+                if len(nz) == 0 or len(onz) == 0:
+                    continue
+                n_swap = int(rng.integers(1, max(2, len(nz) // 2 + 1)))
+                n_swap = min(n_swap, len(nz), len(onz))
+                drop = rng.choice(len(nz), size=n_swap, replace=False)
+                take = rng.choice(len(onz), size=n_swap, replace=False)
+                for d, t in zip(drop, take):
+                    di, ti = int(nz[int(d)]), int(onz[int(t)])
+                    mine[ti] = float(mine[di])   # keep the magnitude scale
+                    mine[di] = 0.0
         xs.append(x_t)
         ts.append(t)
         pend_all.append(pending)
