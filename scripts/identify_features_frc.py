@@ -30,6 +30,8 @@ from __future__ import annotations
 import argparse
 import json
 import random
+
+import numpy as np
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -70,9 +72,13 @@ def main():
     ds = load_dataset(args.dataset, split="train")
     if args.language and args.language.lower() != "all":
         ds = ds.filter(lambda r: r["language"] == args.language)
-    order = list(range(len(ds)))
-    random.Random(args.seed).shuffle(order)
-    eval_idx = set(order[:min(args.eval_sample_size, len(order))])
+    # MUST be the same recipe every consumer uses to draw its eval sample
+    # (np.default_rng(seed).choice), or the exclusion misses the actual eval
+    # pairs. The original stdlib-shuffle recipe excluded a DIFFERENT 500:
+    # only ~50 overlapped, so ~450 eval pairs leaked into identification.
+    eval_idx = set(np.random.default_rng(args.seed).choice(
+        len(ds), size=min(args.eval_sample_size, len(ds)),
+        replace=False).tolist())
     print(f"[frc] {len(ds)} pairs; excluding {len(eval_idx)} eval pairs "
           f"from identification")
 
@@ -120,8 +126,14 @@ def main():
 
     # ---- PS / PN / FRC per phenomenon (LinguaLens metrics.py) -----------
     by_ph = defaultdict(list)
+    n_skip = 0
     for r in done.values():
+        if int(r["idx"]) in eval_idx:
+            n_skip += 1              # stale cache rows from the old recipe
+            continue
         by_ph[r["feature"]].append(r)
+    if n_skip:
+        print(f"[frc] excluded {n_skip} cached eval-pair rows from aggregation")
     print(f"[frc] {len(by_ph)} phenomena")
 
     expl = {}

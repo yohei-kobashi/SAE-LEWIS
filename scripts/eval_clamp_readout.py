@@ -182,6 +182,19 @@ def parse_args():
                         "strongly before we touch the token.")
     p.add_argument("--ins-keep-p", type=float, default=0.10,
                    help="after splicing v, if the intervened head still gives the\n                        original token at least this probability, v was an\n                        INSERTION, not a substitution")
+    p.add_argument("--feature-sets", default="",
+                   help="JSON {phenomenon: [[feature_id, score], ...]} from "
+                        "identify_features_frc.py (LinguaLens) or "
+                        "select_features_auroc.py (AxBench). When set, the "
+                        "intervention targets the IDENTIFIED features instead "
+                        "of the instance delta — the deployment-honest spec: "
+                        "no target is consulted anywhere.")
+    p.add_argument("--feature-mode", default="pure",
+                   help="pure = suppress the identified features, magnitudes "
+                        "from the SOURCE's global pool (never the target; "
+                        "this is LinguaLens's ablation, generalized to r>3). "
+                        "intersect = instance delta masked to the identified "
+                        "set (keeps target-peeking; isolates pure narrowing)")
     p.add_argument("--conditions", default="true,empty,random")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -338,6 +351,14 @@ def main():
              else "NO-OP (delta adds nothing when the spec is empty, so the "
                   "unintervened forward IS the right baseline)"))
 
+    fsets = None
+    if args.feature_sets:
+        _raw = json.loads(Path(args.feature_sets).read_text())
+        fsets = {ph: {int(f) for f, _ in lst} for ph, lst in _raw.items()}
+        print(f"[readout] feature sets: {len(fsets)} phenomena, "
+              f"mode={args.feature_mode} "
+              f"({'TARGET-FREE spec' if args.feature_mode == 'pure' else 'delta ∩ set'})")
+
     clamp_vals = [float(v) for v in args.clamp_values.split(",")]
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
     prng = np.random.default_rng(args.seed + 1)
@@ -369,6 +390,28 @@ def main():
             z_src = local_pool_topk(z_s, s_off, sr, args.pool_topk, blk)
             z_tgt = local_pool_topk(z_t, t_off, tr, args.pool_topk, blk)
         za_t, zs_t = diff_intervention(z_src, z_tgt, args.k_amp, args.k_sup)
+        if fsets is not None:
+            ident = fsets.get(ex.get("feature") or "?", set())
+            if args.feature_mode == "pure":
+                # LinguaLens's ablation protocol, generalized: suppress the
+                # phenomenon-identified features. Magnitudes come from the
+                # SOURCE's global pool — the edit-span pool would leak the
+                # target, and pure mode's whole point is that NOTHING here
+                # consults the target. Features silent in the source
+                # contribute 0 (clamping an inactive feature is a no-op;
+                # delta subtracts nothing).
+                g_src = z_s.max(dim=0).values.float().cpu()
+                zs_t = torch.zeros_like(zs_t)
+                if ident:
+                    ids_t = torch.tensor(sorted(ident), dtype=torch.long)
+                    zs_t[ids_t] = g_src[ids_t]
+                za_t = torch.zeros_like(za_t)
+            else:                                  # intersect
+                keep = torch.zeros_like(za_t, dtype=torch.bool)
+                if ident:
+                    keep[sorted(ident)] = True
+                za_t = torch.where(keep, za_t, torch.zeros_like(za_t))
+                zs_t = torch.where(keep, zs_t, torch.zeros_like(zs_t))
         zvar = {
             "true": (za_t, zs_t),
             "empty": (torch.zeros_like(za_t), torch.zeros_like(zs_t)),
@@ -404,7 +447,7 @@ def main():
                 out_text = tok.decode(out_ids, skip_special_tokens=True)
 
                 pm = pair_metrics(out_text, src, tgt)
-                rec["outputs"][cond][f"clamp{cv:g}"] = {
+                rec["outputs"][cond][f"{args.intervention}{cv:g}"] = {
                     "text": out_text, "exact": pm["exact_match"],
                     "sim_target": pm["sim_target"], "copy": pm["copy_rate"],
                     "n_fire": len(fire),
