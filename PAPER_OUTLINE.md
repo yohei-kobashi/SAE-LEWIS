@@ -626,6 +626,29 @@ probe500_frc_{intersect,pure}_ctrl(両者同一 = **既知**の pool_topk=64 上
   **2つの独立な経路(学習済み編集器・無学習readout)が同じ結論**:
   現象レベル同定特徴はWHEREを部分的に運び、WHATを運ばない。
 
+## 6j. corruption top-up v7 = P4 + P5 + 語彙多様化(2026-07-17着手)
+
+ユーザ決定により実施。台帳(M1 NO-GO判定)の処方箋そのまま:
+- **P4(SPLITINF family、`transforms.py` 実装済み)**: "to ADV V" ↔
+  "to V ... ADV"(LinguaLensの分裂不定詞幾何)。既存ADVPLACEは定形動詞の
+  動詞前↔節末のみ = M1のpointerが学んだ幾何とLinguaLensの幾何のズレを解消。
+  + 飢餓気味のreorder系familyを family-priority-pick で厚めに。
+- **P5(mismatched-z null teacher、`train_editflow.py --mismatch-null-prob`
+  実装済み)**: **キャッシュ変更不要の学習時実装** — 確率pで、レコードを
+  「x_t = x0、gold = 編集なし、条件付け = **他ペアの実deltaを拝借**」に
+  振り替える。matched записи が「一致するzでは撃て」を教え、これが
+  「一致しないzでは黙れ」を教える — M1診断(mismatched条件下の発火に
+  ペナルティが無い)の欠落コントラスト。random no_edit 0.87 の引き上げと
+  MOVE前提保護の構造的修理を狙う。検証済み: spec は常に他ペア由来・非空、
+  gold は pending 空。
+- **語彙多様化**: MLM payload の top-k 8→24、del-top1 0.5→0.25、
+  **seed 777**(v5のseed 42と別のdolma文を引く)。
+- 生成: `run_corruption_v7.sh`(interact-g、2h予算内timeout、再実行で延長、
+  別dir生成→shard-v7-*をsymlink合流、meta_v7topup.json)。
+  ゲート: 実spaCyでのSPLITINF自己テスト合格後にのみGPU消費。
+- 次段: S6学習(S3温開始 + v7シャード + --mismatch-null-prob 0.1〜0.15 +
+  --move-ops[M1b相乗り、台帳の条件成立])→ probe500 + 全ゲート再判定。
+
 ## 6i. S5(family仕様学習)への懸念と、B1改善の実行順(2026-07-16)
 
 **🔴 S5のfamily集合案はユーザ指摘により要修正**: corruption familyは25個

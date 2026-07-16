@@ -124,6 +124,15 @@ def parse_args():
     p.add_argument("--k-top", type=int, default=32)
     p.add_argument("--k-amp", default="log:1-32")
     p.add_argument("--k-sup", default="log:1-32")
+    p.add_argument("--mismatch-null-prob", type=float, default=0.0,
+                   help="P5 (mismatched-z null teacher): with this prob. a "
+                        "record trains as (x_t = x0, NO pending ops) under a "
+                        "PARTNER record's conditioning delta. The M1 NO-GO "
+                        "diagnosis: nothing in training penalizes firing "
+                        "under MISMATCHED conditioning — the null-record "
+                        "teacher only covers EMPTY. This is the missing "
+                        "contrast: real, nonempty, irrelevant spec -> "
+                        "suppress all rates. Needs no cache change.")
     p.add_argument("--spec-binarize-prob", type=float, default=0.0,
                    help="prob. of dropping the spec's MAGNITUDES (keeping the "
                         "feature IDs) for an example. Simulates LinguaLens's "
@@ -193,6 +202,32 @@ def build_batch(batch: Dict, rng: np.random.Generator, args,
         x0, x1 = batch["x0"][b], batch["x1"][b]
         if max(len(x0), len(x1)) > args.max_len:
             continue
+        # ---- P5: mismatched-z null --------------------------------------
+        # Same input distribution as ordinary records, gold = do nothing,
+        # conditioning = a partner's real delta. Matched records teach
+        # firing under matched z; this teaches silence under mismatched z —
+        # the contrast that premise protection (random no_edit) needs.
+        if (getattr(args, "mismatch_null_prob", 0.0) > 0 and B_ > 1
+                and rng.random() < args.mismatch_null_prob):
+            o = int(rng.integers(0, B_))
+            while o == b:
+                o = int(rng.integers(0, B_))
+            if len(x0) <= args.max_len:
+                a_mm, s_mm = diff_to_sparse(
+                    batch["z_X"][o], batch["z_X_prime"][o],
+                    k_top=args.k_top,
+                    k_amp=draw_k(rng, args._k_amp),
+                    k_sup=draw_k(rng, args._k_sup),
+                    rng=rng, empty_conditioning_prob=0.0)
+                if bool((a_mm > 0).any() or (s_mm > 0).any()):
+                    xs.append(list(x0))
+                    ts.append(float(rng.random()))
+                    pend_all.append([])          # gold: NO pending ops
+                    pend_w_all.append([])
+                    adj_all.append(None)
+                    za_l.append(a_mm)
+                    zs_l.append(s_mm)
+                    continue                     # replaces the normal record
         slots = None
         if getattr(args, "true_align", False) and batch["ei"][b] is not None:
             slots = cache_slots(x0, x1, batch["ei"][b], batch["et"][b],

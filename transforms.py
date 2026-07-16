@@ -870,6 +870,50 @@ def propose_advplace(doc, text, rng) -> List[Proposal]:
     return out
 
 
+def propose_splitinf(doc, text, rng) -> List[Proposal]:
+    """Split infinitive ↔ post-verbal adverb (P4, 2026-07-17).
+
+    The v7 top-up family: LinguaLens's split_infinitives pairs move the
+    adverb between "to" and the verb ("to boldly go") to after the verb's
+    object/subtree ("to go boldly"). The cache's ADVPLACE only generates
+    pre-verbal ↔ clause-final geometry on FINITE verbs — the M1 pointer
+    learned that geometry and missed this one (the P4 mismatch).
+    Both directions, pure reorder, grammaticality-preserving."""
+    out = []
+    if not _sent_ok(doc):
+        return out
+    for v in doc:
+        if v.pos_ != "VERB":
+            continue
+        # the infinitival "to" directly attached to this verb
+        to = next((c for c in v.children
+                   if c.tag_ == "TO" and c.dep_ in ("aux", "mark")), None)
+        if to is None or to.i >= v.i:
+            continue
+        vsub = sorted(v.subtree, key=lambda t: t.i)
+        last = vsub[-1]
+        if last.pos_ == "PUNCT" and len(vsub) >= 2:
+            last = vsub[-2]
+        adv = next((c for c in v.children
+                    if c.dep_ == "advmod" and c.lower_.endswith("ly")
+                    and not any(True for _ in c.children)), None)
+        if adv is None:
+            continue
+        # A: split ("to ADV V") -> post-subtree ("to V ... ADV")
+        if to.i < adv.i < v.i and adv.i == v.i - 1 and last.i >= v.i:
+            end = last.idx + len(last.text)
+            T = _splice(text, [(adv.idx, adv.idx + len(adv.text) + 1, ""),
+                               (end, end, " " + adv.text)])
+            out.append(Proposal("TOINF:SPLIT->POST", "SPLITINF", T, True))
+        # B: post-subtree ("to V ... ADV") -> split ("to ADV V")
+        elif adv.i == last.i and adv.i > v.i and to.i == v.i - 1:
+            T = _splice(text,
+                        [(adv.idx - 1, adv.idx + len(adv.text), ""),
+                         (v.idx, v.idx, adv.text + " ")])
+            out.append(Proposal("TOINF:POST->SPLIT", "SPLITINF", T, True))
+    return out
+
+
 def propose_ppfront(doc, text, rng) -> List[Proposal]:
     """Sentence-final adjunct PP ↔ fronted PP + comma (long-distance move)."""
     out = []
@@ -1167,6 +1211,7 @@ FAMILIES: Dict[str, Callable] = {
     "PARTICLE": propose_particle,
     "DATIVE": propose_dative,
     "ADVPLACE": propose_advplace,
+    "SPLITINF": propose_splitinf,   # v7 top-up (P4)
     "PPFRONT": propose_ppfront,
     "CONTRACT": propose_contract,
     "COMPZR": propose_compzr,
