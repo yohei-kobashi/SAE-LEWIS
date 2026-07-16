@@ -576,6 +576,26 @@ v2 = PMI WHAT(介入が最も昇格させたトークン、p_int top-50内)+ cla
   **学習フリーな因果証拠**として主張可能。exactの勝負は conditioning
   (routed 0.2839)が担う。
 
+## 6g-3. P-I WHERE統計(2026-07-16実測、delta_local/delta0.5、500ペア)
+
+- **対応のある符号検定: true>random 393 / true<random 31 / tied 76、
+  p = 5.6e-81**。平均発火 3.57 vs 1.08(3.30×)。同数・同大きさ・ID違いのみの
+  対照なので、**「同定活性はLM自身の予測を因果的に動かす」は確定**。
+- **現象別WHERE表が他の表と噛み合う**:
+  - **上位 = 発話行為・節タイプ**: interrogative +4.12(7/0)、expressive
+    +3.30(10/0)、commisive +3.20(10/0)— 介入がLMの予測に強く反対を生む。
+    interrogativeはexactでは**steerの領地**(EF 0.000/steer 0.700)だった現象
+    で、因果信号は強いのに離散編集が失敗していた = WHATの協調問題の傍証。
+  - **中位 = 形態・時制**: past +1.25(8/0)、third_person_singular、
+    past_progressive — EFの領地と一致。
+  - **底 = 比喩系**: non_synecdoche_metonymy **−0.17**(5/3、唯一の負)、
+    punctual_durative +0.22(3/3)。**比喩系はFRR高・exact 0の
+    「方向は実現、正確編集は不可」群だったが、因果WHERE信号すら無い** —
+    同定特徴が発火位置でLMの予測を動かしていない。3層分解の最下層
+    (検出できるが指令も介入もできない)の実例。
+- 論文図: この表 × per-feature exact × per-feature FRR の3面で、現象ごとに
+  「検出/指令/介入」のどの層まで到達するかを示せる。
+
 ## 6f. P-J — 介入する活性の選択(LinguaLens FRC vs AxBench AUROC、2026-07-16計画)
 
 **問い**: 因果readoutで介入する活性を**現象レベル同定**で選んだとき、
