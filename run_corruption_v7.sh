@@ -86,7 +86,7 @@ done
 [ -f "$OUT/meta.json" ] && cp "$OUT/meta.json" "$MAIN/meta_v7topup.json"
 echo "[v7] linked $n shard(s) into $MAIN as shard-v7-*"
 echo "[v7] records so far:"
-for s in "$OUT"/shard-*.jsonl.gz; do [ -e "$s" ] && zcat "$s" | wc -l; done | paste -sd+ | bc || true
+total=0; for s in "$OUT"/shard-*.jsonl.gz; do [ -e "$s" ] && total=$((total + $(zcat "$s" | wc -l))); done; echo "$total"
 echo
 echo "SPLITINF share check (last shard):"
 last=$(ls -t "$OUT"/shard-*.jsonl.gz 2>/dev/null | head -1)
