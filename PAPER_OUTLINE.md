@@ -610,7 +610,14 @@ probe500_frc_{intersect,pure}_ctrl(両者同一 = **既知**の pool_topk=64 上
    readoutで検証済みのマスクを、効く効果器に接続する未測定セル。
    併せてαの細目掃引(0.25/0.375/0.5/0.75; 0.5→1で半減する崖の頂点確認)。
 2. **P-K(`run_protocol_e2e.sh`)**: 両プロトコル完全版(C1'の左列)。
-3. 勝ったsteer設定は routed のfallbackにも継承される(0.2839も連動改善)。
+3. **routedへの波及は条件付き(2026-07-16訂正)**: routedはEF-head +
+   steer-fallbackの混合(steer側に振られたペアはsteerの出力そのもの)なので、
+   fallback差し替えで exact(routed) の steer項は機構的に変わる。**ただし**
+   (a) 改善がEF側ペアに集中していれば寄与ゼロ、(b) 0.2839/0.2892は
+   「steer0.5をfallbackとする凍結済み規則」への**事前登録済みの数字**であり、
+   fallback差し替え = 別システム。同じ厳密さで主張するには**未接触標本
+   (idx 1001+)での再確認**が必須(gain-router 0.3012を昇格させなかったのと
+   同じ規律)。steer側比率は routed records の `picked` で数えられる。
 ## 6g. P-I v1 判定 — 因果信号はWHEREにあり、WHATに無い(2026-07-16実測)
 
 500ペア、gemma-2-2b層12、readout(反復8・top4発火・INS/DEL/SUB)。
