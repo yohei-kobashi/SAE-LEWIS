@@ -106,14 +106,20 @@ def parse_args():
                    help="enhancement 'set' values swept on `true` "
                         "(their code uses 10); ablation is always set-0. "
                         "empty/random run at the SECOND value (10).")
-    p.add_argument("--intervention", choices=["clamp", "steer"],
+    p.add_argument("--intervention", choices=["clamp", "steer", "learned"],
                    default="clamp",
                    help="B1 'clamp' = OpenSAE-faithful set+reconstruction "
                         "replacement. B3 'steer' = steering vector: "
                         "h + alpha*(za@W_dec - zs@W_dec), a pure delta "
                         "add (no SAE in the loop) rendering the commanded "
                         "feature delta in residual space (SAE-TS spirit); "
-                        "--clamp-values are read as the alpha sweep.")
+                        "--clamp-values are read as the alpha sweep. "
+                        "'learned' = the Intervener (INTERVENER_PLAN.md): "
+                        "delta_pre at the prompt's src span + delta_dec at "
+                        "every decode step, generated from (src, spec) — "
+                        "same injection site, learned rendering.")
+    p.add_argument("--intervener-ckpt", default="",
+                   help="checkpoint for --intervention learned")
     p.add_argument("--max-new-tokens", type=int, default=128)
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
@@ -269,12 +275,33 @@ def main():
     # Gemma Scope layer_L = residual AFTER block L → hook block L's output
     sae = load_sae(args.sae_type, args.sae_repo, args.sae_path,
                    sae_k=args.sae_k).to(args.device).eval()
+    interv = None
     if args.intervention == "clamp":
         hook = SaeClampHook(sae)
         mode_prefix = "clamp"
-    else:
+    elif args.intervention == "steer":
         hook = SteerHook()
         mode_prefix = "steer"
+    else:
+        from intervener import Intervener, InjectHook, find_subseq
+        if not args.intervener_ckpt:
+            raise SystemExit("--intervention learned needs "
+                             "--intervener-ckpt")
+        blob = torch.load(args.intervener_ckpt, map_location="cpu",
+                          weights_only=False)
+        cfg = blob["config"]
+        if int(cfg.get("inject_layer", args.sae_layer)) != args.sae_layer:
+            raise SystemExit(
+                f"ckpt trained for layer {cfg['inject_layer']}, "
+                f"eval hooks layer {args.sae_layer}")
+        interv = Intervener(args.llm2vec_dir, int(cfg["d_sae"]),
+                            dtype=dtype, lora_r=int(cfg.get("lora_r", 32)),
+                            w_dec=sae.W_dec.detach().float().cpu(),
+                            ).to(args.device).eval()
+        interv.load_trainable_state_dict(blob["trainable"])
+        hook = InjectHook()
+        mode_prefix = "learned"
+        print(f"[b1] Intervener loaded from {args.intervener_ckpt}")
     it_model.model.layers[args.sae_layer].register_forward_hook(hook)
     print(f"[b1] rewriter {args.it_model}, {args.intervention} hook on "
           f"layers[{args.sae_layer}] output (all positions, "
@@ -390,7 +417,11 @@ def main():
             za, zs = zvar[c]
             amp = torch.nonzero(za > 0).flatten().to(args.device)
             sup = torch.nonzero(zs > 0).flatten().to(args.device)
-            if c == "true":
+            if args.intervention == "learned":
+                modes = [("learned", None)]
+                if c == "empty":
+                    modes.append(("raw", None))
+            elif c == "true":
                 modes = [(f"{mode_prefix}{v:g}", v) for v in clamp_vals]
                 if args.intervention == "clamp":
                     modes.append(("clampZ", za[amp.cpu()].to(args.device)))
@@ -411,6 +442,32 @@ def main():
                 hook.pos_mask = prompt_mask(enc_c, sup)
             elif args.intervention == "steer":
                 hook.pos_mask = None
+            elif args.intervention == "learned":
+                # generate the intervention for THIS condition's spec
+                enc_c = make_enc(src)
+                with torch.no_grad():
+                    ei = torch.tensor([src_ids], device=args.device)
+                    io = interv(ei, torch.ones_like(ei),
+                                za.unsqueeze(0).to(args.device),
+                                zs.unsqueeze(0).to(args.device))
+                needle = it_tok(src, add_special_tokens=False).input_ids
+                pl = enc_c["input_ids"][0].tolist()
+                off = 1 if src_ids[0] == tokenizer.bos_token_id else 0
+                lo = find_subseq(pl, needle)
+                if lo is None and len(needle) > 1:
+                    lo = find_subseq(pl, needle[1:])
+                    if lo is not None:
+                        off += 1
+                        needle = needle[1:]
+                hook.delta_dec = io["delta_dec"][0].detach()
+                hook.resp_from = None
+                if lo is not None:
+                    n = min(len(needle), io["delta_pre"].shape[1] - off)
+                    hook.delta_pre = io["delta_pre"][0,
+                                                    off:off + n].detach()
+                    hook.span = (lo, lo + n)
+                else:
+                    hook.delta_pre, hook.span = None, None
             for mname, val in modes:
                 if mname == "raw":
                     hook.enabled = False       # plain model, no hook
@@ -418,6 +475,8 @@ def main():
                     hook.enabled = True        # recon replacement always
                     hook.amp_idx, hook.sup_idx = amp, sup
                     hook.amp_val = val
+                elif mname == "learned":
+                    hook.enabled = True        # fields set above
                 else:
                     hook.enabled = True
                     hook.dvec = dvec
@@ -438,8 +497,10 @@ def main():
                   f"({len(records)} scored)")
     pf.close()
 
-    title = ("B1 LinguaLens-clamp" if args.intervention == "clamp"
-             else "B3 steering-vector")
+    title = {"clamp": "B1 LinguaLens-clamp",
+             "steer": "B3 steering-vector",
+             "learned": "Intervener (learned intervention)"
+             }[args.intervention]
     lines = [f"# {title} baseline (LinguaLens)", ""]
     lines.append(f"pairs scored: {len(records)}; rewriter {args.it_model}; "
                  f"intervention={args.intervention} on "
