@@ -136,6 +136,31 @@ runs/prod_gemma_v6/ksweep_steer/k*/report.md)
   論文除外)の結論をEFなしで取り直した確定値。表現幅の主張は形1(P-J)/
   形2(S_min安定核)で行う。
 
+## 🟢 B-2 S_min(steer)+ 安定核×FRC3の実測(2026-07-17完走、134ペア、
+runs/prod_gemma_v6/prune_spec_steer/report.md + runs/tables/smin_vs_frc.md)
+
+- **|S_min|: median 5 / mean 7.9 / min 1 / max 43 — vs 全仕様 mean 98.7**。
+  事例あたりの因果ハンドルは仕様の~5%。**S_min=1 の実例あり**
+  (of_genitive、passive_voice: 活性1本の介入で編集が再現)。
+- **B-1との整合 = 局在性の中心的な物語**: 事例ごとの正しいハンドルは少数
+  (median 5)だが、**その少数が事例ごとに違う**(現象内Jaccard 0.0-0.4)
+  ため、|delta|順のtop-kでは k=32 まで積まないと集団で飽和しない
+  (magnitude順位 ≠ 因果順位)。
+- **安定核×FRC3(形2、22現象 ≥3ペア)**:
+  - 安定核が非空 **20/22** — 因果検証済みの対応集合は大半の現象で存在。
+    核のラベルは強く現象整合(past_perfect: "the verb had" 4/4、
+    future系: "will" / "future tense and conditional"、interrogative:
+    "questions and queries" 5/5、present_progressive: "ongoing processes"
+    3/3)— **因果基準が意味的に正しい辞書項目を掘り当てている**。
+  - **核∩FRC3 は 8/22 のみ、FRC3のS_min出現率は0.0-0.6** — 因果的対応
+    集合はFRCの検出的同定と**大部分は別物**(「より多い」ではなく
+    「別物」が主結論; future_perfect 等は「FRC3の一部を含んで広い」)。
+  - **AUROC top-1 は核に頻出**(future/present_progressive 出現率1.00、
+    interrogative 0.80)— AxBenchの1本は因果ハンドルとして実在するが
+    **単独では編集を指令できない**(B-1 k=1床と整合)。
+  - 空核: synecdoche/non_synecdoche_metonymy(比喩系、Jaccard 0.00)—
+    判別木の比喩クラスタと一貫。
+
 ## 🔴 枠組みの訂正: 我々は「介入」していない(2026-07-16)
 
 **旧題「SAE介入の離散編集化」および §2 の表は誤りだった。** コードで確認:

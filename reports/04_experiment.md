@@ -111,8 +111,24 @@ Limitationsでのみ使用。
 - 免許規則の読み: 操作インターフェース幅の曲線(「~32本で飽和」)。
   表現幅は形1(P-J)・形2(S_min安定核)で主張。
 
-## 10. 進行中・空欄
+## 10. 主結果7 — B-2 S_min + 安定核×FRC3(完走、134ペア、形2)
 
-- **B-2 S_min + 安定核×FRC3**(形2): `runs/tables/smin_vs_frc.md`
+- **|S_min| median 5 / mean 7.9 / min 1 / max 43** vs 全仕様 98.7 —
+  事例あたりの因果ハンドルは仕様の~5%。S_min=1の実例(of_genitive、
+  passive_voice)。
+- B-1との整合: 事例ごとの正しいハンドルは少数だが**事例ごとに違う**
+  (Jaccard 0.0-0.4)→ magnitude順のtop-kは k=32 まで必要(magnitude
+  順位≠因果順位)。
+- **安定核(22現象≥3ペア)**: 非空 **20/22**、サイズ median 1.5 /
+  mean 3.2。核ラベルは現象整合(past_perfect "had" 4/4、future "will"、
+  interrogative "questions" 5/5)= 因果基準が意味的に正しい辞書項目を
+  掘り当てる。
+- **核∩FRC3 = 8/22、FRC3出現率 0.0-0.6** → 因果的対応集合はFRCの検出的
+  同定と**大部分は別物**(一部は「含んで広い」)。**AUROC top-1 は核に
+  頻出**(出現率1.00の現象あり)だが単独では編集不能(B-1 k=1床)。
+- 空核 = 比喩系(synecdoche等、Jaccard 0.00)— 判別木と一貫。
+- 出典: `runs/tables/smin_vs_frc.md`、`runs/prod_gemma_v6/prune_spec_steer/report.md`
+
+## 11. 進行中・空欄
 - AxBench再現 L20→L10 → judge
 - FRR表再集計(EF行なし)、clamp腕FRR(任意)、BLEU/chrF、定性例
