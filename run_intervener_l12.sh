@@ -1,17 +1,30 @@
-#!/bin/bash
+#!/bin/bash -l
+
+#------ qsub option --------#
+#PBS -q short-g
+#PBS -l select=1
+#PBS -l walltime=8:00:00
+#PBS -W group_list=go25
+#PBS -j oe
+
 # Intervener L12 (INTERVENER_PLAN.md): learned intervention generator.
-#   qsub -I -l select=1 -W group_list=go25 -q interact-g
-#   source start_gpu_nodes.sh && cd SAE-LEWIS && git pull && bash run_intervener_l12.sh
+# Batch:      cd ~/SAE-LEWIS && qsub run_intervener_l12.sh   (login node)
+# Interactive: qsub -I -l select=1 -W group_list=go25 -q interact-g
+#              then: cd ~/SAE-LEWIS && git pull && bash run_intervener_l12.sh
 #
-# Multi-session: training checkpoints every 1000 steps and resumes; rerun
-# this script until "INTERVENER L12 DONE". The 2h interact-g wall just
-# truncates a session — nothing is lost past the last checkpoint.
-# When training completes, the probe runs automatically: the SAME 500-pair
-# frame as the steer champion (blocklist, k 64/64, seed 42), conditions
-# true/empty/random. Bar = steer0.5 exact 0.2385@499; floors raw 0.0601 /
-# random 0.0521; empty must stay ~copy (premise protection).
+# Multi-session: training checkpoints every 1000 steps and resumes; rerun /
+# resubmit until "INTERVENER L12 DONE". When training completes, the probe
+# runs automatically: the SAME 500-pair frame as the steer champion
+# (blocklist, k 64/64, seed 42), conditions true/empty/random.
+# Bar = steer0.5 exact 0.2385@499; floors raw 0.0601 / random 0.0521;
+# empty must stay ~copy (premise protection).
+
+cd ~/
+source start_gpu_nodes.sh
+cd ~/SAE-LEWIS
+
 set -eo pipefail
-cd "$(dirname "$0")"
+git pull || true
 
 V4=./runs/prod_gemma_v4
 V6=./runs/prod_gemma_v6
