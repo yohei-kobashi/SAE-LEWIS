@@ -59,6 +59,11 @@ def parse_args():
     p.add_argument("--language", default="English")
     p.add_argument("--min-n", type=int, default=4)
     p.add_argument("--detect-thr", type=float, default=0.9)
+    p.add_argument("--paper-mode", action="store_true",
+                   help="⚫ EF除外版(2026-07-17決定): ef32/routed列を出さず、"
+                        "C類の判定を『WHERE陽性+介入不可』に再定義する — "
+                        "『活性に情報が在る』の証拠はEFでなくP-I WHEREが担う。"
+                        "B2は補助列(LM側の切り分け)に残る")
     p.add_argument("--out", default="runs/tables/feature_tree")
     return p.parse_args()
 
@@ -147,13 +152,26 @@ def main():
         w = row.get("where")
         if st > 0 or (cl is not None and cl > 0):
             return "A 介入で編集可能"
-        if w is None or b is None:
+        if w is None:
+            return "? データ不足"
+        d, gt, lt = w
+        where_pos = d > 0 and gt > lt
+        if args.paper_mode:
+            # ⚫ EF除外版: 「活性に情報が在る」はP-I WHEREのみが担う。
+            # C = WHERE陽性なのに介入が編集を実行できない(効果器側)。
+            # B = WHERE無しなのにB2は編集できる(同定/SAE側の示唆)。
+            # D = WHERE無しかつB2も不可(LM/タスク側 or SAE側、不定)。
+            if where_pos:
+                return "C 効果器側(WHERE有・介入実行不可)"
+            if b is not None and b > 0:
+                return "B SAE側の示唆(因果WHERE無し・B2可)"
+            return "D LM/タスク側 or SAE側(WHERE無し・B2不可、不定)"
+        if b is None:
             return "? データ不足"
         text_editable = (b > 0) or (ef > 0) or (rt > 0)
         if not text_editable:
             return "D LM/タスク側"
-        d, gt, lt = w
-        if d <= 0 or gt <= lt:
+        if not where_pos:
             return "B SAE側の示唆(因果WHERE無し)"
         return "C 効果器側(WHERE有・実行不可=WHAT問題)"
 
@@ -173,22 +191,35 @@ def main():
     order = {"A": 0, "C": 1, "B": 2, "D": 3, "?": 4}
     rows.sort(key=lambda r: (order.get(r["class"][0], 9), -r["steer"],
                              -r["ef"]))
+    mode_note = ("⚫ paper版(EF列なし — C類はWHERE基準)" if args.paper_mode
+                 else "内部診断版(EF列あり)")
     L = ["# 編集可能性の判別木(現象別)— SAE側/効果器側/LM側の切り分け示唆",
          "",
-         f"detection thr {args.detect_thr}; where = mean fires true−random "
-         f"({args.where_mode}); clamp = {args.clamp_mode}; b2 = "
+         f"{mode_note}; detection thr {args.detect_thr}; where = mean fires "
+         f"true−random ({args.where_mode}); clamp = {args.clamp_mode}; b2 = "
          f"{args.b2_mode}; 貪欲最小化・閾値は全て表に出す(classは示唆)",
-         "",
-         "| feature | n | AUROC | WHERE Δ (>/< ) | steer | clamp | ef32 | "
-         "routed | B2 | class |",
-         "|---|---|---|---|---|---|---|---|---|---|"]
+         ""]
+    if args.paper_mode:
+        L += ["| feature | n | AUROC | WHERE Δ (>/< ) | steer | clamp | B2 "
+              "| class |",
+              "|---|---|---|---|---|---|---|---|"]
+    else:
+        L += ["| feature | n | AUROC | WHERE Δ (>/< ) | steer | clamp | "
+              "ef32 | routed | B2 | class |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         w = r["where"]
         wtxt = "—" if w is None else f"{w[0]:+.2f} ({w[1]}/{w[2]})"
-        L.append(
-            f"| {r['feature']} | {r['n']} | {fmt(r['auroc'])} | {wtxt} | "
-            f"{r['steer']:.3f} | {fmt(r['clamp'])} | {r['ef']:.3f} | "
-            f"{r['routed']:.3f} | {fmt(r['b2'])} | {r['class']} |")
+        if args.paper_mode:
+            L.append(
+                f"| {r['feature']} | {r['n']} | {fmt(r['auroc'])} | {wtxt} "
+                f"| {r['steer']:.3f} | {fmt(r['clamp'])} | {fmt(r['b2'])} "
+                f"| {r['class']} |")
+        else:
+            L.append(
+                f"| {r['feature']} | {r['n']} | {fmt(r['auroc'])} | {wtxt} | "
+                f"{r['steer']:.3f} | {fmt(r['clamp'])} | {r['ef']:.3f} | "
+                f"{r['routed']:.3f} | {fmt(r['b2'])} | {r['class']} |")
     counts = defaultdict(int)
     for r in rows:
         counts[r["class"]] += 1
