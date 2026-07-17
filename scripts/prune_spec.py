@@ -41,6 +41,22 @@ Usage (interact-g):
         --exact-from runs/prod_gemma_v6/ksweep500/records.jsonl:k32 \
         --explanations runs/np_explanations/gemma-2-2b_12-res-16k.json \
         --output-dir runs/prod_gemma_v6/prune_spec --max-pairs 60
+
+--effector steer (P-O INTERVENTION version, 2026-07-17 reframing): same
+pruning algorithm, but the effector is B3's steering intervention — dvec =
+za@W_dec − zs@W_dec added at layers[12] of gemma-2-2b-it (hook + rewrite
+copied from eval_clamp_baseline.py, greedy so deterministic). This makes
+S_min a CAUSAL minimal set: the smallest activation subset whose
+INTERVENTION still executes the exact minimal-pair edit. Under the 🔵
+reframing this is the primary instrument (localization spectrum of the
+causal claim); the EF version above is its information-side counterpart.
+    python scripts/prune_spec.py --effector steer \
+        --llm2vec-dir runs/mcgill_gemma_repro_3k/final \
+        --exact-from runs/prod_gemma_v6/steer_baseline500/records.jsonl:steer0.5 \
+        --k-amp 64 --k-sup 64 \
+        --output-dir runs/prod_gemma_v6/prune_spec_steer --max-pairs 60
+(--k-amp/--k-sup 64 = the defaults the steer baseline ran with; the spec
+must be rebuilt identically or step 0's reproduce guard rejects the pairs.)
 """
 
 from __future__ import annotations
@@ -67,7 +83,14 @@ from scripts.editflow_probe import decode_flow                # noqa: E402
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--editflow-ckpt", required=True)
+    p.add_argument("--effector", choices=["ef", "steer"], default="ef",
+                   help="ef = conditioning decode (information-side); "
+                        "steer = B3 intervention rewrite (causal-side)")
+    p.add_argument("--it-model", default="google/gemma-2-2b-it")
+    p.add_argument("--steer-alpha", type=float, default=0.5)
+    p.add_argument("--max-new-tokens", type=int, default=128)
+    p.add_argument("--editflow-ckpt", default="",
+                   help="required for --effector ef")
     p.add_argument("--llm2vec-dir", required=True)
     p.add_argument("--exact-from", required=True,
                    help="records.jsonl:mode — pairs whose `mode` output was "
@@ -157,11 +180,41 @@ def main():
                 tokenizer.pad_token_id]
     suppress = sorted({int(s) for s in suppress if s is not None})
     dtype = torch.bfloat16
-    model = load_editflow_from_checkpoint(
-        args.llm2vec_dir, args.editflow_ckpt, dtype=dtype,
-    ).to(args.device).eval()
     w_dec = load_sae_w_dec(args.sae_repo, args.sae_path).to(args.device)
-    head_w = model.lm_head.weight.detach().float().to(args.device)
+    if args.effector == "steer":
+        # B3's effector, copied from eval_clamp_baseline.py: SteerHook on
+        # layers[sae_layer] of the -it model, neutral Rewrite prompt,
+        # greedy (deterministic — pruning needs stable decodes).
+        from transformers import AutoModelForCausalLM
+        from scripts.eval_clamp_baseline import (PROMPT, SteerHook,
+                                                 extract_sentence)
+        it_tok = AutoTokenizer.from_pretrained(args.it_model)
+        it_model = AutoModelForCausalLM.from_pretrained(
+            args.it_model, torch_dtype=dtype).to(args.device).eval()
+        hook = SteerHook()
+        it_model.model.layers[args.sae_layer].register_forward_hook(hook)
+        model, head_w = None, None
+
+        @torch.no_grad()
+        def steer_rewrite(src: str) -> str:
+            text_in = it_tok.apply_chat_template(
+                [{"role": "user", "content": PROMPT.format(src=src)}],
+                add_generation_prompt=True, tokenize=False)
+            enc = it_tok(text_in, return_tensors="pt",
+                         add_special_tokens=False).to(args.device)
+            gen = it_model.generate(
+                **enc, max_new_tokens=args.max_new_tokens, do_sample=False,
+                pad_token_id=it_tok.pad_token_id or it_tok.eos_token_id)
+            return extract_sentence(
+                it_tok.decode(gen[0, enc["input_ids"].shape[1]:],
+                              skip_special_tokens=True), src)
+    else:
+        if not args.editflow_ckpt:
+            raise SystemExit("--editflow-ckpt is required for --effector ef")
+        model = load_editflow_from_checkpoint(
+            args.llm2vec_dir, args.editflow_ckpt, dtype=dtype,
+        ).to(args.device).eval()
+        head_w = model.lm_head.weight.detach().float().to(args.device)
     blk = None
     if args.blocklist and Path(args.blocklist).exists():
         blk = torch.as_tensor(np.asarray(np.load(args.blocklist),
@@ -178,10 +231,21 @@ def main():
 
     n_decodes = 0
 
-    def decode_with(entries, src_ids, d_sae, k):
+    def decode_with(entries, src_ids, src, d_sae, k):
         nonlocal n_decodes
         n_decodes += 1
         za, zs = spec_from_entries(entries, d_sae)
+        if args.effector == "steer":
+            # dvec construction verbatim from eval_clamp_baseline (B3)
+            W = w_dec.float()
+            hook.dvec = (za.to(args.device).float() @ W
+                         - zs.to(args.device).float() @ W)
+            hook.alpha = float(args.steer_alpha)
+            hook.pos_mask = None
+            hook.enabled = True
+            out = steer_rewrite(src)
+            hook.enabled = False
+            return out
         srng = random.Random(args.seed * 1000003 + int(k))
         out_ids = decode_flow(
             model, src_ids, za.to(args.device), zs.to(args.device),
@@ -241,7 +305,7 @@ def main():
         n_full = len(entries)
 
         # 0) reproduce the exact hit with the full spec (env-drift guard)
-        if norm(decode_with(entries, src_ids, d_sae, k)) != tgt_norm:
+        if norm(decode_with(entries, src_ids, src, d_sae, k)) != tgt_norm:
             row = {"idx": int(k), "feature": feature, "n_full": n_full,
                    "status": "full-spec no longer exact (skipped)"}
             results.append(row)
@@ -253,7 +317,7 @@ def main():
         lo, hi = 1, n_full
         while lo < hi:
             mid = (lo + hi) // 2
-            if norm(decode_with(entries[:mid], src_ids, d_sae, k)) \
+            if norm(decode_with(entries[:mid], src_ids, src, d_sae, k)) \
                     == tgt_norm:
                 hi = mid
             else:
@@ -267,10 +331,10 @@ def main():
             if len(s_min) == 1:
                 break
             trial = [x for x in s_min if x is not e]
-            if norm(decode_with(trial, src_ids, d_sae, k)) == tgt_norm:
+            if norm(decode_with(trial, src_ids, src, d_sae, k)) == tgt_norm:
                 s_min = trial
         # 3) final verification
-        assert norm(decode_with(s_min, src_ids, d_sae, k)) == tgt_norm
+        assert norm(decode_with(s_min, src_ids, src, d_sae, k)) == tgt_norm
 
         row = {"idx": int(k), "feature": feature, "n_full": n_full,
                "p_prefix": p_star, "n_min": len(s_min), "status": "ok",
@@ -290,9 +354,12 @@ def main():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     L = ["# P-O: per-instance minimal conditioning sets", "",
-         f"pairs pruned: {len(ok)} (of {len(results)} attempted); decode = "
-         f"champion thr{args.thr:g}, {args.steps} steps; total decodes "
-         f"{n_decodes}", ""]
+         f"pairs pruned: {len(ok)} (of {len(results)} attempted); effector = "
+         f"{args.effector}"
+         + (f" (steer alpha {args.steer_alpha:g}, greedy rewrite)"
+            if args.effector == "steer" else
+            f" (champion thr{args.thr:g}, {args.steps} steps)")
+         + f"; total decodes {n_decodes}", ""]
     if ok:
         import statistics as st
         sizes = [r["n_min"] for r in ok]
