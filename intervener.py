@@ -68,7 +68,8 @@ class Intervener(nn.Module):
     def load_trainable_state_dict(self, sd: Dict[str, torch.Tensor]):
         flow_sd = {k[len("flow::"):]: v for k, v in sd.items()
                    if k.startswith("flow::")}
-        self.flow.load_trainable_state_dict(flow_sd)
+        # editflow's loader is load_trainable (verbatim signature, line 429)
+        self.flow.load_trainable(flow_sd)
         for name in ("delta_prefill", "delta_decode"):
             lin = getattr(self, name)
             lin.weight.data.copy_(sd[f"{name}.weight"])
