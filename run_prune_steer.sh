@@ -22,6 +22,7 @@ python scripts/prune_spec.py --effector steer \
     --exact-from runs/prod_gemma_v6/steer_baseline500/records.jsonl:steer0.5 \
     --k-amp 64 --k-sup 64 \
     $EXPL_ARG \
+    --sample-size 0 \
     --output-dir runs/prod_gemma_v6/prune_spec_steer \
     --max-pairs 120 \
     --device cuda

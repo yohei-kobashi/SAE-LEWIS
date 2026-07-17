@@ -157,10 +157,18 @@ def main():
     ds = load_dataset(args.dataset, split="train")
     if args.language and args.language.lower() != "all":
         ds = ds.filter(lambda r: r["language"] == args.language)
-    rng = np.random.default_rng(args.seed)
-    sample = set(rng.choice(len(ds), size=min(args.sample_size, len(ds)),
-                            replace=False).tolist())
-    pool = sorted(set(exact_idx) & sample)
+    if args.sample_size > 0:
+        # NOTE: numpy-choice recipe — records produced by stdlib-shuffle
+        # sampling (eval_clamp_baseline) overlap this only ~24%, which
+        # silently starved the pool to 24 pairs (2026-07-17). The records'
+        # idx ARE the eval sample already, so the default is now 0 = trust
+        # the records; keep >0 only for caches that need re-filtering.
+        rng = np.random.default_rng(args.seed)
+        sample = set(rng.choice(len(ds), size=min(args.sample_size, len(ds)),
+                                replace=False).tolist())
+        pool = sorted(set(exact_idx) & sample)
+    else:
+        pool = sorted(set(exact_idx))
     if args.max_pairs and len(pool) > args.max_pairs:
         pool = list(np.random.default_rng(args.seed + 7).choice(
             pool, size=args.max_pairs, replace=False))
