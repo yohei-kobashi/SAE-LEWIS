@@ -68,8 +68,7 @@ activations抽出手法を提案しているのではない**。主張は
    B2すら× → LM/タスク側。貪欲最小化は|S_min|の上界に留まる旨も明記。
 
 **残作業への反映**: B-1 介入k掃引(1セッション、eval_clamp_baseline設定替え)、
-B-2 prune_spec.py --effector steer(P-O介入版)、C 判別木集計(prepost、
-既存records)。実行順: S6 → LL再現 → B-1 → AxBench再現 → B-2 → C。
+B-2 prune_spec.py --effector steer(P-O介入版)+ **後段: S_min安定核×FRC top-3比較(compare_smin_frc.py → runs/tables/smin_vs_frc.md、免許規則・形(ii)の測定器)**、C 判別木集計(prepost、既存records)。実行順: S6 → LL再現 → B-1 → AxBench再現 → B-2(+比較) → C。
 
 ## ⚫ EF系の完全除外(2026-07-17ユーザー決定 — 上記🔵の帰結)
 
