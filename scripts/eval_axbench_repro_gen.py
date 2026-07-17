@@ -180,13 +180,27 @@ def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.it_model)
 
-    def chat_wrap(instruction: str) -> str:
-        # their formatting: template w/ generation prompt, BOS stripped
-        # ([1:]) because tokenization at generate-time re-adds it
+    def chat_wrap(instruction: str) -> list:
+        # Token IDS of the chat-templated prompt, BOS included. The v1
+        # string path (decode -> re-tokenize at generate time) silently
+        # produced EMPTY prompts on the GPU env — 2026-07-17 debug run:
+        # identical greedy output for different instructions — so the ids
+        # go straight to generate() with manual left padding, no string
+        # round trip.
         ids = tok.apply_chat_template(
             [{"role": "user", "content": instruction}],
-            tokenize=True, add_generation_prompt=True)[1:]
-        return tok.decode(ids)
+            tokenize=True, add_generation_prompt=True)
+        if ids and isinstance(ids[0], list):     # version drift guard
+            ids = ids[0]
+        if hasattr(ids, "input_ids"):            # BatchEncoding variant
+            ids = ids.input_ids
+            if ids and isinstance(ids[0], list):
+                ids = ids[0]
+        ids = [int(t) for t in ids]
+        if tok.bos_token_id is not None and (
+                not ids or ids[0] != tok.bos_token_id):
+            ids = [tok.bos_token_id] + ids
+        return ids
 
     # per-concept instructions: THEIR sampler, verbatim
     instr = {cid: alpaca.sample(args.num_instructions, random_state=int(cid)
@@ -259,18 +273,31 @@ def main():
         print(f"[axrepro] RESUME: {len(done)} generations")
     fh = open(rec_path, "a")
     tok.padding_side = "left"                    # their predict_steer
+    _probe = chat_wrap("PING12345 sanity instruction")
+    _dec = tok.decode(_probe)
+    assert "PING12345" in _dec, (
+        f"chat_wrap lost the instruction on this env: {_dec[:160]!r}")
+
+    pad_id = tok.pad_token_id or tok.eos_token_id
 
     @torch.no_grad()
-    def gen(prompts, seed_key):
-        enc = tok(prompts, return_tensors="pt", padding=True,
-                  truncation=True).to(args.device)
+    def gen(prompt_ids, seed_key):
+        # prompt_ids: list of id-lists (chat_wrap). Manual LEFT padding —
+        # no re-tokenization of decoded strings (see chat_wrap).
+        T = max(len(p) for p in prompt_ids)
+        ids = torch.full((len(prompt_ids), T), pad_id, dtype=torch.long)
+        mask = torch.zeros((len(prompt_ids), T), dtype=torch.long)
+        for i, p in enumerate(prompt_ids):
+            ids[i, T - len(p):] = torch.tensor(p, dtype=torch.long)
+            mask[i, T - len(p):] = 1
+        ids, mask = ids.to(args.device), mask.to(args.device)
         torch.manual_seed(stable_hash(*seed_key) % (2**31))
         out = model.generate(
-            **enc, max_new_tokens=args.max_new_tokens,
+            input_ids=ids, attention_mask=mask,
+            max_new_tokens=args.max_new_tokens,
             do_sample=True, temperature=args.temperature,
-            pad_token_id=tok.pad_token_id or tok.eos_token_id)
-        n_in = enc["input_ids"].shape[1]
-        return [tok.decode(o[n_in:], skip_special_tokens=True) for o in out]
+            pad_token_id=pad_id)
+        return [tok.decode(o[T:], skip_special_tokens=True) for o in out]
 
     for cid, concept, vanilla in concepts:
         sa = stage_a[cid]
