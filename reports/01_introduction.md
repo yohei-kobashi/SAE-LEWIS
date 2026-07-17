@@ -1,14 +1,20 @@
-# 01 — Introduction 執筆資料(⚫EF除外後の全面改訂版)
+# 01 — Introduction 執筆資料(🔶2026-07-18 editor前提へ改訂)
+
+> 🔶 大前提(2026-07-18): SAE介入(仕様)を信号としてeditorに入力し、
+> editorの出力embedding(Δh)を凍結LMのresidual streamに戻す。
+> editorを使わない枠組みの記述は削除済み。
 
 ## 1. 論文の一文
 
-> **SAE activationsの因果妥当性は、介入によるminimal-pair編集の実行で
-> 評価されるべきである — 本研究はその評価枠組みを提案し、既存の同定手法
+> **SAE活性への介入を信号として受け取り、編集内容をembedding(Δh)として
+> 凍結LMのresidual streamに返す学習editor(Intervener)を提案する。
+> テキストは凍結LM自身の生成として出るため、編集の成立はSAE活性同定の
+> 因果的証明になる — minimal-pair編集の実行を成功基準に、既存の同定手法
 > (FRC / AUROC / 事例レベルdelta)を同じ物差しで測る。**
 
-新しい抽出手法の提案ではない。編集という評価器が加わることで評価の幅が
-広がる: (i) exactという厳密なテキスト接地基準、(ii) 介入本数の局在性
-スペクトル、(iii) net-FRRの特異性、(iv) 現象別の到達層(判別木)。
+編集という評価器により評価の幅が広がる: (i) exactという厳密なテキスト
+接地基準、(ii) 介入本数の局在性スペクトル、(iii) net-FRRの特異性、
+(iv) 現象別の到達層(判別木)。
 
 ## 2. 動機の流れ(推奨の段落構成)
 
@@ -27,11 +33,15 @@ AxBenchは概念検出のAUROCで同定を評価した。
 SAEBench/RAVELは介入ベースのSAE評価を持つが、評価器は属性予測であり
 **テキスト編集の実行**ではない。
 
-### 段落3 — 提案: 編集可能性を因果基準にする
-本研究は、同定された活性への**介入**(steering / clamping)が、対象の
-言語現象**だけ**を反転させた最小対変換を実行できるか — random仕様・
-無介入・再構成の統制との分離込み — を、活性集合の因果妥当性の基準として
-提案する。編集は文法性を保った最小対変換として評価可能であり(exact)、
+### 段落3 — 提案: SAE仕様に条件付けられたeditor+編集可能性を因果基準に
+本研究は、同定された活性集合(仕様)を信号として受け取り、編集を
+**residual streamへのembedding(Δh)として描画する学習editor
+(Intervener)**を提案する。テキストは凍結LM自身の生成として出る
+(do(residual)、ReFT類縁)ため、編集の成立は「LMの計算がその活性方向に
+因果的に応答する」ことの証明になる。固定描画(steering)・LinguaLens式
+clampはeditorの自明な特殊ケース/既存機構としてベースラインに置き、
+random仕様・無介入・再構成の統制との分離込みで、活性集合の因果妥当性を
+測る。編集は文法性を保った最小対変換として評価可能であり(exact)、
 介入本数を振ることで表現の局在性まで測れる。
 
 ### 段落4 — 発見の予告(3層分解 = フック)
@@ -49,18 +59,25 @@ SAEBench/RAVELは介入ベースのSAE評価を持つが、評価器は属性予
 
 ## 3. 貢献リスト
 
-(i) **編集ベース因果評価枠組み**: minimal-pair編集の実行を成功基準に、
+(i) **Intervener(提案editor)**: 事例レベルSAE仕様+src文を双方向
+エンコーダで読み、位置依存の介入場Δh(prefill)+全域Δh(decode)を
+凍結LMのresidual streamに注入する学習editor。トークンは出力しない
+(出力インターフェース=Δh)ので因果証明の枠組みが保たれる。ReFT/LoReFTが
+機構の先行 — 新規性は「事例レベルSAE仕様に条件付けられた介入生成」と
+編集=因果評価枠組み内での使用。ノルム予算で「介入サイズ」を明示。
+
+(ii) **編集ベース因果評価枠組み**: minimal-pair編集の実行を成功基準に、
 統制(random/empty/raw/recon)と多軸指標(exact・FRR/net-FRR・彼ら自身の
 指標)で活性集合を評価するプロトコル。CausalGymの因果評価をテキスト編集
 まで拡張し、SAEBench系の介入評価に編集という評価器を加える。
 
-(ii) **適用による発見**: (a) 仕様が介入の編集力を決める(C1' 2×2 —
-両論文の完全プロトコルは無介入床以下〜同等、事例レベル仕様は同じ機構で
-3〜15×)、(b) 検出の完璧さと因果的実在の乖離(P-J)、(c) 局在性
-スペクトル(介入k掃引・最小介入集合S_minと安定核×FRC3)、(d) 現象別の
-判別木(A71/C21/B2/D4)。
+(iii) **適用による発見**: (a) 仕様が介入の編集力を決める(C1' 2×2
+ベースライン — 両論文の完全プロトコルは無介入床以下〜同等、事例レベル
+仕様は同じ機構で3〜15×)、(b) 検出の完璧さと因果的実在の乖離(P-J)、
+(c) 局在性スペクトル(介入k掃引・最小介入集合S_minと安定核×FRC3)、
+(d) 現象別の判別木(A71/C21/B2/D4)。
 
-(iii) **再現アンカーと相互評価**: LinguaLens介入評価(FIC)とAxBench
+(iv) **再現アンカーと相互評価**: LinguaLens介入評価(FIC)とAxBench
 steering(SAE/SAE-A)の忠実再現、および相互評価(彼らのプロトコルを
 我々のベンチで、LinguaLens機構を彼らのベンチで)。
 
@@ -71,25 +88,30 @@ steering(SAE/SAE-A)の忠実再現、および相互評価(彼らのプロトコ
 - 因果床: P-I 393/31、p=5.6e-81
 - 判別木: A 71/98
 
-## 5. タイトル案(⚫後、仮)
+## 5. タイトル案(🔶editor前提、仮 — 要再検討)
 
-1. *Edit to Verify: Evaluating the Causal Validity of SAE Activations by
-   Minimal-Pair Editing*
-2. *Detection Is Not Causation: An Editing-Based Causal Evaluation of
-   SAE Feature Identification*
-3. *Can You Edit With It? Interventional Minimal-Pair Editing as an
-   Evaluation of SAE Activations*
+editorが提案物の中心になったため旧タイトル案(評価枠組み単独)は要改訂。
+方向性: SAE仕様に条件付けられた介入生成(editor)+編集による因果検証を
+両方含む題。例:
+1. *SAE-LEWIS: Rendering SAE Interventions as Residual-Stream Edits with
+   a Learned Editor*
+2. *Edit to Verify: A Learned Intervention Generator for Causally
+   Validating SAE Activations by Minimal-Pair Editing*
 
-**使用禁止(EF系/旧枠組み)**: SAE-LEWIS / Edit Flows を冠する題、
+**使用禁止(トークン出力の旧枠組み)**:
 ~~Commanding Edits with SAE Features~~(条件付け枠組みの題)、
 ~~Lifting SAE Interventions into Discrete Edit Operations~~。
 
 ## 6. この章の地雷
 
-- 「編集器(モデル)を提案」と読める表現をしない — 効果器は既存機構
-  (steering/clamp)のみ。
+- **editorを使わない枠組みで書かない**(🔶): steering/clampは
+  「ベースライン(既存機構の忠実実装/固定描画の特殊ケース)」とだけ
+  書く。提案はIntervener(Δh出力のeditor)。
+- editorの出力インターフェースを必ず明示する: **トークンではなくΔh** —
+  ここが条件付け(probing系)との因果的な分水嶺。
 - R5の先行を必ず踏む: CausalGym(挙動フリップ)/SAEBench(介入評価)/
-  Beyond Input Activations(因果的latent選択の発想)— 「初」を置く場所は
-  **テキスト編集という評価器**のみ。
+  ReFT/LoReFT(学習型介入の機構先行)/ Beyond Input Activations(因果的
+  latent選択の発想)— 「初」を置く場所は**事例レベルSAE仕様に条件付け
+  られた介入生成とテキスト編集という評価器**のみ。
 - 免許規則: 事例レベルkを表現幅と書かない(05参照)。
 - promptingに勝つ主張はしない(B2はSAE不使用参照としてのみ)。

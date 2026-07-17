@@ -1,10 +1,27 @@
-# 04 — Experiment 執筆資料(⚫EF除外後の全面改訂版)
+# 04 — Experiment 執筆資料(🔶2026-07-18 editor前提へ改訂)
 
-数値はすべて実測・確定(進行中は明記)。EF系の数値は載せない(⚫)。
-旧版にあった routed/ef32/λ-IoU/M0/P-B は論文から除外 — 結論の引き継ぎ先:
-P-B → P-J、M0 → B-1 介入k掃引、内容混入の証拠 → S_min組成分析。
+> 🔶 大前提: 提案=Intervener(SAE仕様→editor→Δh→residual stream)。
+> steer/clampの数値はすべて**ベースライン**。Intervenerの主結果欄は
+> v2学習完了待ち(v1=0.0200は失敗、残差基底のv2が学習中)。
 
-## 1. 主結果1 — C1': 介入の編集力は仕様が決める(主claim、499/997ペア)
+数値はすべて実測・確定(進行中は明記)。トークン出力EF系の数値は
+載せない(⚫)。旧版にあった routed/ef32/λ-IoU/M0/P-B は論文から除外 —
+結論の引き継ぎ先: P-B → P-J、M0 → B-1 介入k掃引、内容混入の証拠 →
+S_min組成分析。
+
+## 0. 主結果0 — Intervener(提案editor)probe500 【学習完了待ち】
+
+- v1(恒等初期化、40k steps): exact **0.0200** — コピーアトラクタ崩壊
+  (true≈random 0.018、copy 0.65、|Δh|≈budget/4)。empty→copy 0.972で
+  null防御は機能。**失敗分析として書ける**: x1≈x0のNLLはコピーが支配 →
+  恒等スタートの学習介入は「無介入」に退化する。
+- v2(残差基底 0.5·dvec + 学習補正、編集トークンCE重み4×): 学習中。
+  初期状態=steerベースライン(0.2385@499)を厳密再現するため、
+  下限はベースライン同等が設計上保証される。
+- 報告軸: exact(バー=steer0.5 0.2385)、統制(empty→copy、random→
+  ベースライン挙動)、**実測ノルム/予算比**(介入サイズの明示)。
+
+## 1. 主結果1 — C1'ベースライン: 介入の編集力は仕様が決める(499/997ペア)
 
 **同一の介入機構で仕様だけ差し替える2×2(exact)**:
 
@@ -130,5 +147,7 @@ Limitationsでのみ使用。
 - 出典: `runs/tables/smin_vs_frc.md`、`runs/prod_gemma_v6/prune_spec_steer/report.md`
 
 ## 11. 進行中・空欄
-- AxBench再現 L20→L10 → judge
-- FRR表再集計(EF行なし)、clamp腕FRR(任意)、BLEU/chrF、定性例
+- **Intervener v2 学習+probe500(主結果0の本体)** → 勝てばL20再学習
+- AxBench再現 L20(生成済み・judge実行中)→ L10
+- FRR表再集計(EF行なし)+ intervener行の追加、clamp腕FRR(任意)、
+  BLEU/chrF、定性例
