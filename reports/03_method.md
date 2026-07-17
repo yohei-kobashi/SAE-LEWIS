@@ -1,148 +1,101 @@
-# 03 — Method 執筆資料
+# 03 — Method 執筆資料(⚫EF除外後の全面改訂版 — Method = 評価枠組み)
 
-出典: `PAPER_OUTLINE.md` §3、`EDIT_FLOWS_ZERO.md`(S系列の設計と判定)、
-`editflow.py` / `train_editflow.py` / `decode_flow`。
+本研究のMethodは「モデル」ではなく**評価プロトコル**の記述になる。
 
-## 1. タスク定義
+## 1. 評価の枠組み(全体像)
 
-- 入力: ソース文 x0 と **特徴デルタ仕様** (z_amp, z_sup)。
-  仕様は `diff_intervention(z_src, z_tgt, k_top=32)` = SAE(x0) と SAE(x1) の
-  差分 `delta = z_tgt − z_src` の top-k を符号分解したもの
-  (正 = amplify、負 = suppress)。
-- 出力: 編集後の文 x1(離散編集操作 INS/DEL/SUB の系列を適用)。
-- **保存則**: empty 仕様 → 無編集(no-edit)を構造的に要求(null-record教師)。
-- 評価は**ゼロショットOOD**: 学習は corruption キャッシュのみ、評価は
-  LinguaLens minimal pairs(学習で一切見ない)。
-
-🔴 執筆注意: 仕様は「事例レベル」= 実際の (src, tgt) ペアから計算した特徴差分。
-運用時に target は無いので「仕様を概念から得る」問題は残る — Limitations で
-正面から書く(05参照)。主張の射程は「**特徴レベルの仕様が与えられたとき、
-離散編集が steering より良くそれを実現する**」。
-
-## 2. アーキテクチャ(すべて凍結ベース + LoRA)
-
-| 部品 | 実体 | 役割 |
-|---|---|---|
-| バックボーン | **凍結 Gemma-2-2B** + LLM2Vec双方向化 + **LoRA r=32** | 編集器のエンコーダ(双方向attention — 右文脈を見る) |
-| SAE | **Gemma Scope layer-12 / 16k(JumpReLU)**、凍結 | 特徴抽出(仕様の定義域)。blocklist 32特徴を除外 |
-| 条件付け | **feature-tokens**(下記) | 仕様の注入 — 活性は書き換えない |
-| rate head | 位置ごと λ^{ins,del,sub} | WHERE + 操作種(hazard分解、下記) |
-| token head Q | **凍結 lm_head** + logit-lens バイアス(W_U·W_dec、λ_lens=1) | WHAT(挿入・置換の内容)。SAE幾何の事前分布として再解釈 |
-
-### 条件付け経路(🔴 論文の枠組みの根拠 — 正確に書く)
-
-指令特徴1つにつき1トークンを **層0(入力)の prefix** として与える:
+対象: ある同定手法が出した活性集合 S(現象レベルでも事例レベルでもよい)。
+問い: **S に介入すると、対象の言語現象だけを反転させた最小対変換が出力
+されるか。**
 
 ```
-prefix = [F(f1,±,v1), …, F(fj,±,vj)]
-F(f,±,v) = RMS較正(W_dec[f]) + sign_emb(±) + mag_mlp(log(1+v))
+同定手法(FRC / AUROC / 事例delta) → 活性集合S
+  → 介入(steer / clamp)+ 再生成
+  → 統制(random-S / empty / raw / recon)との分離
+  → 指標(exact / FRR / 彼ら自身の指標)
+  → 局在性(|S|掃引・最小集合S_min)・判別木
 ```
 
-- W_dec[f](SAEデコーダ行)を埋め込みスケールにRMS再正規化し、学習される
-  cond_scale を掛けて入力トークン化。**凍結Gemmaの活性はどの層でも一度も
-  変更されない** — クランプもベクトル加算もしない。因果的には
-  `P(edit | Z=z)` = **条件付け(証拠)**であり `P(Y | do(Z=z))` ではない。
-- attentionが**個々の特徴と個々の編集サイトを直接束縛**できる(プール型
-  2ベクトル条件付けの feature-bag binding 問題の正面解 — S2で採用確定)。
-- CFGドロップアウトはトークン集合単位(全ドロップ = empty教師)。
+## 2. データと仕様の構築
 
-## 3. Edit Flow 機構
+- 評価データ: LinguaLens-Data 英語 minimal pairs(499ペア seed42、
+  確認ブロック込み997)。学習は一切なし(効果器は凍結モデルのみ)。
+- **事例レベル仕様**(informed上限): `delta = z_tgt − z_src` の top-k
+  符号分解(k_amp/k_sup、編集スパン局所プール、blocklist)。**SAE抽出
+  のみに依存**(gemma-2-2b + Gemma Scope layer-12/16k JumpReLU)。
+- **現象レベル仕様**(target-free、彼らのプロトコル): FRC top-r
+  (LinguaLens公式 r=3; 実装は公式repoのコード側=周辺比率に忠実、
+  リーク修正済み)/ AUROC top-r(AxBench公式 r=1; Mann-Whitney平均
+  ランク、選択器のsanity gate = top-1 mean 0.939)。
+- 運用時にtargetは無いので事例レベル仕様は「仕様が与えられたときの実現」
+  の測定 — 仕様の出所は主張の射程外(Limitations筆頭)。
 
-### 継承と差分(D.3と整合させる — 過剰主張しない)
+## 3. 効果器(既存機構の忠実実装 — 提案物ではない)
 
-- **継承**: Edit Flows(Havasi et al., arXiv:2506.09018)のCTMC離散フローと
-  **rate×token の因子分解**(式13: `u_t(ins(x,i,a)|x) = λ_{t,i}(x)·Q_{t,i}(a|x)`)。
-  我々の2ヘッドはこの積そのもの。opの適用は状態遷移であり学習対象ではない。
-- **差分**: (1) スクラッチ生成 → **ソース係留の編集regime**(x0=入力文、
-  x1=目標文; 論文はX₀=∅か一様ランダムのみで、編集regimeは本研究の外挿)。
-  (2) ランダムアラインメント → **最小編集の決定的アラインメント**
-  (経路長=編集距離のとき自然)+ corruption が生成した演算列そのものを
-  教師にする真アラインメント。(3) 自由レート → **hazard解析形**(下記)。
-  (4) 条件付け prefix/画像/CFG → **SAE特徴トークン**。
+- **steer**(B3): dvec = za@W_dec − zs@W_dec を層12残差に h += α·dvec、
+  全位置。α=0.5(掃引で確定した鋭い頂点)。-itモデル+中立Rewrite
+  プロンプト、greedy。
+- **clamp**(B1 = LinguaLens忠実): OpenSAE準拠のset介入(非活性は強制
+  挿入)、**残差はSAE再構成で完全置換**、全位置・全ステップ、クランプ値
+  {5,10,20,Z}。
+- **統制**: random仕様(同数・同大きさ・ID違い)/ empty / raw(無介入の
+  書き換え役)/ recon(multiply×1 再構成パススルー — 機構損傷の分離)。
 
-### hazard 分解(較正の構造化)
+## 4. 指標
 
-編集regimeでは κ(t)=t³ が既知で各opは一度だけ発火するため、目標レートは
-厳密に w(t)·1[pending](w(t) = 3t²/(1−t³))。よって
+- **exact**(正規化一致)= 最小対変換の厳密基準。sim_target・copy併記。
+- **FRR**(LLM judge、LinguaLens整合): gold方向 = judge(src,tgt)、
+  システム = judge(src,out)、提示順は gold/system 独立rng。
+  **net-FRR = FRR(true) − FRR(random)** が特異性。3 judge
+  (GPT-4o主・gemma-2-9b-it・gpt-5.4-nano)、厳密McNemar。
+- **judge信頼性(限界コスト貢献)**: exact一致ペア上のFRR = judgeの
+  自己一致率(無償の自然発生重複)。per-system自己一致がMcNemarの
+  非差異性条件の検査を兼ねる(減衰の代数は6e-4/05参照)。
+- **彼ら自身の指標**(P-N): LinguaLensのE_abl(judge gpt-4o)と
+  AxBenchの3ルーブリック調和平均(gpt-4o-mini、公式テンプレ逐語)。
 
-```
-λ = w(t) × sigmoid(head(h))
-```
+## 5. 局在性の測定器(局在×安定の2軸)
 
-と分解し、hazard因子は解析的に与えて **確率因子 P(pending|x_t) だけを学習**
-させる。強度追従は構成上厳密(較正問題が消滅)、p は確率なので発火閾値が
-自己較正され、**thr{F} デコード = p ≥ F** が文字通りの動作点になる
-(S2実測: mean p が t によらず 0.50/0.48/0.46 と安定)。入力非依存のレート
-経路が存在しないため premise 安全(empty→no-edit)。
+- **介入k掃引**(B-1): 事例レベル仕様を k=1,2,4,8,16,32,64 に切り詰めた
+  steerのexact曲線 = **操作インターフェース幅**(免許規則: 表現幅とは
+  書かない)。
+- **最小介入集合S_min**(B-2): steerがexactを出したペアで、|delta|降順
+  プレフィクスの二分探索 → 後退消去 → 最終検証(貪欲上界と明記)。
+- **安定核×FRC3**(compare_smin_frc.py): 同一現象のS_min群で出現率≥50%
+  の共通部分=現象側、入れ替わる部分=事例内容側、という操作的分解。
+  安定核をFRC top-3と本数・中身で直接比較(免許規則・形2)。
+- **現象レベルr掃引**(P-J、形1): target-freeなので内容混入が構成上ない。
+  因果効果は学習ゼロreadout(下記)で測る。
 
-### 局所化(Localized CTMC、Edit Flows 付録C.1 の編集regimeへの翻訳)
+## 6. 学習ゼロの因果readout(P-I)
 
-- 訓練: 各opの自己発火時刻 t* = u^{1/3}(κ⁻¹)、発火済みソースから
-  Pois(λ_prop·Δt) で左右近傍へ被覆伝播。損失重みは
-  λ_eff = w(t) + λ_prop·(編集済み隣接数 adj)。hazardベースを
-  b = w(t)+λ_prop·adj に拡張して λ = b·p を維持(adj はゼロ初期化埋め込みで
-  エンコーダにも供給 — warm-start 厳密)。λ_prop=4。
-- デコード: 編集隣接サイトの発火バーが p ≥ F·w/(w+λ_prop·adj) に低下 —
-  **一箇所編集すると隣の発火バーが下がる** = 統語変形が要求する協調的
-  多点編集の事前分布。編集痕跡は decode_flow が `edited` リストで追跡
-  (apply_step_ops が同期更新)。
-- 効果(S3→S4確定): 4-8編集バケット 2.4×、9+ で唯一の命中 — 局所性の配当。
+凍結gemma-2-2b層12に介入し、**LM自身のheadの予測変化**(teacher-forced、
+Δ_j = log p_int − log p_base の閾値超え=発火)を数える。読み手を介さない
+因果の床。WHERE(位置)は測れるがWHAT(内容)は測れない — その分解自体が
+結果(04参照)。
 
-### デコード
+## 7. 判別木(Limitations用)
 
-thr{F}(Fが唯一のノブ)+ greedy Q、48 steps。本番はS3単一ckpt:
-**thr0.1 = exact最大、thr0.5 = バランス**(S4のペア統計で確定)。
-CFG・温度・best-of-K は「較正済みλを前提とする道具」で、hazard以前の
-パイロットでは全敗(S0)— 採らない。
+現象ごとに3種の証拠で分類: (1) do-介入編集(steer/clamp)、(2) P-I WHERE、
+(3) B2(SAE不使用のタスク実行可能性フロア)。
+A = 介入編集成立 / C = WHERE陽性・介入不可(効果器側) /
+B = WHERE無し・B2可(同定/SAE側の示唆) / D = WHERE無し・B2不可(不定)。
+編集器(条件付け)は因果的に等価なため判別に使わない。
 
-## 4. 学習データ(corruption cache)
+## 8. 再現アンカー(実装忠実性の防御)
 
-- dolma文に **25 family の依存構造述語ベース変換**(PARTICLE/DATIVE/ADVPLACE/
-  PPFRONT/QUOTINV/CLEFT等の並べ替え系を含む)+ MLM語彙corruption を適用し、
-  round-trip 検証と対称SLORフィルタで文法性を担保。SAE blocklist 適用。
-- **null-record 教師**: empty仕様 → no-edit を構造的に教える(前提保護の源)。
-- 真アラインメント教師: corruption が適用した演算列をそのままスロット列に
-  符号化(difflib事後推定の誤アラインを排除)。
-- **v7 top-up(進行中のS6で使用 — 執筆時は暫定と明記)**:
-  P4 = SPLITINF family(分裂不定詞幾何 "to ADV V"↔"to V…ADV")、
-  P5 = **mismatched-z null教師**(確率0.12でレコードを「x_t=x0、gold=no-edit、
-  条件付け=他ペアの実delta」に振替 — 「一致しないzでは黙れ」を教える欠落
-  コントラスト)、語彙多様化(MLM top-k 8→24、seed 777)。12,000レコード。
-  S6がGOなら本文へ、NO-GOならS3の記述のまま。
+- **LinguaLens介入評価の再現**: 公式repoのIntervener逐語(set 0/10+recon
+  完全置換、素プロンプト、temp1.0、100tok)、FRC top-3を1本ずつ50試行+
+  random対照、E_abl/E_enh/ペナルティ付きFIC(w=0.5 — 式実装はTable2の
+  FIC値を成功率から再現して検算済み)。
+- **AxBench steeringの再現**: 公式repo逐語(AlpacaEval 10命令/概念の
+  決定的サンプル、14 factor格子、addition steering、公式judgeテンプレ、
+  factor選択half/holdout half)。同一スタックなので強いアンカー
+  (詳細: axbench_testdata.md)。
 
-## 5. routed システム(C0のヘッドライン)
+## 9. この章の地雷
 
-**count-rule T=1(完全教師なし・事前登録・凍結)**:
-
-> EF自身のλ場が発火させた編集ハンク数が **≤1 なら EF(ef32)の出力**、
-> それ以外は **steer0.5(介入fallback)** の出力を採用。
-
-- ルータの学習なし・ラベルなし・検証集合フィットなし。「このペアにどれだけ
-  編集が要るか」の推定器が**編集器自身のλ場**(自己言及的)。
-- λ場は「形態=1ハンク / 構造=多ハンク」を教師なしで見分けている
-  (per-feature表で routed ≈ max(EF, steer) を回収 — 04参照)。
-- 🔴 表現規則: routed は「**条件付けと介入の、教師なし規則による相補的結合**」。
-  「介入の結果」と呼ばない。steer fallback の差し替えは別システム扱い
-  (未接触標本での再確認が要る — gain-router 0.3012 を昇格させなかった規律)。
-
-## 6. 実装の細部(付録向け)
-
-- SAE抽出: `sae_z_with_offsets`(トークンオフセット付き活性)、
-  local scope = 編集スパン内トークンのみで delta を取る。
-- 学習: 50k〜100k steps、warm-start系列(S1 hazard → S2 feature-tokens+真ア
-  ライン 100k r=32 → S3 localized 50k)。k_top=32、k_amp/k_sup サンプリング、
-  empty_conditioning_prob(CFGドロップ)。
-- 推論コスト: 単一モデル1パス(タガー・列挙・ランカー・refine なし)。
-  対比: v6パイプラインは4段カスケード。
-- 再現性: 全システムが records.jsonl 形式で出力 → `compare_ef_pipeline.py`
-  が matched-pair 統計まで一括。
-
-## 7. この章の地雷
-
-- 「hazard分解・局所化は我々の発明」と書かない — 局所化は付録C.1の翻訳、
-  因子分解は式13の継承。**我々のものは: 編集regimeへの外挿、hazardの解析形、
-  真アラインメント教師、SAE特徴トークン条件付け、count-rule ルーティング**。
-- 「編集モデルの提案」として書かない — 「SAE特徴を仕様として実現する」話
-  (C2の土俵設定)。編集語彙の新規性主張は即死(02参照)。
-- λ-IoU の優位(0.74 vs タガー count-oracle 0.7472 はパリティ)は「知識」では
-  なく「決定経路」(単一の較正可能スカラー vs 多段カスケードの決定損失)。
+- steer/clampを「我々の提案」と書かない(既存機構の忠実実装)。
+- EF系の機構記述(hazard・局所化・特徴トークン等)を一切載せない(⚫)。
+- FRCの論文/コード乖離、AUROCのsanity gate、リーク修正は必ず1文ずつ
+  書く(実装批判への先回り)。

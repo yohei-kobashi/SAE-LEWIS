@@ -86,11 +86,11 @@ sanity gate 0.939 で検証済みの実装)で再計算する。
 P-K/P-N で実施済み(ax_protocol 0.0701 / E_abl +0.115 / AxBench score
 1.121 ≈ raw 1.081)。**これで相互評価マトリクスが両方向とも埋まる**。
 
-## 5. 実行順(ユーザー指示: S6優先)
+## 5. 実行順(2026-07-17 ⚫後の現行)
 
-1. S6 学習完走 + probe500 ゲート判定(interact-g、進行中)
-2. LinguaLens再現の生成 `run_ll_repro.sh`(interact-g 1セッション)
-   → prepost で `run_ll_repro_judge.sh`
-3. AxBench再現の生成 `run_axbench_repro.sh`(interact-g、L20から。
-   resumeで複数セッション)→ prepost で `run_axbench_repro_judge.sh`
-4. S6勝者確定後: `ours_ef` 腕の実装+生成、L10構成、必要なら500概念へ拡張
+1. ~~S6~~ 済(NO-GO・EF系凍結)、~~ours_ef~~ 中止(§3)
+2. LinguaLens再現 済(FICアンカー取得 — reports/04 §7)
+3. B-1 介入k掃引(実行中)
+4. **AxBench再現の生成 `run_axbench_repro.sh`(L20 → L10)→ prepost で
+   `run_axbench_repro_judge.sh`**、必要なら500概念へ拡張
+5. B-2 S_min + 安定核×FRC3比較

@@ -89,8 +89,13 @@ B-2 prune_spec.py --effector steer(P-O介入版)+ **後段: S_min安定核×FRC 
 - **仕様構築はSAEのみに依存**: delta = z_tgt − z_src の top-k は編集器と無関係
   → C1'(介入編集 steer 0.2337 / clamp 0.1743 + 両プロトコル対比 + raw/recon
   統制)が**唯一のヘッドライン**
-- P-I(学習ゼロreadout、WHERE p=5.6e-81)、P-J(FRC vs AUROC因果対決)、
-  P-B(true vs random対照)、M0は「仕様のk依存」の話としてsteer k掃引に交代
+- P-I(学習ゼロreadout、WHERE p=5.6e-81)、P-J(FRC vs AUROC因果対決)
+- **🔴 訂正(2026-07-17、reports改訂時に発見)**: 当初「生存」に入れた
+  **P-BとM0はEF編集器を介した実験**(FRC特徴でEFを条件付け / EFのk掃引)
+  なので**論文からは除外**。結論の引き継ぎ: P-B(現象レベル特徴は実在だが
+  不十分)→ **P-J**(readout、67/0)と P-K(frc_r3×steer 0.0822)、
+  M0(kを絞ると劣化)→ **B-1 介入k掃引**、rank17-32の内容混入の証拠 →
+  **S_min組成分析**(B-2)。免許規則の根拠文もこれに合わせて読み替える
 - FRRとnet-FRRのsteer行、judge自己一致率(exact一致ペアはsteerにもある:
   exact 0.23 → ~230ペア@997)、McNemar、減衰(6e-4)
 - B-1 介入k掃引・B-2 S_min(steer版)= 局在性スペクトル

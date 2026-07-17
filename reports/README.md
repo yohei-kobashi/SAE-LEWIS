@@ -1,91 +1,65 @@
 # reports/ — 論文執筆用資料(日本語執筆の下敷き)
 
-作成 2026-07-17。ユーザが introduction / previous works / method / experiment を
-日本語で執筆するための、確定数値・主張・地雷(書いてはいけないこと)の集約。
-
-> **🔵 2026-07-17 目的の再固定(PAPER_OUTLINE.md 🔵節が正 — 本ディレクトリの
-> 各ファイルより優先)**: 主claim = C1'(同定活性への**介入**による編集 =
-> 同定の因果証明)。routed/EF(C0)は情報・実用の副claimに降格。
-> 「EF」は我々の編集器の腕の略記であり、Havasi et al. のモデルそのものでは
-> ない(枠組みは継承、regime/条件付け/hazard/デコードは我々)。
-> 新中心図 = 介入本数の局在性スペクトル(k掃引 + P-O介入版)。
-> 編集不能featureはSAE側/手法側の判別木でLimitationへ。
-> **貢献の位置づけ: 新たな活性抽出手法の提案ではない** — 「activationsの
-> 因果妥当性は編集で評価されるべきで、評価の幅が広がる」という
-> **編集ベース因果評価枠組み**の提案(既存の同定手法 FRC/AUROC/事例delta
-> を同じ枠組みで評価する)。
-> 01〜05は追って本節の序列に合わせて改訂する。
-
-> **⚫ 2026-07-17 追記(最優先・PAPER_OUTLINE ⚫節が正): EF系は論文から
-> 完全除外(ユーザー決定)。** S1/S2/S3はどれもSAE活性の因果証明になって
-> いない(条件付け=P(edit|Z=z)のまま)ため、**S系列・ef32・routed(C0
-> 0.2839/0.2892)・C2・C3・ours_ef腕・P-O ef版のすべてを論文に載せない**。
-> 本ディレクトリ内のEF/routedの数値・記述(01/03/04の該当箇所)は履歴で
-> あり執筆には使わない。効果器は steer/clamp のみ、ヘッドラインは C1'
-> 一本。仕様構築(delta top-k)はSAEのみ依存なので C1'/P-I/P-J/P-B/
-> FRR(steer行)/judge自己一致/局在性(k掃引・S_min steer版)/再現アンカー
-> /B2(SAE不使用参照)は全て生存。判別木の論文版はEF列を落とす。
+作成 2026-07-17、同日 🔵目的再固定・⚫EF完全除外を反映して全面改訂。
+論文 = **編集ベース因果評価枠組み**(SAE活性の因果妥当性を、介入による
+minimal-pair編集の実行で評価する)。効果器は **steer / clamp のみ**。
+EF系(S系列・ef32・routed・λ-IoU・M0・P-B)はコード/runsに履歴として
+残るが**論文には一切載せない**。
 
 ## ファイル構成
 
 | ファイル | 対応する章 | 内容 |
 |---|---|---|
-| `01_introduction.md` | Introduction | 動機の流れ、目標文、貢献リスト、冒頭で引く数値、タイトル案 |
-| `02_previous_works.md` | Related Work | 2軸分類、4軸サーベイの確定分、検証済み逐語引用、棄却リスト |
-| `03_method.md` | Method | タスク定義、アーキテクチャ、Edit Flow機構、学習データ、routed規則 |
-| `04_experiment.md` | Experiments | 設定、ベースライン、全確定数値の表、統計手法、統制実験 |
-| `05_discussion_limitations.md` | Analysis / Limitations | 3層分解の物語、仕様出所の限界、判明済みの弱点 |
-| `06_pipeline_and_theory.md` | **(最新の正)** | 🔵/⚫以降の理論的背景(条件付けvs介入、外生的検証器、免許規則、形1/形2)と現行パイプラインの状態表 |
+| `01_introduction.md` | Introduction | 動機、主張、貢献リスト、冒頭数値、タイトル案 |
+| `02_previous_works.md` | Related Work | 冒頭の⚫改訂ガイドに従って読む(D.3/D.6等は退役) |
+| `03_method.md` | Method(=評価枠組み) | 仕様構築、効果器、統制、指標、局在性測定器、判別木、再現 |
+| `04_experiment.md` | Experiments | 確定数値の表(EFなし)、統計、進行中の空欄 |
+| `05_discussion_limitations.md` | Analysis / Limitations | 3層分解、免許規則、attenuation、限界 |
+| `06_pipeline_and_theory.md` | 理論とパイプライン状態 | 条件付けvs介入の理論(⚫の根拠)、実験の状態表 |
+| `axbench_testdata.md` | 付録/実験 | AxBenchテストデータの正体と再現・相互評価設計 |
 
-## ソース・オブ・トゥルース(数値の一次出典)
+数値の一次出典: `PAPER_OUTLINE.md`(🔵/⚫節と§6x台帳)、`runs/tables/`、
+`runs/paper_metrics/report.md`、`runs/ll_repro/report.md`、`RELATED_WORK.md`。
 
-- `PAPER_OUTLINE.md` — 主張C0〜C4と全結果台帳(§6b〜6l)。**数値はここが正**。
-- `RELATED_WORK.md` — 関連研究の英語草稿v2・検証済み引用・棄却リスト。
-- `runs/tables/` — main_metrics_{499,997}、frr_per_feature_*(judge別)、per_feature CSV。
-- `runs/paper_metrics/report.md` — P-N(両論文の指標での検証)。
-- `README.md` §13.8 / `EDIT_FLOWS_ZERO.md` — S0〜S4の学習履歴とゲート判定。
+## 🔴 全章共通の規則(違反すると主張が壊れる)
 
-## 🔴 全章共通の用語規則(違反すると主張が壊れる)
+1. **⚫ EF系の数値・記述を論文に使わない**(routed 0.2839、ef32 0.2237、
+   λ-IoU 0.74、M0のk掃引、P-BのFRC条件付け10×崩壊などすべて)。
+   これらの結論はEF非依存の実験が引き継ぐ: P-B → **P-J**、M0 → **B-1
+   介入k掃引**、内容混入の証拠 → **S_min組成分析**。
+2. **免許規則**: 「事例レベルkで編集成功 → featureの表現はk本」と書かない
+   (操作ハンドルには事例内容が混入)。「対応はtop-3より広い/別物」を
+   書けるのは (形1) 現象レベルr掃引(P-J、因果的定義への取替を明示)
+   (形2) S_min事例横断安定核×FRC3比較、の2形のみ。
+3. judge評価は「**reliability**を測る」(品質/validityは禁止 — Norman et al.)。
+4. R5の禁止事項: 「介入ベースのSAE評価は初」(SAEBench/RAVEL先行)、
+   「因果基準でlatent選択は初」(Beyond Input Activations先行)、
+   「言語minimal pairの因果介入評価は初」(CausalGym先行 — 差分は評価器
+   [挙動→テキスト編集]と対象[学習特徴化→SAE latent])。
+5. 単位は「言語現象」、編集は「最小対変換(minimal-pair transformation)」。
+6. LinguaLensのFRCは論文とコードで定義が違う(条件付き vs 周辺)—
+   我々はコード側に忠実、と1文明記。
 
-1. **本手法に "intervention" / "介入" / "steering" を使わない。**
-   本手法は凍結Gemmaの活性を一切変更しない(層0への prefix トークン追加=
-   証拠の提示)。正しい語は **"conditioning"(条件付け)/ "specification"(仕様)**。
-   介入と呼べるのは B1(クランプ)・B3(steer)・LinguaLens・AxBench 側のみ。
-2. routed(0.2839/0.2892)を「介入の結果」と呼ばない — headは条件付け編集器、
-   介入はfallback。介入列のヘッドラインはC1'(P-K)が別に持つ。
-3. 「言語学的な最小単位」と書かない(形態素と誤読)。単位は「言語現象」、
-   編集は「最小対変換(minimal-pair transformation)」。
-4. 編集語彙(INS/DEL/SUB)に新規性を主張しない(Gu 2019 / Malmi 2019 が先行)。
-   新規性は**条件付け信号**(SAE特徴辞書)にのみ置く。
-5. judge評価は「**reliability** を測る」と書く。「品質/validity を測る」は禁止
-   (Norman et al. "Reliability without Validity" がそのまま反論)。
-6. 使用禁止タイトル: ~~Lifting SAE Interventions into Discrete Edit Operations~~ /
-   ~~Structural Interventions on SAE Features~~ / ~~Editing as Intervention~~。
-
-## 数値クイックシート(確定値のみ。詳細は 04)
+## 数値クイックシート(論文に載る確定値のみ)
 
 | 主張 | 数値 | 状態 |
 |---|---|---|
-| C0 routed exact | **0.2839**@997 / **0.2892**@未接触498(vs steer 0.2269、p≈0.007) | 確定・事前登録・凍結 |
-| C1' 仕様2×2(499) | LinguaLens完全版 0.0160 / AxBench完全版 0.0701 / 我々の仕様×clamp 0.1743 / ×steer 0.2337 | 確定 |
-| 無介入床 / recon統制 | raw 0.0601 / recon 0.0100 | 確定 |
-| EF vs v6パイプライン | 0.1904 vs 0.1102(+73%、p<1e-4)、holdout 0.1833 vs 0.1033 | 確定 |
-| B2(プロンプト) | 0.1242、empty copy 0.4770(統制崩壊) | 確定 |
-| FRR(GPT-4o) | ef32 0.8735 > routed 0.8306 > steer 0.7327(3 judge順位一致) | 確定 |
-| steer net-FRR | 0.4062(GPT-4o)vs EF側 0.69 | 確定 |
-| P-I WHERE | true発火 3.57 vs random 1.08、符号検定 393/31、p=5.6e-81 | 確定 |
-| P-J AxBench逐語 r=1 | 因果信号ゼロ(0.06/0.07、平均比0.86×)— 検出は0.939で完璧 | 確定 |
-| P-B FRC条件付け | exact 0.0140(vs random 0.0000、事例仕様の~7%) | 確定 |
-| P-N E_abl | 我々の仕様 +0.631/+0.370 vs 両プロトコル +0.091/+0.115 | 確定 |
-| λ-IoU(WHERE) | 0.7449 vs empty 0.1539 / random 0.3252 | 確定 |
-| 前提保護 | empty no_edit 1.0000(全F・全ckpt) | 確定 |
+| **C1' 仕様2×2(499)** | 我々の仕様×steer **0.2337**(0.2385@499)/×clamp 0.1743 vs LinguaLens完全版 **0.0160**・AxBench完全版 **0.0701**(FRC×steer 0.0822) | 確定・主claim |
+| 床と統制 | raw 0.0601 / recon 0.0100 / random 0.0521 | 確定 |
+| 動作点の崖 | steer α 0.25/0.375/0.5/0.75 = 0.098/0.176/**0.2385**/0.18; clamp 5/10/20 = 0.06/0.17/0.03 | 確定 |
+| P-N(彼らの指標) | E_abl 我々 +0.631/+0.370 vs 両プロトコル +0.091/+0.115; AxBench score 1.211/1.262 vs 0.570/1.121(raw 1.081) | 確定 |
+| P-I WHERE(因果床) | true発火 3.57 vs random 1.08、393/31、p=5.6e-81; WHAT不能 | 確定 |
+| P-J r掃引(形1) | FRC r3 0.17/0.00(67/0, p=1.4e-20)→ r64 2.51 単調非飽和; AUROC r1 **ゼロ**(0.86×)なのに検出 mean **0.939** | 確定 |
+| FRR(steer行) | FRR 0.7327 / net-FRR 0.4062 / random床 0.3265(GPT-4o); steer自己一致 0.9781 | 確定(EFなし再集計は残) |
+| B2(SAE不使用参照) | 0.1242、empty copy 0.4770 | 確定 |
+| LinguaLens再現 | FIC 12.0/8.6/13.6/3.0 vs Table2 8.3/22.9/46.9/6.9(弱い行がアンカー) | 確定 |
+| 判別木(paper版) | **A 71 / C 21 / B 2 / D 4**(98現象) | 確定 |
+| AxBenchアンカー | 2B: SAE 0.177/0.151、SAE-A 0.166/0.132(L10/L20) | 再現実行待ち |
 
-## 未確定・進行中(執筆時に「暫定」と明記するもの)
+## 進行中・待機(執筆時は空欄/暫定)
 
-- **S6 学習が進行中**(v7キャッシュ + mismatched-z null教師 + MOVE op)。
-  GOなら手法節の学習データ記述に v7/P5 を昇格、NO-GOなら S3 のまま。
-  ゲート: MOVE≥4/12(薄い)、thr0.1≥0.2104、random no_edit≥0.87、λ-IoU≥0.74。
-- **P-O(事例レベル最小条件集合)**: 実装済み・S6決着後に実行。
-- BLEU/chrF は sacrebleu 未導入で空欄(表の空欄埋めのみ)。
-- gain-router 0.3012 は未昇格(未接触標本での再確認が要る — 使わない)。
-- 定性例収集(`run_examples.sh`)は未実行。
+- **B-1 介入k掃引**(実行中): 局在性の操作幅曲線(k=1..64)
+- **AxBench再現 L20/L10** + ll_set10(相互評価セル)→ judge
+- **B-2 S_min(steer)+ 安定核×FRC3比較**(形2)
+- FRR表のEF行なし再集計(オフライン)、clamp腕のFRR判定(任意)
+- random辞書対照(情報軸を復活させる場合のみ)、BLEU/chrF、定性例
