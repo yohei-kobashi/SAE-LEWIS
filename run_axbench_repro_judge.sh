@@ -1,13 +1,14 @@
 #!/bin/bash -l
 
 #------ qsub option --------#
-#PBS -q prepost
+#PBS -q short-c
 #PBS -l select=1
 #PBS -l walltime=6:00:00
 #PBS -W group_list=go25
 #PBS -j oe
 
-# AxBench steering reproduction — JUDGE (CPU, prepost).
+# AxBench steering reproduction — JUDGE (CPU batch on short-c; aarch64,
+# so env-c works. prepost rejects batch qsub — interactive only).
 # Batch:      cd ~/SAE-LEWIS && qsub run_axbench_repro_judge.sh  (login node)
 # Interactive: qsub -I -l select=1 -W group_list=go25 -q prepost
 #   cd SAE-LEWIS && git pull && bash run_axbench_repro_judge.sh
