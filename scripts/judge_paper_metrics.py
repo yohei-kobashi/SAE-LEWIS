@@ -110,6 +110,15 @@ class Judge:
                     time.sleep(5 * (attempt + 1))
                     continue
                 raise
+            except (urllib.error.URLError, ConnectionError, TimeoutError,
+                    OSError):
+                # transient network resets on the cluster (2026-07-19:
+                # ConnectionResetError killed a judge run mid-stream)
+                if attempt < 2:
+                    import time
+                    time.sleep(10 * (attempt + 1))
+                    continue
+                raise
         raise RuntimeError("judge retries exhausted")
 
 
