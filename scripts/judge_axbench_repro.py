@@ -108,9 +108,21 @@ def parse_args():
 
 
 def parse_rating(text: str):
-    m = re.findall(r"Rating:\s*\[\[([0-2])\]\]", text)
-    if not m:
-        m = re.findall(r"\[\[([0-2])\]\]", text)
+    """Official-parser-equivalent (axbench lm_judge._get_rating_from_
+    completion): split on 'Rating:', strip brackets IF present. The v1
+    regex REQUIRED the literal [[x]] wrapper, but gpt-4o-mini answers
+    'Rating: 0' without brackets -> every score silently parsed to None
+    -> 0 (the 2026-07-18 all-zero report)."""
+    if "Rating:" in text:
+        tail = text.split("Rating:")[-1].strip().split("\n")[0].strip()
+        tail = (tail.replace("[", "").replace("]", "")
+                .rstrip(".").strip('"').strip("'").strip("*").strip())
+        try:
+            v = float(tail)
+        except ValueError:
+            return None
+        return int(v) if v in (0.0, 1.0, 2.0) else None
+    m = re.findall(r"\[\[([0-2])\]\]", text)
     return int(m[-1]) if m else None
 
 

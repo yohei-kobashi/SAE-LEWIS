@@ -20,6 +20,18 @@ source env-c/bin/activate
 set -eo pipefail
 git pull || true
 CONFIG=${CONFIG:-prod_2b_l20_v1}
+
+# 2026-07-18: parse_rating required the literal "[[x]]" wrapper but
+# gpt-4o-mini answers "Rating: 0" bare -> ALL 16k cached scores were
+# parse-failure zeros. Those cache entries are POISON for resume;
+# quarantine once (records are healthy and stay).
+JC=runs/axbench_repro/judge_cache_${CONFIG}_gpt-4o-mini.jsonl
+if [ -f "$JC" ] && [ ! -f "$JC.parsebug-v2" ]; then
+    mv "$JC" "$JC.parsebug-v2"
+    rm -f "runs/axbench_repro/report_${CONFIG}.md"
+    echo "[axjudge] quarantined parse-bug cache -> $JC.parsebug-v2"
+fi
+
 [ -n "$OPENAI_API_KEY" ] || { [ -f .openai_key ] && export OPENAI_API_KEY=$(cat .openai_key); }
 [ -n "$OPENAI_API_KEY" ] || { echo "OPENAI_API_KEY not set"; exit 1; }
 [ -f "runs/axbench_repro/records_${CONFIG}.jsonl" ] || { echo "run run_axbench_repro.sh first"; exit 1; }
