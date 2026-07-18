@@ -104,6 +104,14 @@ def parse_args():
                    help="warm-start the editor from this checkpoint's "
                         "trainable state (e.g. the copy-collapsed run, "
                         "which already induces reproduction).")
+    p.add_argument("--lam-sup-w", type=float, default=0.0,
+                   help="branch B (plan §5, activated 2026-07-19 after "
+                        "v2 kept true==random): weak direct BCE on the "
+                        "rate field — true rows fire at the remaining-"
+                        "edit source positions and nowhere else; "
+                        "mismatch/empty rows fire nowhere. The mismatch "
+                        "contrast is what forces SPEC-conditional "
+                        "firing (eval's true-vs-random separation).")
 
     # Norm budget.
     p.add_argument("--norm-alpha", type=float, default=0.5,
@@ -203,12 +211,14 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
         if len(lm_prefix) + len(x1_body) > args.max_lm_len:
             continue
 
-        # positions of x1_body that differ from x_t (edit-only loss):
-        # non-equal opcode spans on the x1 side; deletions mark the
-        # boundary token after the removed span.
+        # positions of x1_body that differ from x_t (edit-only loss) and
+        # the x_t-side remaining-edit positions (lam supervision).
+        # non-equal opcode spans; deletions mark the boundary token.
         edit_pos = set()
-        if args.edit_only_loss and null_kind is None:
+        lam_pos = set()
+        if null_kind is None and (args.edit_only_loss or args.lam_sup_w > 0):
             xt_body = xt[1:] if (xt and xt[0] == ctx["bos_id"]) else list(xt)
+            bos_off = len(xt) - len(xt_body)
             sm = difflib.SequenceMatcher(None, xt_body, x1_body,
                                          autojunk=False)
             for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -218,10 +228,14 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
                     edit_pos.update(range(j1, j2))
                 else:                                  # pure deletion
                     edit_pos.add(min(j1, len(x1_body) - 1))
+                if i2 > i1:                            # x_t-side span
+                    lam_pos.update(range(bos_off + i1, bos_off + i2))
+                else:                                  # pure insertion
+                    lam_pos.add(bos_off + min(i1, len(xt_body) - 1))
         rows.append({
             "xt": xt, "prefix": lm_prefix, "resp": x1_body,
             "null": null_kind, "za": a, "zs": s, "t": t,
-            "edit_pos": edit_pos,
+            "edit_pos": edit_pos, "lam_pos": lam_pos,
         })
     if not rows:
         return None
@@ -230,6 +244,11 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
     Te = max(len(r["xt"]) for r in rows)
     enc_ids = torch.full((B, Te), ctx["pad_id"], dtype=torch.long)
     enc_mask = torch.zeros((B, Te), dtype=torch.long)
+    lam_tgt = torch.zeros((B, Te), dtype=torch.float32)
+    for i, r in enumerate(rows):
+        for j in r["lam_pos"]:                     # null rows: all-zero
+            if j < Te:
+                lam_tgt[i, j] = 1.0
     Tl = max(len(r["prefix"]) + len(r["resp"]) for r in rows)
     lm_ids = torch.full((B, Tl), ctx["it_pad"], dtype=torch.long)
     lm_mask = torch.zeros((B, Tl), dtype=torch.long)
@@ -260,7 +279,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
     return {
         "rows": rows, "enc_ids": enc_ids, "enc_mask": enc_mask,
         "lm_ids": lm_ids, "lm_mask": lm_mask, "labels": labels,
-        "ce_w": ce_w,
+        "ce_w": ce_w, "lam_tgt": lam_tgt,
         "z_amp": za, "z_sup": zs, "budget": budget,
         "null_mask": torch.tensor([r["null"] is not None for r in rows]),
     }
@@ -336,6 +355,12 @@ def ef_loss(model, it_model, hook, built: Dict, args, device: str,
         / (true_m * has_nll).sum().clamp_min(1.0)
     loss = (nll_true + args.norm_reg_w * norm_pen
             + args.null_norm_w * null_pen)
+    if args.lam_sup_w > 0:
+        lam_t = built["lam_tgt"].to(device)
+        lam_bce = F.binary_cross_entropy(
+            lam.clamp(1e-6, 1 - 1e-6), lam_t, reduction="none")
+        lam_bce = (lam_bce * enc_m).sum() / enc_m.sum().clamp_min(1.0)
+        loss = loss + args.lam_sup_w * lam_bce
     if not return_metrics:
         return loss
     lam_mean = (lam * enc_m).sum(dim=1) / enc_m.sum(dim=1).clamp_min(1.0)

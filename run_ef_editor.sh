@@ -47,6 +47,7 @@ EXTRA=()
 # start from a reproduction-capable checkpoint.
 [ -n "${EDIT_ONLY:-}" ] && EXTRA+=(--edit-only-loss --bg-weight "${BG_WEIGHT:-0.1}")
 [ -n "${INIT_CKPT:-}" ] && EXTRA+=(--init-ckpt "$INIT_CKPT")
+[ -n "${LAM_SUP:-}" ] && EXTRA+=(--lam-sup-w "$LAM_SUP")
 
 TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --llm2vec-dir "$LLM2VEC" --output-dir "$OUT"
