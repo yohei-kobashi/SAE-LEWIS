@@ -176,16 +176,19 @@ def main():
 
     @torch.no_grad()
     def gen_batch(prompt, n, seed_key):
-        """n sampled continuations of the raw prompt (no chat template —
-        repo passes the string straight to the tokenizer)."""
+        """n sampled generations of the raw prompt (no chat template —
+        repo passes the string straight to the tokenizer). 2026-07-18
+        audit fix: the official repo decodes the FULL sequence
+        (tokenizer.decode(generated_ids[0]) — PROMPT INCLUDED) and that
+        full text is what the judge reads; v1 of this script decoded the
+        continuation only."""
         enc = tok([prompt] * n, return_tensors="pt").to(args.device)
         torch.manual_seed(stable_hash(*seed_key) % (2**31))
         out = model.generate(
             **enc, max_new_tokens=args.max_new_tokens,
             temperature=args.temperature, do_sample=args.temperature > 0,
             pad_token_id=tok.pad_token_id or tok.eos_token_id)
-        cont = out[:, enc["input_ids"].shape[1]:]
-        return [tok.decode(c, skip_special_tokens=True) for c in cont]
+        return [tok.decode(o, skip_special_tokens=True) for o in out]
 
     def emit(feature, cond, direction, vec_tag, idxs, texts, vec_of=None):
         for i, t in zip(idxs, texts):

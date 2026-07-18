@@ -504,6 +504,16 @@ def main():
         pbar.update(1)
     pbar.close()
 
+    # loop-exit checkpoint: the boundary step (== max_steps) never reaches
+    # the in-loop save, which left stage-1 runs without a step10000 ckpt
+    # (runner's probe100 gate silently skipped) and made resume re-train
+    # from the previous save point.
+    exit_ckpt = out_dir / f"eflm-step{step}.pt"
+    if step > 0 and not exit_ckpt.exists():
+        save_ckpt(exit_ckpt)
+        save_train_state(exit_ckpt, optim, sched, step)
+        print(f"[ef-lm] saved loop-exit ckpt {exit_ckpt}")
+
     maybe_update_best(step)
     if dev_batches and best_path.exists():
         save_ckpt(out_dir / "eflm-last.pt")
