@@ -14,6 +14,13 @@ first generated line is the candidate edit. Information channels:
             interface with WHERE solved and WHAT linear. Measures the
             capacity ceiling of a linear spec rendering at the right
             positions in the bare frame.
+  * oracle_resid — DIAGNOSTIC 5 (2026-07-19, prepared for the v5/v6
+            residual-matching objective): inject the IDEAL residual
+            delta  Δh* = h_L(tgt frame) − h_L(src frame)  at the
+            difflib-aligned src positions (true condition only; no spec
+            involved). Tests the objective's premise: does making the
+            L12 states match the edited text cause the frozen LM to
+            OUTPUT the edited text? --oracle-scale sweeps the push.
   * raw   — no hook (the frame's floor: whatever the LM does after a
             bare sentence).
 Conditions true / empty / random as in the standard probe; spec built
@@ -76,6 +83,9 @@ def parse_args():
     p.add_argument("--conditions", default="true,empty,random")
     p.add_argument("--arms", default="ef,steer,raw")
     p.add_argument("--steer-alpha", type=float, default=0.5)
+    p.add_argument("--oracle-scale", type=float, default=1.0,
+                   help="multiplier on the oracle residual delta "
+                        "(arm oracle_resid)")
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--stop-lam", type=float, default=0.05)
     p.add_argument("--max-new-pad", type=int, default=24)
@@ -268,6 +278,8 @@ def main():
             for arm in arms:
                 if arm == "raw" and c != "empty":
                     continue                      # raw is condition-free
+                if arm == "oracle_resid" and c != "true":
+                    continue                      # oracle uses tgt, no spec
                 hook.mode = None
                 if arm == "ef":
                     cur_ids = list(src_ids)
@@ -302,6 +314,42 @@ def main():
                     out_text = gen_continuation(list(src_ids))
                     hook.mode = None
                     extra = {}
+                elif arm == "oracle_resid":
+                    with torch.no_grad():
+                        hs = it_model(
+                            input_ids=torch.tensor(
+                                [src_ids + [nl_id]], device=args.device),
+                            output_hidden_states=True, use_cache=False,
+                        ).hidden_states[args.sae_layer + 1][0].float()
+                        ht = it_model(
+                            input_ids=torch.tensor(
+                                [tgt_ids + [nl_id]], device=args.device),
+                            output_hidden_states=True, use_cache=False,
+                        ).hidden_states[args.sae_layer + 1][0].float()
+                    dloc = torch.zeros(len(src_ids), hs.shape[-1],
+                                       device=args.device)
+                    sm2 = difflib.SequenceMatcher(None, src_ids, tgt_ids,
+                                                  autojunk=False)
+                    for tag2, i1, i2, j1, j2 in sm2.get_opcodes():
+                        if tag2 == "equal" or tag2 == "replace":
+                            n2 = min(i2 - i1, j2 - j1)
+                            for k2 in range(n2):
+                                dloc[i1 + k2] = ht[j1 + k2] - hs[i1 + k2]
+                            for k2 in range(n2, i2 - i1):  # extra src
+                                dloc[i1 + k2] = (ht[min(j2 - 1,
+                                                        ht.shape[0] - 1)]
+                                                 - hs[i1 + k2])
+                        elif tag2 == "delete":
+                            jb = min(j1, ht.shape[0] - 1)
+                            for p2 in range(i1, i2):
+                                dloc[p2] = ht[jb] - hs[p2]
+                        # insert: no src position; the neighbouring
+                        # aligned targets already carry its context
+                    hook.mode = "ef"
+                    hook.delta = dloc * args.oracle_scale
+                    out_text = gen_continuation(list(src_ids))
+                    hook.mode = None
+                    extra = {"d_norm": float(dloc.norm(dim=-1).mean())}
                 elif arm == "steer_local":
                     # diagnostic 3: oracle WHERE (gold src-side edit
                     # positions) x linear WHAT (alpha*dvec), prefill-only
