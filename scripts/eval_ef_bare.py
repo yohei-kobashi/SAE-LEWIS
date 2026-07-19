@@ -230,7 +230,7 @@ def main():
         print(f"[efbare] EF editor loaded from {args.ef_ckpt}")
 
     a3 = None
-    if "prompting" in arms:
+    if "prompting" in arms or "prompting_edit" in arms:
         if not args.a3_prompts:
             raise SystemExit("arm 'prompting' needs --a3-prompts")
         a3 = json.loads(Path(args.a3_prompts).read_text())
@@ -423,6 +423,42 @@ def main():
                     out_text = gen_continuation(pids,
                                                 src_len=len(src_ids))
                     hook.mode = None
+                    extra = {}
+                elif arm == "prompting_edit":
+                    # A3' (main prompting row, user-approved 2026-07-19):
+                    # natural-language EDIT instruction — the no-SAE
+                    # prompting ceiling on our task. s1->s2 removes the
+                    # feature (dataset convention), hence "remove".
+                    feat = (ex.get("feature") or "").replace("_", " ")
+                    if c == "true":
+                        instr = (f"Rewrite the input sentence to remove "
+                                 f"any {feat}. Output only the rewritten "
+                                 f"sentence.")
+                    elif c == "random":
+                        others = [f2 for f2 in sorted(a3) if
+                                  f2.replace('_', ' ') != feat] \
+                            if a3 else ["metaphor"]
+                        rf2 = others[int(prng.integers(0, len(others)))]
+                        instr = (f"Rewrite the input sentence to remove "
+                                 f"any {rf2.replace('_', ' ')}. Output "
+                                 f"only the rewritten sentence.")
+                    else:
+                        instr = ("Rewrite the input sentence. Output "
+                                 "only the rewritten sentence.")
+                    pids2 = chat_prompt_ids(
+                        it_tok, instr + "\n\nInput: " + src)
+                    hook.mode = None
+                    with torch.no_grad():
+                        g = it_model.generate(
+                            input_ids=torch.tensor([pids2],
+                                                   device=args.device),
+                            max_new_tokens=len(src_ids) + args.max_new_pad,
+                            do_sample=False,
+                            pad_token_id=it_tok.pad_token_id
+                            or it_tok.eos_token_id)
+                    out_text = it_tok.decode(
+                        g[0, len(pids2):],
+                        skip_special_tokens=True).split("\n")[0].strip()
                     extra = {}
                 elif arm == "prompting":
                     feat = ex.get("feature") or ""
