@@ -65,7 +65,8 @@ from eval_lingualens import (                                  # noqa: E402
 from intervener import (EFIntervener, REPEAT_PROMPT,           # noqa: E402
                         chat_prompt_ids, find_subseq)
 from model import SAEFeatureExtractor, load_sae                # noqa: E402
-from scripts.eval_clamp_baseline import extract_sentence, bname  # noqa: E402
+from scripts.eval_clamp_baseline import (extract_sentence, bname,  # noqa
+                                         SaeClampHook)
 
 
 def parse_args():
@@ -221,6 +222,11 @@ def main():
 
     hook = BareHook()
     it_model.model.layers[args.sae_layer].register_forward_hook(hook)
+    # A1 arm: LinguaLens-faithful set(10/0) + full recon replacement,
+    # every position and step (OpenSAE semantics; empty spec = recon
+    # passthrough = their control)
+    clamp_hook = SaeClampHook(sae)
+    it_model.model.layers[args.sae_layer].register_forward_hook(clamp_hook)
     # diag 6b: one hook per layer (enabled only by oracle_resid_all)
     n_layers = len(it_model.model.layers)
     layer_hooks = [BareHook() for _ in range(n_layers)]
@@ -401,6 +407,18 @@ def main():
                     out_text = gen_continuation(pids,
                                                 src_len=len(src_ids))
                     hook.mode = None
+                    extra = {}
+                elif arm == "clamp":
+                    clamp_hook.enabled = True
+                    clamp_hook.amp_idx = torch.nonzero(
+                        za > 0).flatten().to(args.device)
+                    clamp_hook.amp_val = 10.0      # their enhancement value
+                    clamp_hook.sup_idx = torch.nonzero(
+                        zs > 0).flatten().to(args.device)
+                    pids, _, _, _ = frame_prompt(src, src_ids)
+                    out_text = gen_continuation(pids,
+                                                src_len=len(src_ids))
+                    clamp_hook.enabled = False
                     extra = {}
                 elif arm.startswith("oracle_resid"):
                     with torch.no_grad():
