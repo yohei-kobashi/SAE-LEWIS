@@ -69,6 +69,18 @@ if [ ! -f runs/prod_gemma_v6/abl_noblock/report.md ]; then
         --output-dir runs/prod_gemma_v6/abl_noblock
 fi
 
+# ---- L20 native EF foundation + v5f2 (user 2026-07-20: parallel to
+# ---- L4-on-short-g; takes priority over the Tier1 trainings) ----------
+if [ ! -f runs/prod_gemma_v6/editflow_s3_l20/probe/probe_report.md ]; then
+    LAYER=20 bash run_editflow_layer.sh
+fi
+if [ -f runs/prod_gemma_v6/editflow_s3_l20/editflow-final.pt ] \
+   && [ ! -f runs/prod_gemma_v6/eflm_l20_v5f2/probe500/report.md ]; then
+    LAYER=20 FRAME=repeat EDIT_ONLY=1 LAM_SUP=0.2 \
+        FLOW_INIT=runs/prod_gemma_v6/editflow_s3_l20/editflow-final.pt \
+        OUT_SUFFIX=_v5f2 MAX_STEPS=40000 bash run_ef_editor.sh
+fi
+
 # ---- Tier1 trainings (each guarded by its own probe500 report) --------
 # S5: Tier1-2 no S3 warm start
 if [ ! -f runs/prod_gemma_v6/eflm_l12_v5f_noS3/probe500/report.md ]; then
