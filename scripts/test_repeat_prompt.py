@@ -83,8 +83,11 @@ def main():
                 pids = tok.apply_chat_template(
                     [{"role": "user", "content": text}],
                     add_generation_prompt=True, tokenize=True)
-                # tokenizers version drift (same fix as the AxBench
-                # chat_wrap): Encoding object / nested list -> id list
+                # tokenizers version drift (same guards as the fixed
+                # AxBench chat_wrap): BatchEncoding / Encoding / nested
+                # list -> flat id list
+                if hasattr(pids, "input_ids"):
+                    pids = pids.input_ids
                 if hasattr(pids, "ids"):
                     pids = pids.ids
                 if pids and isinstance(pids[0], list):
