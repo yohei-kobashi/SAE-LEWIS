@@ -37,7 +37,7 @@ for K in 1 4 8 16 32; do
         python scripts/eval_ef_bare.py --frame repeat \
             --llm2vec-dir "$L2V" --sae-path "$SAE" --sae-layer 12 \
             --blocklist "$BLK" --k-amp $K --k-sup $K \
-            --ef-ckpt "$CKPT" --arms ef --sample-size 200 \
+            --ef-ckpt "$CKPT" --arms ef --sample-size 499 \
             --conditions true,random \
             --output-dir runs/prod_gemma_v6/abl_k$K --device cuda
     fi
@@ -89,5 +89,12 @@ if [ ! -f runs/prod_gemma_v6/eflm_l12_v5f_nobudget/probe500/report.md ]; then
         NORM_REG_W=0.0 NULL_NORM_W=0.0 \
         OUT_SUFFIX=_v5f_nobudget MAX_STEPS=40000 bash run_ef_editor.sh
 fi
+
+# ---- S8: per-feature aggregation (stdlib, cheap) ----------------------
+python3 scripts/aggregate_per_feature.py \
+    --records runs/prod_gemma_v6/eflm_l12_v5f/probe500/records.jsonl \
+    --out runs/tables/perfeature_v5f_l12.md
+python3 scripts/aggregate_per_feature.py --out runs/tables/perfeature_ksweep.md \
+    --sweep "k1=runs/prod_gemma_v6/abl_k1/records.jsonl:k4=runs/prod_gemma_v6/abl_k4/records.jsonl:k8=runs/prod_gemma_v6/abl_k8/records.jsonl:k16=runs/prod_gemma_v6/abl_k16/records.jsonl:k32=runs/prod_gemma_v6/abl_k32/records.jsonl:k64=runs/prod_gemma_v6/eflm_l12_v5f/probe500/records.jsonl"
 
 echo "==================== ALL-ABLATIONS-DONE ===================="
