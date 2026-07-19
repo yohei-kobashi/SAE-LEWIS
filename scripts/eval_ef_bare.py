@@ -112,6 +112,11 @@ def parse_args():
                         "at the src span inside the prompt, steer at all "
                         "positions, raw = prompt only. oracle_/steer_"
                         "local diag arms are bare-frame only.")
+    p.add_argument("--ef-scale", type=float, default=1.0,
+                   help="ablation: inference-time multiplier on the "
+                        "editor's delta (tests whether the learned "
+                        "magnitude is self-calibrated, vs steer's "
+                        "alpha cliff)")
     p.add_argument("--spec-scope", choices=["local", "global"],
                    default="local",
                    help="ablation (7): 'global' pools the spec over ALL "
@@ -402,10 +407,10 @@ def main():
                             eo = (1 if cur_ids and cur_ids[0]
                                   == tokenizer.bos_token_id else 0) + extra
                             n = min(len(needle), delta.shape[0] - eo)
-                            hook.delta = delta[eo:eo + n]
+                            hook.delta = delta[eo:eo + n] * args.ef_scale
                             hook.off = lo
                         else:
-                            hook.delta = delta
+                            hook.delta = delta * args.ef_scale
                             hook.off = 0
                         hook.mode = "ef"
                         out_text = gen_continuation(pids,

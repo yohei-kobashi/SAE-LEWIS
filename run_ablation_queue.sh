@@ -43,6 +43,16 @@ for K in 1 4 8 16 32; do
     fi
 done
 
+# ---- S2b: intervention-magnitude sweep at best k (user addition) ------
+for S in 0.5 0.75 1.25 1.5 2.0; do
+    if [ ! -f runs/prod_gemma_v6/abl_scale$S/report.md ]; then
+        python scripts/eval_ef_bare.py "${BASE[@]}" --blocklist "$BLK" \
+            --ef-ckpt "$CKPT" --arms ef --ef-scale $S --sample-size 200 \
+            --conditions true,random \
+            --output-dir runs/prod_gemma_v6/abl_scale$S
+    fi
+done
+
 # ---- S3: Tier2-7 spec scope global (probe only) -----------------------
 if [ ! -f runs/prod_gemma_v6/abl_scope_global/report.md ]; then
     python scripts/eval_ef_bare.py "${BASE[@]}" --blocklist "$BLK" \
