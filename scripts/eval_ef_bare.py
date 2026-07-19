@@ -97,6 +97,15 @@ def parse_args():
     p.add_argument("--oracle-scale", type=float, default=1.0,
                    help="multiplier on the oracle residual delta "
                         "(arm oracle_resid)")
+    p.add_argument("--a3-prompts", default="",
+                   help="steering_prompts.json (gen_a3_prompts.py) — "
+                        "enables the 'prompting' arm (A3 = AxBench "
+                        "prompt-steering port; no SAE involved). The "
+                        "standard probe direction s1->s2 REMOVES the "
+                        "feature (their metrics.py: sentence1 = example, "
+                        "sentence2 = counterfactual), so true uses the "
+                        "'abl' prompt; random = another feature's abl; "
+                        "empty = plain Question frame.")
     p.add_argument("--frame", choices=["bare", "repeat"], default="bare",
                    help="'repeat' = v5 frame: chat-templated explicit "
                         "repeat instruction (REPEAT_PROMPT); ef injects "
@@ -219,6 +228,13 @@ def main():
                               ).to(args.device).eval()
         interv.load_trainable_state_dict(blob["trainable"])
         print(f"[efbare] EF editor loaded from {args.ef_ckpt}")
+
+    a3 = None
+    if "prompting" in arms:
+        if not args.a3_prompts:
+            raise SystemExit("arm 'prompting' needs --a3-prompts")
+        a3 = json.loads(Path(args.a3_prompts).read_text())
+        print(f"[efbare] A3 prompts: {len(a3)} features")
 
     hook = BareHook()
     it_model.model.layers[args.sae_layer].register_forward_hook(hook)
@@ -407,6 +423,33 @@ def main():
                     out_text = gen_continuation(pids,
                                                 src_len=len(src_ids))
                     hook.mode = None
+                    extra = {}
+                elif arm == "prompting":
+                    feat = ex.get("feature") or ""
+                    if c == "true":
+                        sp = a3.get(feat, {}).get("abl", "")
+                    elif c == "random":
+                        others = [f2 for f2 in sorted(a3)
+                                  if f2 != feat]
+                        sp = a3[others[int(prng.integers(
+                            0, len(others)))]]["abl"]
+                    else:                          # empty
+                        sp = ""
+                    content = ((sp + "\n\nQuestion: " + src)
+                               if sp else ("Question: " + src))
+                    pids2 = chat_prompt_ids(it_tok, content)
+                    hook.mode = None
+                    with torch.no_grad():
+                        g = it_model.generate(
+                            input_ids=torch.tensor([pids2],
+                                                   device=args.device),
+                            max_new_tokens=len(src_ids) + args.max_new_pad,
+                            do_sample=False,
+                            pad_token_id=it_tok.pad_token_id
+                            or it_tok.eos_token_id)
+                    out_text = it_tok.decode(
+                        g[0, len(pids2):],
+                        skip_special_tokens=True).split("\n")[0].strip()
                     extra = {}
                 elif arm == "clamp":
                     clamp_hook.enabled = True
