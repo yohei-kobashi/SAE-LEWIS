@@ -8,6 +8,12 @@ first generated line is the candidate edit. Information channels:
             perception persists through the KV cache);
   * steer — fixed rendering h + alpha*(za-zs)@W_dec at EVERY position
             (prefill + decode), the champion mechanics in this frame;
+  * steer_local — DIAGNOSTIC 3 (2026-07-19): the same fixed rendering
+            injected ONLY at the ORACLE edit positions (src-side difflib
+            spans vs tgt), prefill-only — the ef arm's exact injection
+            interface with WHERE solved and WHAT linear. Measures the
+            capacity ceiling of a linear spec rendering at the right
+            positions in the bare frame.
   * raw   — no hook (the frame's floor: whatever the LM does after a
             bare sentence).
 Conditions true / empty / random as in the standard probe; spec built
@@ -296,6 +302,27 @@ def main():
                     out_text = gen_continuation(list(src_ids))
                     hook.mode = None
                     extra = {}
+                elif arm == "steer_local":
+                    # diagnostic 3: oracle WHERE (gold src-side edit
+                    # positions) x linear WHAT (alpha*dvec), prefill-only
+                    # via the ef injection interface.
+                    dvec = (za.to(args.device).float() @ W
+                            - zs.to(args.device).float() @ W)
+                    sm2 = difflib.SequenceMatcher(None, src_ids, tgt_ids,
+                                                  autojunk=False)
+                    gold = set()
+                    for tag2, i1, i2, _, _ in sm2.get_opcodes():
+                        if tag2 != "equal":
+                            gold.update(range(i1, max(i1 + 1, i2)))
+                    gold = sorted(p for p in gold if p < len(src_ids))
+                    dloc = torch.zeros(len(src_ids), W.shape[1],
+                                       device=args.device)
+                    for p in gold:
+                        dloc[p] = args.steer_alpha * dvec
+                    hook.mode, hook.delta = "ef", dloc
+                    out_text = gen_continuation(list(src_ids))
+                    hook.mode = None
+                    extra = {"n_gold": len(gold)}
                 else:                              # raw
                     hook.mode = None
                     out_text = gen_continuation(list(src_ids))
