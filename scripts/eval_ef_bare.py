@@ -21,6 +21,15 @@ first generated line is the candidate edit. Information channels:
             involved). Tests the objective's premise: does making the
             L12 states match the edited text cause the frozen LM to
             OUTPUT the edited text? --oracle-scale sweeps the push.
+  * oracle_resid_b — DIAGNOSTIC 6a: oracle_resid + the BOUNDARY \\n
+            position (same layer L). Isolates the boundary-position
+            contribution identified by diag5.
+  * oracle_resid_all — DIAGNOSTIC 6b (ANALYSIS ONLY, not a method arm:
+            multi-layer injection bypasses the L12-feature mediation
+            claim): the ideal per-layer deltas injected at EVERY layer's
+            output (aligned positions + boundary). Measures the ceiling
+            when ALL decoder inflow paths are closed — the lower-KV
+            pathway's contribution = (6b − 6a).
   * raw   — no hook (the frame's floor: whatever the LM does after a
             bare sentence).
 Conditions true / empty / random as in the standard probe; spec built
@@ -92,6 +101,30 @@ def parse_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     return p.parse_args()
+
+
+def oracle_delta(hs, ht, s_ids, t_ids, boundary: bool):
+    """Ideal residual delta at difflib-aligned src positions (+ the
+    boundary \\n position when boundary=True). hs/ht: (T, d) hidden
+    states of the src/tgt frames (ids + [nl])."""
+    n_rows = len(s_ids) + (1 if boundary else 0)
+    d = torch.zeros(n_rows, hs.shape[-1], device=hs.device)
+    sm2 = difflib.SequenceMatcher(None, s_ids, t_ids, autojunk=False)
+    for tag2, i1, i2, j1, j2 in sm2.get_opcodes():
+        if tag2 in ("equal", "replace"):
+            n2 = min(i2 - i1, j2 - j1)
+            for k2 in range(n2):
+                d[i1 + k2] = ht[j1 + k2] - hs[i1 + k2]
+            for k2 in range(n2, i2 - i1):
+                d[i1 + k2] = ht[min(j2 - 1, ht.shape[0] - 1)] \
+                    - hs[i1 + k2]
+        elif tag2 == "delete":
+            jb = min(j1, ht.shape[0] - 1)
+            for p2 in range(i1, i2):
+                d[p2] = ht[jb] - hs[p2]
+    if boundary:
+        d[len(s_ids)] = ht[len(t_ids)] - hs[len(s_ids)]
+    return d
 
 
 class BareHook:
@@ -178,6 +211,11 @@ def main():
 
     hook = BareHook()
     it_model.model.layers[args.sae_layer].register_forward_hook(hook)
+    # diag 6b: one hook per layer (enabled only by oracle_resid_all)
+    n_layers = len(it_model.model.layers)
+    layer_hooks = [BareHook() for _ in range(n_layers)]
+    for _l, _hk in enumerate(layer_hooks):
+        it_model.model.layers[_l].register_forward_hook(_hk)
     nl_ids = it_tok("\n", add_special_tokens=False).input_ids
     assert len(nl_ids) == 1
     nl_id = int(nl_ids[0])
@@ -278,7 +316,7 @@ def main():
             for arm in arms:
                 if arm == "raw" and c != "empty":
                     continue                      # raw is condition-free
-                if arm == "oracle_resid" and c != "true":
+                if arm.startswith("oracle_resid") and c != "true":
                     continue                      # oracle uses tgt, no spec
                 hook.mode = None
                 if arm == "ef":
@@ -314,42 +352,40 @@ def main():
                     out_text = gen_continuation(list(src_ids))
                     hook.mode = None
                     extra = {}
-                elif arm == "oracle_resid":
+                elif arm.startswith("oracle_resid"):
                     with torch.no_grad():
-                        hs = it_model(
+                        os_ = it_model(
                             input_ids=torch.tensor(
                                 [src_ids + [nl_id]], device=args.device),
-                            output_hidden_states=True, use_cache=False,
-                        ).hidden_states[args.sae_layer + 1][0].float()
-                        ht = it_model(
+                            output_hidden_states=True, use_cache=False)
+                        ot_ = it_model(
                             input_ids=torch.tensor(
                                 [tgt_ids + [nl_id]], device=args.device),
-                            output_hidden_states=True, use_cache=False,
-                        ).hidden_states[args.sae_layer + 1][0].float()
-                    dloc = torch.zeros(len(src_ids), hs.shape[-1],
-                                       device=args.device)
-                    sm2 = difflib.SequenceMatcher(None, src_ids, tgt_ids,
-                                                  autojunk=False)
-                    for tag2, i1, i2, j1, j2 in sm2.get_opcodes():
-                        if tag2 == "equal" or tag2 == "replace":
-                            n2 = min(i2 - i1, j2 - j1)
-                            for k2 in range(n2):
-                                dloc[i1 + k2] = ht[j1 + k2] - hs[i1 + k2]
-                            for k2 in range(n2, i2 - i1):  # extra src
-                                dloc[i1 + k2] = (ht[min(j2 - 1,
-                                                        ht.shape[0] - 1)]
-                                                 - hs[i1 + k2])
-                        elif tag2 == "delete":
-                            jb = min(j1, ht.shape[0] - 1)
-                            for p2 in range(i1, i2):
-                                dloc[p2] = ht[jb] - hs[p2]
-                        # insert: no src position; the neighbouring
-                        # aligned targets already carry its context
-                    hook.mode = "ef"
-                    hook.delta = dloc * args.oracle_scale
-                    out_text = gen_continuation(list(src_ids))
-                    hook.mode = None
-                    extra = {"d_norm": float(dloc.norm(dim=-1).mean())}
+                            output_hidden_states=True, use_cache=False)
+                    if arm == "oracle_resid_all":      # diag 6b
+                        for _l in range(n_layers):
+                            dl = oracle_delta(
+                                os_.hidden_states[_l + 1][0].float(),
+                                ot_.hidden_states[_l + 1][0].float(),
+                                src_ids, tgt_ids, boundary=True)
+                            layer_hooks[_l].mode = "ef"
+                            layer_hooks[_l].delta = dl * args.oracle_scale
+                        out_text = gen_continuation(list(src_ids))
+                        for _hk in layer_hooks:
+                            _hk.mode = None
+                        extra = {}
+                    else:                              # diag 5 / 6a
+                        hs = os_.hidden_states[args.sae_layer + 1][0].float()
+                        ht = ot_.hidden_states[args.sae_layer + 1][0].float()
+                        dloc = oracle_delta(
+                            hs, ht, src_ids, tgt_ids,
+                            boundary=(arm == "oracle_resid_b"))
+                        hook.mode = "ef"
+                        hook.delta = dloc * args.oracle_scale
+                        out_text = gen_continuation(list(src_ids))
+                        hook.mode = None
+                        extra = {"d_norm": float(dloc.norm(dim=-1).mean())}
+                    del os_, ot_
                 elif arm == "steer_local":
                     # diagnostic 3: oracle WHERE (gold src-side edit
                     # positions) x linear WHAT (alpha*dvec), prefill-only
