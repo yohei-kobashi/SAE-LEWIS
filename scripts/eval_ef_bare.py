@@ -62,7 +62,8 @@ from eval_lingualens import (                                  # noqa: E402
     diff_intervention, edit_char_ranges, local_pool_topk, pair_metrics,
     randomize_intervention, sae_z_with_offsets,
 )
-from intervener import EFIntervener                            # noqa: E402
+from intervener import (EFIntervener, REPEAT_PROMPT,           # noqa: E402
+                        chat_prompt_ids, find_subseq)
 from model import SAEFeatureExtractor, load_sae                # noqa: E402
 from scripts.eval_clamp_baseline import extract_sentence, bname  # noqa: E402
 
@@ -95,6 +96,12 @@ def parse_args():
     p.add_argument("--oracle-scale", type=float, default=1.0,
                    help="multiplier on the oracle residual delta "
                         "(arm oracle_resid)")
+    p.add_argument("--frame", choices=["bare", "repeat"], default="bare",
+                   help="'repeat' = v5 frame: chat-templated explicit "
+                        "repeat instruction (REPEAT_PROMPT); ef injects "
+                        "at the src span inside the prompt, steer at all "
+                        "positions, raw = prompt only. oracle_/steer_"
+                        "local diag arms are bare-frame only.")
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--stop-lam", type=float, default=0.05)
     p.add_argument("--max-new-pad", type=int, default=24)
@@ -135,6 +142,7 @@ class BareHook:
     def __init__(self):
         self.mode = None            # None | "ef" | "steer"
         self.delta = None           # (n, d) float
+        self.off = 0                # start position of the delta rows
         self.dvec = None            # (d,) float
         self.alpha = 0.5
 
@@ -144,10 +152,12 @@ class BareHook:
         h = output[0] if isinstance(output, tuple) else output
         if self.mode == "ef":
             if h.shape[1] > 1 and self.delta is not None:
-                n = min(self.delta.shape[0], h.shape[1])
-                add = torch.zeros_like(h)
-                add[:, :n] = self.delta[:n].to(h.dtype)
-                h = h + add
+                n = min(self.delta.shape[0], h.shape[1] - self.off)
+                if n > 0:
+                    add = torch.zeros_like(h)
+                    add[:, self.off:self.off + n] = \
+                        self.delta[:n].to(h.dtype)
+                    h = h + add
         elif self.mode == "steer" and self.dvec is not None:
             h = h + (self.alpha * self.dvec).to(h.dtype)
         if isinstance(output, tuple):
@@ -223,14 +233,33 @@ def main():
           f"arms={arms} rounds={args.rounds}")
 
     @torch.no_grad()
-    def gen_continuation(prefix_ids):
-        ids = torch.tensor([prefix_ids + [nl_id]], device=args.device)
+    def gen_continuation(prefix_ids, src_len=None):
+        full = (prefix_ids if args.frame == "repeat"
+                else prefix_ids + [nl_id])
+        ids = torch.tensor([full], device=args.device)
         out = it_model.generate(
-            input_ids=ids, max_new_tokens=len(prefix_ids) + args.max_new_pad,
+            input_ids=ids,
+            max_new_tokens=(src_len or len(prefix_ids)) + args.max_new_pad,
             do_sample=False,
             pad_token_id=it_tok.pad_token_id or it_tok.eos_token_id)
         text = it_tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
         return text.split("\n")[0].strip()
+
+    def frame_prompt(src_text, src_ids_):
+        """Returns (lm_prefix_ids, span_lo, needle) for the frame."""
+        if args.frame == "repeat":
+            pids = chat_prompt_ids(it_tok,
+                                   REPEAT_PROMPT.format(src=src_text))
+            needle = it_tok(src_text, add_special_tokens=False).input_ids
+            off = 0
+            lo = find_subseq(pids, needle)
+            if lo is None and len(needle) > 1:
+                lo = find_subseq(pids, needle[1:])
+                if lo is not None:
+                    off = 1
+                    needle = needle[1:]
+            return pids, lo, needle, off
+        return list(src_ids_), 0, list(src_ids_), 0
 
     @torch.no_grad()
     def ef_delta(src_ids, za, zs):
@@ -318,9 +347,13 @@ def main():
                     continue                      # raw is condition-free
                 if arm.startswith("oracle_resid") and c != "true":
                     continue                      # oracle uses tgt, no spec
+                if args.frame == "repeat" and (
+                        arm.startswith("oracle_") or arm == "steer_local"):
+                    continue                      # diag arms are bare-only
                 hook.mode = None
                 if arm == "ef":
                     cur_ids = list(src_ids)
+                    cur_text = src
                     texts, lams, ious = [], [], []
                     for rnd in range(max(1, args.rounds)):
                         delta, lam = ef_delta(cur_ids, za, zs)
@@ -332,12 +365,27 @@ def main():
                                 ious.append(iou)
                         if rnd > 0 and lam_mean < args.stop_lam:
                             break
-                        hook.mode, hook.delta = "ef", delta
-                        out_text = gen_continuation(cur_ids)
+                        pids, lo, needle, extra = frame_prompt(cur_text,
+                                                               cur_ids)
+                        if args.frame == "repeat":
+                            if lo is None:
+                                break
+                            eo = (1 if cur_ids and cur_ids[0]
+                                  == tokenizer.bos_token_id else 0) + extra
+                            n = min(len(needle), delta.shape[0] - eo)
+                            hook.delta = delta[eo:eo + n]
+                            hook.off = lo
+                        else:
+                            hook.delta = delta
+                            hook.off = 0
+                        hook.mode = "ef"
+                        out_text = gen_continuation(pids,
+                                                    src_len=len(cur_ids))
                         hook.mode = None
                         if not out_text:
                             break
                         texts.append(out_text)
+                        cur_text = out_text
                         cur_ids = tokenizer(
                             out_text, add_special_tokens=True).input_ids
                     out_text = texts[-1] if texts else ""
@@ -349,7 +397,9 @@ def main():
                             - zs.to(args.device).float() @ W)
                     hook.mode, hook.dvec = "steer", dvec
                     hook.alpha = args.steer_alpha
-                    out_text = gen_continuation(list(src_ids))
+                    pids, _, _, _ = frame_prompt(src, src_ids)
+                    out_text = gen_continuation(pids,
+                                                src_len=len(src_ids))
                     hook.mode = None
                     extra = {}
                 elif arm.startswith("oracle_resid"):
@@ -409,7 +459,9 @@ def main():
                     extra = {"n_gold": len(gold)}
                 else:                              # raw
                     hook.mode = None
-                    out_text = gen_continuation(list(src_ids))
+                    pids, _, _, _ = frame_prompt(src, src_ids)
+                    out_text = gen_continuation(pids,
+                                                src_len=len(src_ids))
                     extra = {}
                 out_text = extract_sentence(out_text, src)
                 pm = pair_metrics(out_text, src, tgt)
@@ -430,8 +482,11 @@ def main():
     # ---- report -----------------------------------------------------------
     lines = [f"# EF through-LM bare-frame probe (layer {args.sae_layer})",
              ""]
-    lines.append(f"pairs scored: {len(records)}; frame = BARE "
-                 f"(no prompt, [BOS]+src+\\n, greedy); arms {arms}; "
+    fdesc = ("REPEAT (chat-templated repeat instruction, greedy)"
+             if args.frame == "repeat"
+             else "BARE (no prompt, [BOS]+src+\\n, greedy)")
+    lines.append(f"pairs scored: {len(records)}; frame = {fdesc}; "
+                 f"arms {arms}; "
                  f"steer alpha {args.steer_alpha}; rounds {args.rounds}; "
                  f"sae {args.sae_path}")
     lines += ["", "| condition | arm | exact | sim_target | copy |",

@@ -50,6 +50,7 @@ EXTRA=()
 [ -n "${LAM_SUP:-}" ] && EXTRA+=(--lam-sup-w "$LAM_SUP")
 [ -n "${FLOW_INIT:-}" ] && EXTRA+=(--init-flow-ckpt "$FLOW_INIT")
 [ -n "${MM_ECHO:-}" ] && EXTRA+=(--mismatch-echo)
+[ -n "${FRAME:-}" ] && EXTRA+=(--frame "$FRAME")
 
 TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --llm2vec-dir "$LLM2VEC" --output-dir "$OUT"
@@ -62,6 +63,7 @@ TRAIN_ARGS=(--corruption-dir "$CACHE" --dev-corruption-dir "$DEV"
     --resume --device cuda "${EXTRA[@]}")
 
 PROBE_ARGS=(--llm2vec-dir "$LLM2VEC" --sae-path "$SAE"
+    ${FRAME:+--frame "$FRAME"}
     --sae-layer "$LAYER" --blocklist "$BLK"
     --k-amp 64 --k-sup 64 --steer-alpha 0.5 --device cuda)
 

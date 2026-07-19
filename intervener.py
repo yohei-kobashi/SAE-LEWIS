@@ -34,6 +34,30 @@ import torch.nn as nn
 
 from editflow import SAEEditFlow
 
+# v5 frame (user decision 2026-07-19): explicit repeat instruction,
+# selected by scripts/test_repeat_prompt.py — plain gemma-2-2b-it copies
+# 99% of LinguaLens sentences under this chat-templated prompt (bare-text
+# variants: 0%). The prompt supplies ONLY reproduction capability; the
+# intervention decides WHAT gets reproduced.
+REPEAT_PROMPT = ("Repeat the input sentence exactly. Never output "
+                 "anything else.\n\nInput: {src}")
+
+
+def chat_prompt_ids(it_tok, text: str):
+    """Chat-templated prompt token ids with the tokenizers version-drift
+    guards proven in the AxBench chat_wrap fix (BatchEncoding / Encoding /
+    nested list -> flat id list)."""
+    ids = it_tok.apply_chat_template(
+        [{"role": "user", "content": text}],
+        add_generation_prompt=True, tokenize=True)
+    if hasattr(ids, "input_ids"):
+        ids = ids.input_ids
+    if hasattr(ids, "ids"):
+        ids = ids.ids
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return [int(x) for x in ids]
+
 
 class Intervener(nn.Module):
     def __init__(self, llm2vec_dir: str, d_sae: int,

@@ -44,7 +44,8 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
 
 from data import CorruptionDataset, _dense_topk
 from intervene import diff_to_sparse, draw_k, parse_k_spec
-from intervener import EFIntervener
+from intervener import (EFIntervener, REPEAT_PROMPT, chat_prompt_ids,
+                        find_subseq)
 from model import load_sae_w_dec
 from resume_utils import (
     add_resume_args, find_latest_ckpt, load_train_state, save_train_state,
@@ -84,6 +85,15 @@ def parse_args():
     p.add_argument("--empty-prob", type=float, default=0.08)
     p.add_argument("--mismatch-null-prob", type=float, default=0.12)
 
+    p.add_argument("--frame", choices=["bare", "repeat"], default="bare",
+                   help="'repeat' = v5 (user decision 2026-07-19): the "
+                        "chat-templated explicit repeat instruction "
+                        "(REPEAT_PROMPT, 99% plain-model copy rate). The "
+                        "prompt carries reproduction capability only; "
+                        "ALL rows get an NLL target (true -> x1, "
+                        "empty/mismatch/copy -> x_t itself) and "
+                        "empty+mismatch stay norm-suppressed (copying "
+                        "needs no delta under this frame).")
     # EF regime.
     p.add_argument("--t0-prob", type=float, default=0.5,
                    help="prob. that x_t = x0 (full remaining edit); else "
@@ -219,20 +229,78 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
 
         t = 0.0 if rng.random() < args.t0_prob else float(rng.random())
         xt = sample_intermediate(x0, x1, t, rng)
-
-        # bare frame: [BOS]+x_t  \n  x1-body(no BOS)
         x1_body = x1[1:] if (x1 and x1[0] == ctx["bos_id"]) else list(x1)
-        lm_prefix = list(xt) + [ctx["nl_id"]]
-        if len(lm_prefix) + len(x1_body) > args.max_lm_len:
-            continue
+        xt_body0 = xt[1:] if (xt and xt[0] == ctx["bos_id"]) else list(xt)
 
-        # positions of x1_body that differ from x_t (edit-only loss) and
-        # the x_t-side remaining-edit positions (lam supervision).
-        # non-equal opcode spans; deletions mark the boundary token.
+        if args.frame == "repeat":
+            xt_text = ctx["tok"].decode(xt_body0, skip_special_tokens=True)
+            prompt_ids = chat_prompt_ids(
+                ctx["it_tok"], REPEAT_PROMPT.format(src=xt_text))
+            needle = ctx["it_tok"](xt_text,
+                                   add_special_tokens=False).input_ids
+            enc_extra = 0
+            lo = find_subseq(prompt_ids, needle)
+            if lo is None and len(needle) > 1:
+                lo = find_subseq(prompt_ids, needle[1:])
+                if lo is not None:
+                    enc_extra = 1
+                    needle = needle[1:]
+            if lo is None:
+                continue
+            if null_kind is None:
+                target_ids = list(x1_body)
+            else:                               # empty/mismatch -> copy
+                target_ids = ctx["it_tok"](
+                    xt_text, add_special_tokens=False).input_ids
+            resp0 = target_ids + [ctx["eot_id"]]
+            lm_prefix = prompt_ids
+            if len(lm_prefix) + len(resp0) > args.max_lm_len:
+                continue
+        else:
+            # bare frame: [BOS]+x_t  \n  x1-body(no BOS)
+            lm_prefix = list(xt) + [ctx["nl_id"]]
+            if len(lm_prefix) + len(x1_body) > args.max_lm_len:
+                continue
+
+        # positions of the response that differ from the input (edit-only
+        # loss) and the input-side remaining-edit positions (lam
+        # supervision). non-equal opcode spans; deletions mark the
+        # boundary token.
         edit_pos = set()
         lam_pos = set()
-        xt_body = xt[1:] if (xt and xt[0] == ctx["bos_id"]) else list(xt)
+        xt_body = xt_body0
         bos_off = len(xt) - len(xt_body)
+        if args.frame == "repeat":
+            # diff in the -it token space: needle (= x_t as it sits in
+            # the prompt) vs the true response; encoder position of
+            # needle[j] = enc_extra + bos_off + j.
+            if null_kind is None and (args.edit_only_loss
+                                      or args.lam_sup_w > 0):
+                sm = difflib.SequenceMatcher(None, needle, resp0[:-1],
+                                             autojunk=False)
+                for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                    if tag == "equal":
+                        continue
+                    if j2 > j1:
+                        edit_pos.update(range(j1, j2))
+                    else:
+                        edit_pos.add(min(j1, len(resp0) - 2))
+                    if i2 > i1:
+                        lam_pos.update(range(bos_off + enc_extra + i1,
+                                             bos_off + enc_extra + i2))
+                    else:
+                        lam_pos.add(bos_off + enc_extra
+                                    + min(i1, len(needle) - 1))
+            rows.append({
+                "xt": xt, "prefix": lm_prefix, "resp": resp0,
+                "null": null_kind, "za": a, "zs": s, "t": t,
+                "hi_pos": edit_pos, "lam_pos": lam_pos,
+                "has_labels": True,
+                "span_lo": lo, "span_n": len(needle),
+                "enc_off": bos_off + enc_extra,
+            })
+            continue
+
         need_diff = (args.edit_only_loss or args.lam_sup_w > 0) and (
             null_kind is None
             or (null_kind == "mismatch" and args.mismatch_echo))
@@ -267,6 +335,7 @@ def build_batch(batch: Dict, rng: np.random.Generator, args, ctx) -> Dict:
             "null": null_kind, "za": a, "zs": s, "t": t,
             "hi_pos": hi_pos, "lam_pos": lam_pos,
             "has_labels": has_labels,
+            "span_lo": None, "span_n": 0, "enc_off": 0,
         })
     if not rows:
         return None
@@ -347,8 +416,14 @@ def ef_loss(model, it_model, hook, built: Dict, args, device: str,
     d = delta.shape[-1]
     add = torch.zeros(B, Tl, d, device=device, dtype=torch.float32)
     for i, r in enumerate(built["rows"]):
-        n = r["xt_len"]
-        add[i, :n] = delta[i, :n]                  # identity position map
+        if r.get("span_lo") is not None:           # repeat frame: src
+            lo, eo = r["span_lo"], r["enc_off"]    # span inside prompt
+            n = min(r["span_n"], delta.shape[1] - eo, Tl - lo)
+            if n > 0:
+                add[i, lo:lo + n] = delta[i, eo:eo + n]
+        else:
+            n = r["xt_len"]
+            add[i, :n] = delta[i, :n]              # bare: identity map
 
     hook.add = add
     try:
@@ -375,8 +450,12 @@ def ef_loss(model, it_model, hook, built: Dict, args, device: str,
 
     # rows whose delta must be SILENT: empty always; mismatch only when
     # the echo teacher is off (with echo, mismatch rows need a delta to
-    # render the reproduction).
-    silent = (empty | mm) if not args.mismatch_echo else empty
+    # render the reproduction). Under the repeat frame copying needs NO
+    # delta (the prompt does it), so mismatch is silent again.
+    if args.frame == "repeat":
+        silent = empty | mm
+    else:
+        silent = (empty | mm) if not args.mismatch_echo else empty
     active_m = (~silent).float()
 
     pos_norm = delta.norm(dim=-1)                  # (B, Te)
@@ -403,10 +482,13 @@ def ef_loss(model, it_model, hook, built: Dict, args, device: str,
         lam_t = built["lam_tgt"].to(device)
         lam_bce = F.binary_cross_entropy(
             lam.clamp(1e-6, 1 - 1e-6), lam_t, reduction="none")
-        # mismatch rows leave the BCE pool under the echo teacher (their
-        # lambda may fire to render the echo).
-        row_m = (~mm).float() if args.mismatch_echo \
-            else torch.ones_like(mm, dtype=torch.float32)
+        # mismatch rows leave the BCE pool under the BARE echo teacher
+        # (their lambda may fire to render the echo); under the repeat
+        # frame they are silent -> all-zero targets stay in the pool.
+        if args.frame == "repeat" or not args.mismatch_echo:
+            row_m = torch.ones_like(mm, dtype=torch.float32)
+        else:
+            row_m = (~mm).float()
         wmask = enc_m * row_m.unsqueeze(1)
         lam_bce = (lam_bce * wmask).sum() / wmask.sum().clamp_min(1.0)
         loss = loss + args.lam_sup_w * lam_bce
@@ -474,13 +556,16 @@ def main():
     nl_ids = it_tok("\n", add_special_tokens=False).input_ids
     assert len(nl_ids) == 1, f"newline splits into {nl_ids}"
     ctx = {
-        "d_sae": d_sae,
+        "d_sae": d_sae, "tok": tok, "it_tok": it_tok,
         "pad_id": tok.pad_token_id or 0,
         "it_pad": it_tok.pad_token_id or it_tok.eos_token_id,
         "bos_id": int(tok.bos_token_id),
         "nl_id": int(nl_ids[0]),
+        "eot_id": int(it_tok.convert_tokens_to_ids("<end_of_turn>")),
         "w_dec": w_dec.float(),
     }
+    if args.frame == "repeat":
+        print(f"[ef-lm] REPEAT frame: {REPEAT_PROMPT[:60]!r}...")
 
     lora_params = [p for n, p in model.named_parameters()
                    if "lora_" in n and p.requires_grad]
