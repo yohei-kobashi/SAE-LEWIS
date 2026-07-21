@@ -136,6 +136,10 @@ def parse_args():
                         "evaluated pair's own z_tgt−z_src — the pair "
                         "never contributes to its spec. sup direction is "
                         "the stored sign; --reverse-pairs flips it.")
+    p.add_argument("--fspec-scale", type=float, default=1.0,
+                   help="extra multiplier on the feature spec AFTER the "
+                        "norm-median rescale (input-side strength sweep; "
+                        "only meaningful with --feature-spec)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--llm-dtype", default="bfloat16")
     return p.parse_args()
@@ -394,6 +398,7 @@ def main():
                 v[int(fi)] = val
             if fs["mean_norm"] > 0:          # rescale to pool's per-pair
                 v = v * (fs["norm_median"] / fs["mean_norm"])
+            v = v * args.fspec_scale
             if args.reverse_pairs:           # spec stored sup (s1->s2)
                 v = -v
             za_t, zs_t = diff_intervention(
