@@ -47,4 +47,9 @@ run1 fspec_sw_in25  --fspec-scale 2.5
 run1 fspec_sw_out15 --ef-scale 1.5
 run1 fspec_sw_out25 --ef-scale 2.5
 
+# extension (2026-07-22): input-side monotone to 2.5x — find the peak
+run1 fspec_sw_in35 --fspec-scale 3.5
+run1 fspec_sw_in50 --fspec-scale 5.0
+
 echo "==================== FSPEC-SWEEP-DONE ===================="
+
