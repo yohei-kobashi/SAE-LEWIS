@@ -97,6 +97,20 @@ def parse_args():
                         "to prompt positions where the suppressed features "
                         "fire (reading preserved), while generated tokens are "
                         "always steered (writing). 'all' = original B3.")
+    p.add_argument("--fsets-enhance", action="store_true",
+                   help="AxBench-faithful ENHANCEMENT with --feature-sets: "
+                        "add each identified latent at its POOL max_act "
+                        "(--fsets-maxact), --clamp-values = their steering "
+                        "factors (h + factor*max_act*W_dec). Without this "
+                        "flag the historical suppress-only porting is used.")
+    p.add_argument("--fsets-maxact", default="",
+                   help="{phenomenon: {latent: max_act}} JSON from "
+                        "extract_pool_maxact.py (required by "
+                        "--fsets-enhance)")
+    p.add_argument("--pool-dev", default="",
+                   help="eval_split.json path; sample from the "
+                        "identification pool instead of the eval 500 "
+                        "(hyperparameter selection off the eval sample)")
     p.add_argument("--feature-sets", default="",
                    help="JSON {phenomenon: [[feature_id, score], ...]} — when "
                         "set, the spec is the paper-protocol one: suppress the "
@@ -251,6 +265,10 @@ def main():
         ds = ds.filter(lambda r: r["language"] == args.language)
     order = list(range(len(ds)))
     random.Random(args.seed).shuffle(order)
+    if args.pool_dev:
+        _ev = set(json.loads(Path(args.pool_dev).read_text())["eval_idx"])
+        order = [k for k in order if k not in _ev]
+        print(f"[b1] POOL-DEV mode: {len(order)}-pair pool (eval excluded)")
     chosen = order[:min(args.sample_size, len(order))]
     print(f"[b1] {len(ds)} pairs, sampling {len(chosen)}")
 
@@ -269,8 +287,15 @@ def main():
     if args.feature_sets:
         _raw = json.loads(Path(args.feature_sets).read_text())
         fsets = {ph: {int(f) for f, _ in lst} for ph, lst in _raw.items()}
+        mode_txt = "ENHANCE (AxBench factor*max_act)" if args.fsets_enhance \
+            else "suppress-only"
         print(f"[b1] paper-protocol spec: {len(fsets)} phenomena "
-              f"(TARGET-FREE, suppress-only)")
+              f"(TARGET-FREE, {mode_txt})")
+    fmax = None
+    if args.fsets_enhance:
+        if not args.fsets_maxact:
+            raise SystemExit("--fsets-enhance needs --fsets-maxact")
+        fmax = json.loads(Path(args.fsets_maxact).read_text())
 
     it_tok = AutoTokenizer.from_pretrained(args.it_model)
     it_model = AutoModelForCausalLM.from_pretrained(
@@ -400,17 +425,23 @@ def main():
         za_t, zs_t = diff_intervention(z_src, z_tgt, args.k_amp,
                                        args.k_sup)
         if fsets is not None:
-            # paper-protocol spec (pure): suppress the identified features,
-            # magnitudes from the SOURCE's GLOBAL pool — the edit-span pool
-            # is target-derived, and the whole point is target-free. Same
-            # construction verified in eval_clamp_readout.py.
             ident = fsets.get(ex.get("feature") or "?", set())
-            g_src = z_s.max(dim=0).values.float().cpu()
-            zs_t = torch.zeros_like(zs_t)
-            if ident:
-                ids_i = torch.tensor(sorted(ident), dtype=torch.long)
-                zs_t[ids_i] = g_src[ids_i]
             za_t = torch.zeros_like(za_t)
+            zs_t = torch.zeros_like(zs_t)
+            if args.fsets_enhance:
+                # AxBench-faithful: add identified latents at POOL max_act;
+                # the value sweep supplies their steering factors
+                mxd = fmax.get(ex.get("feature") or "?", {}) if fmax else {}
+                for fi in ident:
+                    za_t[fi] = float(mxd.get(str(fi), 0.0))
+            else:
+                # historical suppress-only porting: magnitudes from the
+                # SOURCE's GLOBAL pool (target-free; verified in
+                # eval_clamp_readout.py)
+                g_src = z_s.max(dim=0).values.float().cpu()
+                if ident:
+                    ids_i = torch.tensor(sorted(ident), dtype=torch.long)
+                    zs_t[ids_i] = g_src[ids_i]
         zvar = {"true": (za_t, zs_t),
                 "empty": (torch.zeros_like(za_t),
                           torch.zeros_like(zs_t)),
