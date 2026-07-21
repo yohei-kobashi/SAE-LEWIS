@@ -80,7 +80,7 @@
 | KL/NLL深さ(3層×3腕完成) | ef KL_red 0.695/0.778/0.597 — 全層で正かつ最大(steer L20 −0.207 逆効果、clamp L4 異常系) | 確定(04§3) |
 | FIC両フレーム(L12、4腕) | bare: ef **0.376**=SAE腕最高(steer 0.284・clamp 0.304; prompting 0.456はE_enh 0.886/E_abl 0.014の偏り)。復唱E_abl: ef **0.940**=4腕トップ。腕順位は両フレーム一致=デコード頑健 | 確定(04§5e) |
 | 復唱E_abl 全層×{40k,80k} | 全6セルで ef > steer。judge再判定ノイズ床 ≈1.5pt(steer同一出力の再判定で実測)。L20 80kの−12ptのみ明確な実差 | 確定(04§5e') |
-| Tier1 ablation(単一要因) | noS3(EF基盤なし)**0.0361 = −85%**(steer以下に崩壊)/ noctr(対照教師なし)0.2104 = −15%+empty λ-IoU 0.10→0.40(スペック特異性喪失)/ nobudget 学習中 | ②③確定(04§5b) |
+| Tier1 ablation(単一要因) | noS3(EF基盤なし)**0.0361 = −85%**(steer以下に崩壊)/ noctr(対照教師なし)0.2104 = −15%+empty λ-IoU 0.10→0.40(スペック特異性喪失)/ nobudget **L12 40k 0.3166=+27%で確定**(80k 0.2886で40k勝ち、L4/L20は予算あり優位の層依存) | 確定(04§5b) |
 | 4大分類別(L4 vs L12) | L12=統語0.253・意味0.307の本拠地。「浅層=形態統語」仮説はexact/FIC両指標で棄却。morphologyは全層最弱(サブワード要因示唆)。pragmaticsのみL4 80kが両指標で逆転(≈2SE) | 確定(04§5f) |
 | feature別(99現象) | exact>0が56現象、完全成功6(copular_be・past_tense・s_genitive等)。表=runs/tables/perfeature_ef_l12_combined.md | 確定 |
 | FRC同定のsplit-half安定性(99現象×20反復×3層) | FRC値は汎化(top-1 in 0.88-0.90→out 0.84-0.86)だが**top-1特徴のhalf間一致 36-43%・top-3で約50%** — 同定される特徴集合の同一性はデータ依存。LinguaLens原法は全ペアin-sample選択+同一データGPT-4o検証でこれを測れない(262k候補)。表=runs/tables/frc_splithalf_l{4,12,20}.md、詳細=audit_ll_axbench.md §5 | 確定 |
