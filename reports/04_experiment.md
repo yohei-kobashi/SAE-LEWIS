@@ -666,3 +666,21 @@ dev選択): L4=2.5 / L12=3.5 / L20=1.5(信号強度と逆相関 — 深層ほど
   と、彼ら流の「概念ごと最適」(tune-on-evalと明記)の両方を集計可能。
   sup方向のAxBench腕は彼らにablationプロトコルが無いため「src活性の
   抑制」という我々の移植であることを明記(fs_axb_l*のsup既存値を使用)。
+
+**amp方向の全腕監査(2026-07-22、ユーザー指示)**:
+- ✅ ef(feature-spec): 符号反転 v→−v — 正しい
+- ✅ steer(機構対応): 同specのdvecに連動 — 正しい
+- ✅ prompting: 指示動詞 remove→add + E_enh集計 — 正しい(床も別挙動)
+- 🔴 **LinguaLens clamp amp = 無発火バグ**(AxBenchと同型): fsets経路の
+  「src活性で抑制」はamp(src=現象なし側)で活性≈0。実証: L20 amp
+  true 0.1122 ≤ raw床 0.1202、random/reconと同値。修正 = 彼らの
+  enhancement(FRC-r3 latentをSET、force-insert)をclamp値5/10/20で
+  実行(clamp10=忠実値、clampZ=プールmax_act)→ fs_clampE_l*_amp。
+- 🔴 AxBench amp = 同バグ(§上記、fs_axbEで修正済み・実行中)。
+- ⚠️ **rewrite枠のamp raw床は0.1202と高い**(素のrewriterが対事実文を
+  自然な文に「直す」= 現象を自発復元するため)。rewrite枠ampセルは
+  net(true−raw/random)必須。復唱枠(ef/steer)のamp床はcopy≈0のまま
+  (randomのみ0.03-0.05に上昇)。
+- FIC judge: MORE/LESS両方向を集計済み(ampはE_enh列を読む — 既存
+  fic_judge_amp_l12の前例どおり)。KL/NLLのfeature-spec版は未実施
+  (別パス、旧oracle版ampは機構的に正しい)。
