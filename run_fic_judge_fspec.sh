@@ -19,11 +19,11 @@ git pull || true
 P=runs/prod_gemma_v6
 CELLS=(
   "fs_probe_l4       fs_clamp_l4       -                fic_fs_l4"
-  "fs_probe_l4_amp   fs_clamp_l4_amp   -                fic_fs_l4_amp"
+  "fs_probe_l4_amp   fs_clampE_l4_amp  -                fic_fs_l4_amp"
   "fs_probe_l12      fs_clamp_l12      a3prime_edit     fic_fs_l12"
-  "fs_probe_l12_amp  fs_clamp_l12_amp  amp_a3prime_l12  fic_fs_l12_amp"
+  "fs_probe_l12_amp  fs_clampE_l12_amp amp_a3prime_l12  fic_fs_l12_amp"
   "fs_probe_l20      fs_clamp_l20      -                fic_fs_l20"
-  "fs_probe_l20_amp  fs_clamp_l20_amp  -                fic_fs_l20_amp"
+  "fs_probe_l20_amp  fs_clampE_l20_amp -                fic_fs_l20_amp"
 )
 
 while true; do
