@@ -128,6 +128,29 @@ ef true 0.0601 < 同枠steer 0.1343(λ-IoU分離も甘い 0.42/0.36)。
     する先行研究は無い(ReFT系はそもそも持たない)ため、**「除去が良い」
     ではなく「持たないのが標準で、持つコストを我々が実測した」**と表現
     すること。
+  - **予算を「入れる」側の先行研究(逐語確認済み 2026-07-21)— 当初設計の
+    根拠として引用可能**:
+    (c) **LEACE**(Belrose+, NeurIPS 2023)— 表現への介入は最小摂動で
+    行うべしという系譜の代表。目的関数そのものが摂動ノルム最小化:
+    "argmin E[‖PX−X‖²_M] subject to Cov(PX,Z)=0"、動機は "we'd like to
+    make a 'small' edit to X so that useful information contained in X is
+    maximally preserved"。大きな編集の巻き添え損害(INLP比のperplexity
+    悪化)も実測している。
+    (d) **Householder Pseudo-Rotation**(Pham & Nguyen, EMNLP 2024)—
+    活性ノルムの一貫性を壊す加算編集への直接警告: "If the scaling factor
+    is too large, the additive edit might drastically alter the activation
+    norms in each layer, violating the norm consistency property of LLMs.
+    In extreme cases, this change can lead to the generation of complete
+    gibberish"。同時に「ノルムを守ると編集力が落ちる」ジレンマも明言
+    ("If the scaling factor is set too low ... limited abilities to
+    shift an activation")。
+    → **論文の枠組み**: ノルム予算は(c)(d)の「最小摂動・ノルム一貫性」系譜
+    に基づく設計であり、(a)(b)の「タスク損失に委ねる」系譜と対立する。
+    我々のablationはこの対立に**編集タスクでの実測**を与える: L12では
+    HPRの言うジレンマの「編集力側」が支配的(予算の税−27%)、L4/L20
+    (40k)では「一貫性側」が支配的(予算が保護、−15%/−24%)— つまり
+    **どちらの系譜が正しいかは層(信号強度)依存**、という新しい知見に
+    昇格できる。
   - **⚠️ 層依存性(2026-07-21夜、L4/L20のnb 40k完了で判明)**: nobudget
     40kは **L4 0.1142(予算あり0.1343より−15%)/ L20 0.0321(0.0421
     より−24%)** — 予算除去の利得はL12(+27%)に特異的で、浅層・深層
