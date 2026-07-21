@@ -1,5 +1,12 @@
 # reports/ — 論文執筆用資料(日本語執筆の下敷き)
 
+> **📛 名称(2026-07-22ユーザー確定)**: リポジトリ名 = **SAE-EditFlow**
+> (旧SAE-LEWIS)。手法名は固有名詞を使わず記述的に
+> **「SAE-conditioned edit-flow intervention」**(SAEスペック条件付き
+> edit-flow介入)と書く。旧称Intervener・SAE-LEWISは本文で使わない
+> (LinguaLens公式コードのIntervenerクラスと衝突するため)。
+> 比較先SpecEdit(拡散画像編集)とは無関係 — 名前検討の経緯のみ。
+
 作成 2026-07-17。**2026-07-18 ユーザー再固定を反映**:
 
 > 🔶 **研究の大前提**: SAEへのintervention(仕様 z_amp/z_sup)を信号として

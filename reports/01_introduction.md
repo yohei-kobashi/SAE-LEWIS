@@ -96,7 +96,7 @@ steering(SAE/SAE-A)の忠実再現、および相互評価(彼らのプロトコ
 editorが提案物の中心になったため旧タイトル案(評価枠組み単独)は要改訂。
 方向性: SAE仕様に条件付けられた介入生成(editor)+編集による因果検証を
 両方含む題。例:
-1. *SAE-LEWIS: Rendering SAE Interventions as Residual-Stream Edits with
+1. *SAE-EditFlow: Rendering SAE Interventions as Residual-Stream Edits with
    a Learned Editor*
 2. *Edit to Verify: A Learned Intervention Generator for Causally
    Validating SAE Activations by Minimal-Pair Editing*
