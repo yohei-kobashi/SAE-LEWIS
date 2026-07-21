@@ -1,5 +1,16 @@
 # 提案手法(ef)のfeature別 exact / FIC — LinguaLens-Data(L12 v5f、2026-07-21)
 
+## 4大分類(categories)別の集計 — 提案手法 ef(L12 v5f)
+
+featureは複数分類に属しうる(重複計上)。exactはペア重み付き平均、FICはfeature平均。
+
+| category | features | pairs | exact(true) | exact(random) | 復唱E_abl | bare FIC |
+|---|---|---|---|---|---|---|
+| morphology | 20 | 104 | 0.154 | 0.010 | 0.954 | 0.365 |
+| syntax | 48 | 229 | 0.253 | 0.000 | 0.988 | 0.384 |
+| semantics | 43 | 212 | 0.307 | 0.000 | 0.925 | 0.391 |
+| pragmatics | 29 | 158 | 0.253 | 0.000 | 0.909 | 0.395 |
+
 exact: probe500(復唱枠greedy、true条件、featureあたり平均~5ペア)。
 FIC(復唱枠): 同probe生成のE_abl(方向は全てablation)。FIC(bare枠): v4での本来プロトコル(2方向、FIC=調和平均)。
 featureあたりn≈5のため個別値の刻みは粗い(0.2刻み)。腕レベルの結論は§5e参照。
