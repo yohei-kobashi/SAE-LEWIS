@@ -83,6 +83,10 @@ def parse_args():
     p.add_argument("--sae-type", default="jumprelu")
     p.add_argument("--sae-k", type=int, default=None)
     p.add_argument("--dataset", default="THU-KEG/LinguaLens-Data")
+    p.add_argument("--reverse-pairs", action="store_true",
+                   help="amp direction (user 2026-07-21: 全評価軸でamp/sup両方): "
+                        "src=sentence2 (feature absent) -> tgt=sentence1 "
+                        "(feature present); the edit ADDS the phenomenon")
     p.add_argument("--language", default="English")
     p.add_argument("--sample-size", type=int, default=500)
     p.add_argument("--seed", type=int, default=42)
@@ -340,6 +344,8 @@ def main():
             continue
         ex = ds[int(k)]
         src, tgt = ex["sentence1"], ex["sentence2"]
+        if args.reverse_pairs:
+            src, tgt = tgt, src
         src_ids = tokenizer(src, add_special_tokens=True).input_ids
         tgt_ids = tokenizer(tgt, add_special_tokens=True).input_ids
         slots = align_pair(src_ids, tgt_ids)
@@ -442,8 +448,9 @@ def main():
                     # prompting ceiling on our task. s1->s2 removes the
                     # feature (dataset convention), hence "remove".
                     feat = (ex.get("feature") or "").replace("_", " ")
+                    verb = "add" if args.reverse_pairs else "remove"
                     if c == "true":
-                        instr = (f"Rewrite the input sentence to remove "
+                        instr = (f"Rewrite the input sentence to {verb} "
                                  f"any {feat}. Output only the rewritten "
                                  f"sentence.")
                     elif c == "random":
@@ -451,7 +458,7 @@ def main():
                                   f2.replace('_', ' ') != feat] \
                             if a3 else ["metaphor"]
                         rf2 = others[int(prng.integers(0, len(others)))]
-                        instr = (f"Rewrite the input sentence to remove "
+                        instr = (f"Rewrite the input sentence to {verb} "
                                  f"any {rf2.replace('_', ' ')}. Output "
                                  f"only the rewritten sentence.")
                     else:
@@ -474,13 +481,14 @@ def main():
                     extra = {}
                 elif arm == "prompting":
                     feat = ex.get("feature") or ""
+                    dkey = "enh" if args.reverse_pairs else "abl"
                     if c == "true":
-                        sp = a3.get(feat, {}).get("abl", "")
+                        sp = a3.get(feat, {}).get(dkey, "")
                     elif c == "random":
                         others = [f2 for f2 in sorted(a3)
                                   if f2 != feat]
                         sp = a3[others[int(prng.integers(
-                            0, len(others)))]]["abl"]
+                            0, len(others)))]][dkey]
                     else:                          # empty
                         sp = ""
                     content = ((sp + "\n\nQuestion: " + src)

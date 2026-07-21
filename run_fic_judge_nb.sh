@@ -40,8 +40,25 @@ while true; do
             done_n=$((done_n+1))
         fi
     done
-    echo "[fic-nb] complete runs: $done_n / ${#PAIRS[@]}"
-    if [ "$done_n" -eq "${#PAIRS[@]}" ]; then
+    # amp-direction FIC (repeat frame): ef+steer from amp_probe_l12_nb,
+    # clamp10 from amp_clamp_l12, prompting from amp_a3prime_l12
+    amp_ok=0
+    if [ -f $P/amp_probe_l12_nb/records.jsonl ]; then
+        echo "==== judging amp-direction (L12) ===="
+        if python scripts/eval_fic_judge.py \
+              --repeat-probe500 $P/amp_probe_l12_nb/records.jsonl \
+              ${P:+$([ -f $P/amp_clamp_l12/records.jsonl ] && echo --repeat-clamp $P/amp_clamp_l12/records.jsonl)} \
+              $([ -f $P/amp_a3prime_l12/records.jsonl ] && echo --repeat-a3 $P/amp_a3prime_l12/records.jsonl) \
+              --dir-map runs/tables/lingualens_dirmap_en.json \
+              --output-dir $P/fic_judge_amp_l12 | tee /tmp/ficnb_amp.log \
+           && grep -q "FIC-JUDGE-DONE" /tmp/ficnb_amp.log \
+           && [ -f $P/amp_clamp_l12/records.jsonl ] \
+           && [ -f $P/amp_a3prime_l12/records.jsonl ]; then
+            amp_ok=1
+        fi
+    fi
+    echo "[fic-nb] complete runs: $done_n / ${#PAIRS[@]}, amp_ok=$amp_ok"
+    if [ "$done_n" -eq "${#PAIRS[@]}" ] && [ "$amp_ok" -eq 1 ]; then
         echo "==================== FIC-NB-ALL-DONE ===================="
         break
     fi

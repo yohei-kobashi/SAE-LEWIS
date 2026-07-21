@@ -49,6 +49,10 @@ E80=$(exact_of $P/eflm_l12_v5f_nobudget_80k/probe500/report.md)
 W=$(python3 -c "print(80000 if float('$E80') > float('$E40') else 40000)")
 echo "NB winner: steps=$W (40k=$E40, 80k=$E80)"
 
+# ---- S2b: amp-direction probes, all axes at L12 (user 2026-07-21:
+# ---- 全評価軸でamp/sup両方; cheap ~2.5h, runs before the long ablations)
+bash run_amp_probes.sh
+
 # ---- S3: noS3 under nobudget (two-phase mirrors the champion) ----------
 if [ ! -f $P/eflm_l12_nb_noS3/probe500/report.md ]; then
     LAYER=12 FRAME=repeat EDIT_ONLY=1 LAM_SUP=0.2 \

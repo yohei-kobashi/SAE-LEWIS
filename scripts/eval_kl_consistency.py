@@ -58,6 +58,9 @@ def parse_args():
     p.add_argument("--sae-path", required=True)
     p.add_argument("--sae-layer", type=int, required=True)
     p.add_argument("--dataset", default="THU-KEG/LinguaLens-Data")
+    p.add_argument("--reverse-pairs", action="store_true",
+                   help="amp direction: src=sentence2 -> tgt=sentence1 "
+                        "(the edit ADDS the phenomenon)")
     p.add_argument("--language", default="English")
     p.add_argument("--sample-size", type=int, default=500)
     p.add_argument("--seed", type=int, default=42)
@@ -175,6 +178,8 @@ def main():
     for step_i, k in enumerate(chosen):
         ex = ds[int(k)]
         src, tgt = ex["sentence1"], ex["sentence2"]
+        if args.reverse_pairs:
+            src, tgt = tgt, src
         src_ids = tokenizer(src, add_special_tokens=True).input_ids
         tgt_ids = tokenizer(tgt, add_special_tokens=True).input_ids
         if len(slot_ops(align_pair(src_ids, tgt_ids))) == 0:
