@@ -66,6 +66,10 @@
    「言語minimal pairの因果介入評価は初」(CausalGym先行 — 差分は評価器
    [挙動→テキスト編集]と対象[学習特徴化→SAE latent])。
 5. 単位は「言語現象」、編集は「最小対変換(minimal-pair transformation)」。
+5'. **方向の用語はLinguaLens準拠(2026-07-22確定)**: 足す=enhancement、
+   消す=ablation(§3.3逐語 "In the ablation experiment, we set the target
+   feature's activation to 0, and in the enhancement experiment, we set
+   it to 10.")。amp/supはコード内部の略記であり本文・スライドでは使わない。
 6. LinguaLensのFRCは論文とコードで定義が違う(条件付き vs 周辺)—
    我々はコード側に忠実、と1文明記。
 
