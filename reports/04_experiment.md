@@ -854,5 +854,27 @@ L12 sup・targeted条件のLESS判定(FIC成功)をjudgeキャッシュ×records
 「pool内の同featureペアの平均で増強する」(ToDo③のLinguaLens-Data活用)
 へ引き継ぐのが妥当。
 
-**未了**: fssamp集計済み。壊れ文除外版FIC(steer割引の定量)、
-絞り込み×4分類の内訳表(k-curve recordsから集計可)。
+### 9k. 統合FIC(2026-07-22、ユーザー指摘で計算 — App. E.2の
+調和平均統合。これまでの報告値は方向別成分E_abl/E_enhだった)
+
+| arm | L4 | L12 | L20 |
+|---|---|---|---|
+| ef | **0.546** | 0.463 | 0.124 |
+| steer(較正済・同spec) | 0.300 | **0.569** | 0.307 |
+| prompting(層共通) | — | 0.410 | — |
+| LinguaLens準拠clamp | 0.072 | 0.045 | 0.058 |
+| AxBench準拠 | 判定中 | 0.116(部分) | 判定中 |
+
+- **L12の統合FICはsteer 0.569 > ef 0.463**: 調和平均がefのenhancement
+  弱さ(0.308 vs steerの0.347)を強く罰するため。L4はef 0.546が全arm
+  最良。ablation成分ではefが全層最良(0.85-0.94)である事実は不変。
+- → 論文の主張の書き方: 「ablationの因果効果はefが圧倒、統合FICは
+  enhancementの弱さに律速されL12でsteerに逆転される」— 実行中の
+  enhancement改善(B/A)が統合FICの回復に直結する構図。
+- 注意: 両方向が揃うfeature数がarmごとに異なる(61-91)— NaN方向を
+  持つfeatureは統合から除外される。表: runs/tables/fic_fs_integrated.md、
+  スクリプト: scripts/combine_fic.py(steerは較正済キャッシュのみ使用)。
+
+**未了**: 壊れ文除外版FIC(steer割引の定量 — 統合FICのsteer値にも
+19%の壊れ文得点が乗っている点は割引側の材料)、絞り込み×4分類内訳、
+AxBench FICの完成(ficaxb実行中)。
