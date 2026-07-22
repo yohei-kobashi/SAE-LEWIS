@@ -27,6 +27,7 @@
 | ファイル | 対応する章 | 内容 |
 |---|---|---|
 | `01_introduction.md` | Introduction | 動機、主張、貢献リスト、冒頭数値、タイトル案 |
+| `abstract_aaai.md` | Abstract | AAAI提出用(日本語版+英語骨子+数値アンカー、feature-spec値のみ) |
 | `02_previous_works.md` | Related Work | 冒頭の改訂ガイドに従って読む(embedding出力editorの復帰でD.3の一部が再関連) |
 | `03_method.md` | Method | **提案editor(Intervener)**、仕様構築、ベースライン効果器、統制、指標、局在性測定器、判別木、再現 |
 | `04_experiment.md` | Experiments | 確定数値の表(トークン出力EFなし)、統計、Intervener欄は学習完了待ち |
