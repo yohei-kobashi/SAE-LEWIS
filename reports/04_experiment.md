@@ -863,7 +863,7 @@ L12 sup・targeted条件のLESS判定(FIC成功)をjudgeキャッシュ×records
 | steer(較正済・同spec) | 0.300 | **0.569** | 0.307 |
 | prompting(層共通) | — | 0.410 | — |
 | LinguaLens準拠clamp | 0.072 | 0.045 | 0.058 |
-| AxBench準拠 | E_abl 0.202 / enh再判定中 | 0.116(E_enh −0.060 / E_abl −0.006) | E_abl −0.021 / enh再判定中 |
+| AxBench準拠 | 0.165(E_enh −0.028 / E_abl 0.202) | 0.116(−0.060 / −0.006) | 0.105(−0.068 / −0.021) |
 
 - **L12の統合FICはsteer 0.569 > ef 0.463**: 調和平均がefのenhancement
   弱さ(0.308 vs steerの0.347)を強く罰するため。L4はef 0.546が全arm
@@ -899,5 +899,11 @@ L12 sup・targeted条件のLESS判定(FIC成功)をjudgeキャッシュ×records
   キュー)。E_enh改善が確認されれば統合FICのL12逆転(steer 0.569 >
   ef 0.463)の解消が見込み。
 
-**未了**: 壊れ文除外版FIC、絞り込み×4分類内訳、AxBench FIC完成、
-検索specのsup評価とFIC判定。
+- **AxBench FIC確定(2026-07-22)**: enhancementは全層で負(−0.03〜
+  −0.07)= 因果効果なし。ablationはL4のみ0.202の弱い効果。統合FICの
+  見かけの正値(0.11-0.17)はw=0.5ペナルティの床効果で、実効果は
+  LinguaLens準拠と同水準の「ほぼゼロ」。amp判定キーはrandom記録に
+  合わせsteer0.6(true側も同係数で統一、値はdev選択とほぼ同等)。
+
+**未了**: 壊れ文除外版FIC、絞り込み×4分類内訳、検索specの
+FIC判定・L4/L20展開(採用判断待ち)。
