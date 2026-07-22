@@ -32,7 +32,7 @@ SC=$(cat $P/fs_scale_l12.txt)
 for R in 1 2 3 4 5; do
   for DIRX in "" "_amp"; do
     OUT=$P/fs_tmp1_l12_r${R}${DIRX}
-    EXTRA=$([ -n "$DIRX" ] && echo --reverse-pairs)
+    if [ -n "$DIRX" ]; then EXTRA=--reverse-pairs; else EXTRA=""; fi
     if [ ! -f $OUT/report.md ]; then
         python scripts/eval_ef_bare.py \
             --frame repeat --feature-spec $FS/l12_spec.json \
