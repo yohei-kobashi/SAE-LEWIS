@@ -875,6 +875,27 @@ L12 sup・targeted条件のLESS判定(FIC成功)をjudgeキャッシュ×records
   持つfeatureは統合から除外される。表: runs/tables/fic_fs_integrated.md、
   スクリプト: scripts/combine_fic.py(steerは較正済キャッシュのみ使用)。
 
-**未了**: 壊れ文除外版FIC(steer割引の定量 — 統合FICのsteer値にも
-19%の壊れ文得点が乗っている点は割引側の材料)、絞り込み×4分類内訳、
-AxBench FICの完成(ficaxb実行中)。
+### 9l. enhancement改善B→A→C(2026-07-22、L12)
+
+| 構成 | true | random | net | 基準比(net) |
+|---|---|---|---|---|
+| 基準(平均spec、supスケール3.5流用) | 0.1483 | 0.0541 | 0.0942 | — |
+| B: amp専用スケール2.5 | 0.1443 | 0.0461 | 0.0982 | +4% |
+| **A: 検索spec(m=5、スケール2.5)** | **0.1523** | 0.0421 | **0.1102** | **+17%** |
+| C: amp成分集中(devのみ) | dev 0.23 | — | — | Aに劣後 |
+
+- **Aが勝ち**: dev(m1 0.24 / m5 0.27 / m15 0.22 — 平均spec devは0.22)
+  でもevalでも一貫。評価srcに似たプールペアのdeltaを使うことで
+  「どの語で現象を実現するか」の情報が回復し、randomも低下(特異性が
+  むしろ改善)する — srcゲート(①)と違い再スケールの副作用がない。
+- B単独は誤差内。Cは不採用。
+- **supへの適用は保留**: dev supで検索spec 0.150 と、平均specよりやや
+  低い可能性 — sup評価500で確認中(fs_retr_l12)。方向別採用
+  (enhancement=検索 / ablation=平均)は「足す編集は語彙実現の事例
+  適応が要る/消す編集は対象が文中に既にある」という機序で正当化可能。
+- 統合FICへの反映は fs_ampA_l12_amp のFIC判定後(prepost、ficaxb完了後に
+  キュー)。E_enh改善が確認されれば統合FICのL12逆転(steer 0.569 >
+  ef 0.463)の解消が見込み。
+
+**未了**: 壊れ文除外版FIC、絞り込み×4分類内訳、AxBench FIC完成、
+検索specのsup評価とFIC判定。
