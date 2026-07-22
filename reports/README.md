@@ -131,6 +131,9 @@
   0.0862 > AUROC-r1 0.0701 > FRC-r3 0.0160、prompting 0.1804が最強arm。
   efのcopy 0.597=発火不足 → 強度掃引fssweep実行中
 - FIC再評価(新プロトコル・全層)— パイロット通過後に生成→prepost判定を再開
+- **📋 予約(最終手法確定後)**: ベースライン2腕(LinguaLens準拠・AxBench準拠)を
+  復唱枠に統一し、介入強度をAxBench流にプールdevで選択(LLのclamp10固定を
+  廃止)— 04§9n。exact+FICを3層×両方向で再測定
 - k掃引feature別表(S8のperfeature_ksweep)— キュー末尾で自動生成
 - 主表の学習量の判断(40k/80k/層別)は新プロトコル数値が出てから再検討
 - LinguaLensとの差別化の検討(ユーザー、後日)
