@@ -136,6 +136,17 @@ def parse_args():
                         "evaluated pair's own z_tgt−z_src — the pair "
                         "never contributes to its spec. sup direction is "
                         "the stored sign; --reverse-pairs flips it.")
+    p.add_argument("--fspec-retrieve", default="",
+                   help="improvement A (2026-07-22): retrieval table JSON "
+                        "(build_retrieval_table.py). Replaces the pool-MEAN "
+                        "spec with the mean of the --retrieve-m pool pairs "
+                        "whose SOURCE side is most similar (SAE max-act "
+                        "cosine) to the eval src — input-only adaptation.")
+    p.add_argument("--retrieve-m", type=int, default=5)
+    p.add_argument("--amp-only", action="store_true",
+                   help="improvement C: after direction resolution keep "
+                        "only the additive (v>0) components and renorm — "
+                        "concentrates the budget on the insertion drive.")
     p.add_argument("--src-gate", action="store_true",
                    help="improvement ① (2026-07-22): per-instance gating "
                         "of the feature spec by the SOURCE's own SAE "
@@ -283,6 +294,11 @@ def main():
         fspec = json.loads(Path(args.feature_spec).read_text())
         print(f"[efbare] FEATURE-SPEC mode: {len(fspec)} features from "
               f"{args.feature_spec} (pair-independent interventions)")
+    rtab = None
+    if args.fspec_retrieve:
+        rtab = json.loads(Path(args.fspec_retrieve).read_text())
+        print(f"[efbare] RETRIEVAL spec: {len(rtab)} features, "
+              f"m={args.retrieve_m}")
 
     a3 = None
     if "prompting" in arms or "prompting_edit" in arms:
@@ -424,18 +440,44 @@ def main():
             fs = fspec.get(ex.get("feature") or "?")
             if fs is None:
                 continue                     # feature absent from pool
-            v = torch.zeros_like(z_src)
-            for fi, val in fs["spec"].items():
-                v[int(fi)] = val
+            if rtab is not None:
+                ent = rtab.get(ex.get("feature") or "?")
+                if ent is None:
+                    continue
+                g_r = z_s.max(dim=0).values.float().cpu()
+                if blk is not None:
+                    g_r[blk] = 0.0
+                side = "m2" if args.reverse_pairs else "m1"
+                sims = []
+                for pp in ent:
+                    num = sum(float(g_r[int(i)]) * val
+                              for i, val in pp[side].items())
+                    den = (sum(val * val for val in pp[side].values())
+                           ** 0.5) + 1e-9
+                    sims.append(num / den)
+                order2 = sorted(range(len(sims)), key=lambda i: -sims[i])
+                top = order2[:max(1, min(args.retrieve_m, len(order2)))]
+                v = torch.zeros_like(z_src)
+                for i in top:
+                    for fi, val in ent[i]["d"].items():
+                        v[int(fi)] += val
+                v = v / len(top)
+            else:
+                v = torch.zeros_like(z_src)
+                for fi, val in fs["spec"].items():
+                    v[int(fi)] = val
             if args.reverse_pairs:           # spec stored sup (s1->s2)
                 v = -v
+            if args.amp_only:
+                v = torch.clamp(v, min=0.0)
             if args.src_gate:
                 g_src = z_s.max(dim=0).values.float().cpu()
                 if blk is not None:
                     g_src[blk] = 0.0
                 dead = (v < 0) & (g_src <= 0)
                 v[dead] = 0.0
-                nrm = float(v.norm())
+            if args.src_gate or args.amp_only or rtab is not None:
+                nrm = float(v.norm())        # dynamic renorm paths
                 if nrm > 0:
                     v = v * (fs["norm_median"] / nrm)
             elif fs["mean_norm"] > 0:        # rescale to pool's per-pair
