@@ -55,7 +55,7 @@ LESS prominently, or about the SAME? Answer with exactly one word: MORE, \
 LESS, or SAME."""
 
 BARE_ARMS = ("ef", "steer", "clamp", "prompting")
-REPEAT_ARMS = ("ef", "steer", "clamp", "prompting")
+REPEAT_ARMS = ("ef", "steer", "clamp", "prompting", "axbench")
 
 
 def parse_args():
@@ -64,6 +64,12 @@ def parse_args():
     p.add_argument("--repeat-probe500", default="")
     p.add_argument("--repeat-clamp", default="")
     p.add_argument("--repeat-a3", default="")
+    p.add_argument("--repeat-axb", default="",
+                   help="AxBench-arm records (eval_clamp_baseline steer "
+                        "runs, e.g. fs_axb_l12 or fs_axbE_l12_amp)")
+    p.add_argument("--axb-key", default="steer1",
+                   help="outputs mode key for the AxBench arm (the "
+                        "dev-selected factor, e.g. steer1 / steer0.6)")
     p.add_argument("--dataset", default="THU-KEG/LinguaLens-Data")
     p.add_argument("--language", default="English")
     p.add_argument("--dir-map", default="runs/tables/lingualens_dirmap_en.json",
@@ -138,6 +144,8 @@ def collect_trials(args):
                  if args.repeat_clamp else {})
         a3 = ({int(r["idx"]): r for r in load_jsonl(args.repeat_a3)}
               if args.repeat_a3 else {})
+        axb = ({int(r["idx"]): r for r in load_jsonl(args.repeat_axb)}
+               if args.repeat_axb else {})
         n0 = len(trials)
         n_nodir = n_noref = 0
         for r in base:
@@ -156,7 +164,8 @@ def collect_trials(args):
                 for arm, src_rec, key in (
                         ("ef", r, "ef"), ("steer", r, "steer"),
                         ("clamp", clamp.get(idx), "clamp10"),
-                        ("prompting", a3.get(idx), "prompting_edit")):
+                        ("prompting", a3.get(idx), "prompting_edit"),
+                        ("axbench", axb.get(idx), args.axb_key)):
                     if src_rec is None:
                         continue
                     txt = (src_rec["outputs"].get(cond_rec, {})
