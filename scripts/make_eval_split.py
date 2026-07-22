@@ -27,6 +27,11 @@ def parse_args():
     p.add_argument("--language", default="English")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sample-size", type=int, default=500)
+    p.add_argument("--dev-size", type=int, default=500,
+                   help="v2 (2026-07-22): a disjoint dev set for ALL "
+                        "hyperparameter selection — the next dev-size "
+                        "indices of the SAME shuffle after the eval "
+                        "prefix. train = the rest (identification only).")
     return p.parse_args()
 
 
@@ -40,6 +45,8 @@ def main():
     order = list(range(n))
     random.Random(args.seed).shuffle(order)
     eval_idx = sorted(order[: min(args.sample_size, n)])
+    dev_idx = sorted(order[args.sample_size:
+                           args.sample_size + args.dev_size])
     per_feat = {}
     for i in eval_idx:
         f = ds[int(i)]["feature"] or "?"
@@ -51,15 +58,19 @@ def main():
         "recipe": f"random.Random({args.seed}).shuffle(range(n))"
                   f"[:{args.sample_size}] — identical to every exact eval",
         "eval_idx": eval_idx,
+        "dev_idx": dev_idx,
         "n_eval": len(eval_idx),
+        "n_dev": len(dev_idx),
         "n_pool": n - len(eval_idx),
+        "n_train": n - len(eval_idx) - len(dev_idx),
         "eval_per_feature": dict(sorted(per_feat.items())),
     }
     p = Path(args.out)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(out))
-    print(f"[split] {n} pairs -> eval {len(eval_idx)} / "
-          f"pool {n - len(eval_idx)}; wrote {p}")
+    print(f"[split] {n} pairs -> test {len(eval_idx)} / dev "
+          f"{len(dev_idx)} / train {n - len(eval_idx) - len(dev_idx)}; "
+          f"wrote {p}")
 
 
 if __name__ == "__main__":
