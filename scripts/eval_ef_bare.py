@@ -136,6 +136,14 @@ def parse_args():
                         "evaluated pair's own z_tgt−z_src — the pair "
                         "never contributes to its spec. sup direction is "
                         "the stored sign; --reverse-pairs flips it.")
+    p.add_argument("--src-gate", action="store_true",
+                   help="improvement ① (2026-07-22): per-instance gating "
+                        "of the feature spec by the SOURCE's own SAE "
+                        "activations (input-only — no target peeking). "
+                        "Suppress-side components (v<0 after direction "
+                        "resolution) are kept only where the feature "
+                        "actually fires in src; the rescale then uses the "
+                        "gated vector's norm.")
     p.add_argument("--fspec-scale", type=float, default=1.0,
                    help="extra multiplier on the feature spec AFTER the "
                         "norm-median rescale (input-side strength sweep; "
@@ -419,11 +427,20 @@ def main():
             v = torch.zeros_like(z_src)
             for fi, val in fs["spec"].items():
                 v[int(fi)] = val
-            if fs["mean_norm"] > 0:          # rescale to pool's per-pair
-                v = v * (fs["norm_median"] / fs["mean_norm"])
-            v = v * args.fspec_scale
             if args.reverse_pairs:           # spec stored sup (s1->s2)
                 v = -v
+            if args.src_gate:
+                g_src = z_s.max(dim=0).values.float().cpu()
+                if blk is not None:
+                    g_src[blk] = 0.0
+                dead = (v < 0) & (g_src <= 0)
+                v[dead] = 0.0
+                nrm = float(v.norm())
+                if nrm > 0:
+                    v = v * (fs["norm_median"] / nrm)
+            elif fs["mean_norm"] > 0:        # rescale to pool's per-pair
+                v = v * (fs["norm_median"] / fs["mean_norm"])
+            v = v * args.fspec_scale
             za_t, zs_t = diff_intervention(
                 torch.zeros_like(v), v, args.k_amp, args.k_sup)
         else:
