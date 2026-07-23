@@ -34,8 +34,8 @@ case "$LAYER" in
 esac
 
 LLM2VEC=runs/mcgill_gemma_repro_3k/final
-CACHE=runs/prod_gemma_v4/corruption_z_l$LAYER
-DEV=runs/prod_gemma_v4/corruption_seldev_z_l$LAYER
+CACHE=${CACHE_DIR:-runs/prod_gemma_v4/corruption_z_l$LAYER}
+DEV=${DEV_DIR:-runs/prod_gemma_v4/corruption_seldev_z_l$LAYER}
 OUT=runs/prod_gemma_v6/eflm_l$LAYER${OUT_SUFFIX:-}
 MAX_STEPS=${MAX_STEPS:-40000}
 
