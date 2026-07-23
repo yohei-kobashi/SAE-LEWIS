@@ -4,7 +4,7 @@
 #PBS -q short-g
 #PBS -l select=1
 #PBS -l walltime=0:30:00
-#PBS -W group_list=go25
+#PBS -W group_list=gj26
 #PBS -j oe
 
 # One-shot debug for the AxBench L20 all-zero judge result: no-hook

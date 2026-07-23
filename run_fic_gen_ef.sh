@@ -4,7 +4,7 @@
 #PBS -q short-g
 #PBS -l select=1
 #PBS -l walltime=8:00:00
-#PBS -W group_list=go25
+#PBS -W group_list=gj26
 #PBS -j oe
 
 # FIC generation, ef arm only, BARE frame (user 2026-07-21: ②missing

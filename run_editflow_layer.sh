@@ -4,7 +4,7 @@
 #PBS -q short-g
 #PBS -l select=1
 #PBS -l walltime=8:00:00
-#PBS -W group_list=go25
+#PBS -W group_list=gj26
 #PBS -j oe
 
 # Layer-native EF foundation (user decision 2026-07-20: L4/L20 must be
