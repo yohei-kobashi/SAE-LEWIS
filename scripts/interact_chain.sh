@@ -51,10 +51,10 @@ for i in $(seq 1 80); do
     done
     sleep 15
     printf '%s\n' "$CMD"
-    sleep 8000            # keeps stdin open; killed as soon as ssh exits
+    sleep "${CHAIN_HOLD:-8000}"   # > walltime; killed as soon as ssh exits
   ) > "$FIFO" &
   W=$!
-  msshc -tt 'qsub -I -l select=1 -W group_list=go25 -q interact-g' \
+  msshc -tt "qsub -I -l select=1 -W group_list=go25 -q ${CHAIN_QUEUE:-interact-g}" \
       < "$FIFO" > "$A" 2>&1
   kill "$W" 2>/dev/null; wait "$W" 2>/dev/null
   rm -f "$FIFO"
