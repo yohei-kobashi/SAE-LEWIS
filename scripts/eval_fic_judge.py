@@ -67,6 +67,10 @@ def parse_args():
     p.add_argument("--repeat-axb", default="",
                    help="AxBench-arm records (eval_clamp_baseline steer "
                         "runs, e.g. fs_axb_l12 or fs_axbE_l12_amp)")
+    p.add_argument("--clamp-key", default="clamp10",
+                   help="outputs mode key for the clamp arm (rewrite-era "
+                        "records: clamp10; repeat-frame bl records: "
+                        "clampset)")
     p.add_argument("--axb-key", default="steer1",
                    help="outputs mode key for the AxBench arm (the "
                         "dev-selected factor, e.g. steer1 / steer0.6)")
@@ -163,7 +167,7 @@ def collect_trials(args):
                                    ("random", "random")):
                 for arm, src_rec, key in (
                         ("ef", r, "ef"), ("steer", r, "steer"),
-                        ("clamp", clamp.get(idx), "clamp10"),
+                        ("clamp", clamp.get(idx), args.clamp_key),
                         ("prompting", a3.get(idx), "prompting_edit"),
                         ("axbench", axb.get(idx), args.axb_key)):
                     if src_rec is None:
