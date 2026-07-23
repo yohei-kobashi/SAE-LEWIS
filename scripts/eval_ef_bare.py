@@ -331,6 +331,8 @@ def main():
     rtab = None
     if args.fspec_retrieve:
         rtab = json.loads(Path(args.fspec_retrieve).read_text())
+        print(f"[efbare] RETRIEVAL spec: {len(rtab)} features, "
+              f"m={args.retrieve_m}")
     fsets = fmax = None
     if args.fsets:
         fsets = {ph: {int(f) for f, _ in lst} for ph, lst in
@@ -339,8 +341,6 @@ def main():
                 if args.fsets_maxact else None)
         print(f"[efbare] FEATURE-SETS mode: {len(fsets)} phenomena "
               f"(repeat-frame baseline arms)")
-        print(f"[efbare] RETRIEVAL spec: {len(rtab)} features, "
-              f"m={args.retrieve_m}")
 
     a3 = None
     if "prompting" in arms or "prompting_edit" in arms:
