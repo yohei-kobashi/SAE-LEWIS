@@ -172,6 +172,20 @@ def parse_args():
                         "and repeated runs for a sampling-robustness probe")
     p.add_argument("--gen-seed", type=int, default=0,
                    help="torch manual seed for sampled generation runs")
+    p.add_argument("--fsets", default="",
+                   help="feature-sets JSON {ph: [[latent, score], ...]} "
+                        "(l{L}_frc_r3.json / l{L}_auroc_r1.json) — enables "
+                        "the repeat-frame baseline arms clampset/axbsteer "
+                        "(9n: LinguaLens/AxBench arms unified into the "
+                        "repeat frame). Overrides spec-driven za/zs.")
+    p.add_argument("--fsets-maxact", default="",
+                   help="{ph: {latent: max_act}} pool JSON — enhancement "
+                        "direction value source for axbsteer")
+    p.add_argument("--clamp-value", type=float, default=10.0,
+                   help="clampset enhancement SET value (LL default 10; "
+                        "9n: dev-selected grid)")
+    p.add_argument("--axb-factor", type=float, default=1.0,
+                   help="axbsteer steering factor (h ± f*act*W_dec)")
     p.add_argument("--pool-dev", default="",
                    help="eval_split.json path; sample pairs from the "
                         "identification POOL instead of the eval 500 — "
@@ -254,10 +268,17 @@ def main():
     order = list(range(len(ds)))
     random.Random(args.seed).shuffle(order)
     if args.pool_dev:
-        _ev = set(json.loads(Path(args.pool_dev).read_text())["eval_idx"])
-        order = [k for k in order if k not in _ev]
-        print(f"[efbare] POOL-DEV mode: sampling from the "
-              f"{len(order)}-pair identification pool (eval excluded)")
+        _sp = json.loads(Path(args.pool_dev).read_text())
+        if "dev_idx" in _sp:                 # v2 split: fixed dev section
+            _dv = set(_sp["dev_idx"])
+            order = [k for k in order if k in _dv]
+            print(f"[efbare] DEV-IDX mode (split v2): sampling from the "
+                  f"{len(order)}-pair dev section")
+        else:
+            _ev = set(_sp["eval_idx"])
+            order = [k for k in order if k not in _ev]
+            print(f"[efbare] POOL-DEV mode: sampling from the "
+                  f"{len(order)}-pair identification pool (eval excluded)")
     chosen = order[:min(args.sample_size, len(order))]
     print(f"[efbare] {len(ds)} pairs, sampling {len(chosen)}")
 
@@ -310,6 +331,14 @@ def main():
     rtab = None
     if args.fspec_retrieve:
         rtab = json.loads(Path(args.fspec_retrieve).read_text())
+    fsets = fmax = None
+    if args.fsets:
+        fsets = {ph: {int(f) for f, _ in lst} for ph, lst in
+                 json.loads(Path(args.fsets).read_text()).items()}
+        fmax = (json.loads(Path(args.fsets_maxact).read_text())
+                if args.fsets_maxact else None)
+        print(f"[efbare] FEATURE-SETS mode: {len(fsets)} phenomena "
+              f"(repeat-frame baseline arms)")
         print(f"[efbare] RETRIEVAL spec: {len(rtab)} features, "
               f"m={args.retrieve_m}")
 
@@ -511,6 +540,28 @@ def main():
         else:
             za_t, zs_t = diff_intervention(
                 z_src, z_tgt, args.k_amp, args.k_sup)
+        if fsets is not None:
+            ident = fsets.get(ex.get("feature") or "?", set())
+            za_t = torch.zeros_like(za_t)
+            zs_t = torch.zeros_like(zs_t)
+            if args.reverse_pairs:
+                # enhancement: ADD the phenomenon. axbsteer uses pool
+                # max_act values; clampset uses an indicator (the SET
+                # value itself comes from --clamp-value at hook time).
+                mxd = (fmax.get(ex.get("feature") or "?", {})
+                       if fmax else {})
+                for fi in ident:
+                    za_t[fi] = float(mxd.get(str(fi), 1.0)) if fmax \
+                        else 1.0
+            else:
+                # ablation: magnitudes from the SOURCE's global pool
+                # (target-free; mirrors eval_clamp_baseline)
+                g_src = z_s.max(dim=0).values.float().cpu()
+                if blk is not None:
+                    g_src[blk] = 0.0
+                if ident:
+                    ids_i = torch.tensor(sorted(ident), dtype=torch.long)
+                    zs_t[ids_i] = g_src[ids_i]
         zvar = {"true": (za_t, zs_t),
                 "empty": (torch.zeros_like(za_t), torch.zeros_like(zs_t)),
                 "random": (randomize_intervention(za_t, prng),
@@ -645,6 +696,36 @@ def main():
                     out_text = it_tok.decode(
                         g[0, len(pids2):],
                         skip_special_tokens=True).split("\n")[0].strip()
+                    extra = {}
+                elif arm == "clampset":
+                    # LinguaLens-faithful clamp in the REPEAT frame:
+                    # ablation -> identified set forced to 0;
+                    # enhancement -> identified set SET to --clamp-value.
+                    # All positions (their protocol), SAE-recon replace.
+                    clamp_hook.enabled = True
+                    clamp_hook.pos_mask = None
+                    clamp_hook.amp_idx = torch.nonzero(
+                        za > 0).flatten().to(args.device)
+                    clamp_hook.amp_val = float(args.clamp_value)
+                    clamp_hook.sup_idx = torch.nonzero(
+                        zs > 0).flatten().to(args.device)
+                    pids, _, _, _ = frame_prompt(src, src_ids)
+                    out_text = gen_continuation(pids,
+                                                src_len=len(src_ids))
+                    clamp_hook.enabled = False
+                    extra = {}
+                elif arm == "axbsteer":
+                    # AxBench-faithful steering in the REPEAT frame:
+                    # h + factor*(za - zs) @ W_dec at all positions
+                    # (enh: za = pool max_act; abl: zs = src global act)
+                    dvec = (za.to(args.device).float() @ W
+                            - zs.to(args.device).float() @ W)
+                    hook.mode, hook.dvec = "steer", dvec
+                    hook.alpha = args.axb_factor
+                    pids, _, _, _ = frame_prompt(src, src_ids)
+                    out_text = gen_continuation(pids,
+                                                src_len=len(src_ids))
+                    hook.mode = None
                     extra = {}
                 elif arm == "clamp":
                     clamp_hook.enabled = True
