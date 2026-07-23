@@ -25,7 +25,7 @@ with a Learned Edit-Flow Editor*
 
 ### 段落1 — SAEと言語featureの同定
 SAEは残差ストリームを解釈可能な活性の組に分解する
-(`cunningham2024sparse`=ICLR 2024[arXiv 2023]、
+(`huben2024sparse`=ICLR 2024[arXiv 2023、旧キーcunningham2024sparse]、
 `bricken2023monosemanticity`; SAEは`lieberum2024gemmascope`)。
 ※引用年はaaai2027.bibの出版年に統一(Cunninghamは2024と書く)。LinguaLens(EMNLP 2025)は言語現象のminimal
 pairとFRCで「featureに対応する活性」を同定し、AxBenchは概念検出のAUROC
