@@ -59,3 +59,11 @@ Never output anything else.")。出典: runs/prod_gemma_v6/diag7_srcfirst/。
   編集局所プール(BOSフリー)なのでBOS除外が正しい比較(修正済み)。
 
 出典: runs/prod_gemma_v6/diag7_context_shift_v2/report.md
+
+## 追記(2026-07-23): この診断の解決策が本線に昇格
+
+診断7が定量した「同定(裸文)と注入(復唱プロンプト文脈)の測定点ずれ」
+は、**⑦文脈内spec構築**(同定測定を復唱プロンプト内のgemma-2-2b-it残差・
+srcスパン位置で行う、04§9m)により解消され、exactが両方向+15〜16%改善
+した(ablation 0.148)。⑦は最終構成の採用候補 — 本診断は「ずれの定量」
+から「⑦の動機付け」として論文に引く。
