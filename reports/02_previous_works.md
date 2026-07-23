@@ -277,6 +277,15 @@ bibキーはaaai2027.bib登録済み。
   unintended signals")であり**テキスト編集ではない**。"minimal pair" 0回。
 - 書き方: SAE特徴の因果帰属(挙動への寄与)の代表として1-2文。
   回路帰属(挙動の説明)vs 編集実行(出力の生成)の対比。
+- **介入手法の詳細(2026-07-23、arXiv HTML抽出 — camera-ready照合は
+  投稿前)**: IE = m(x_clean|do(a=a_patch))−m(x_clean)、m=logit差
+  (SVAなら log P("are")−log P("is"))。全latentはattribution patching
+  (1次テイラー)/IG(N=10)で近似。回路検証はfaithfulness
+  =(m(C)−m(∅))/(m(M)−m(∅))で**回路外を位置別mean ablation**。
+  SHIFTは人手判定featureの**zero ablation**。→ 介入値はpatch値/平均/
+  ゼロの固定3種・成功基準はlogit/分類器で、編集実行なし。
+  **IE勾配帰属は我々のE'(editor読み出し)の方法論的先行 — E'実施時に
+  必ず引く**。
 
 ### 軸5-4. Hase et al.(NeurIPS 2023)— localization ≠ editing の系譜
 
@@ -355,6 +364,17 @@ bibキーはaaai2027.bib登録済み。
   検証対象にする」— 相補の先行として真っ先に引き、対決しない。
   D.1のLinguaLens批判(選択不安定)はBrinkmannの分類器選択にも同じ
   問いを立てられる(強めの武器だが、PDF確認前は示唆に留める)。
+- **介入手法の詳細(2026-07-23、arXiv HTML抽出)**: 同定=UDでプローブ
+  (概念×言語)学習→**プローブlogitを指標にattribution patchingでIE
+  上位32選択**、2言語以上で上位=多言語feature。ablation=活性ゼロ固定→
+  23言語のプローブ精度低下。翻訳操作=残差を「SAE再構成+誤差」に分解し
+  **再構成側のfeatureを反実仮想値にクランプ**(観測max活性の倍数、
+  倍数は経験選択)、**生成各ステップの最終トークン位置のみ適用
+  ("to prevent degenerate outputs")**。評価=Efficacy(対象プローブ
+  反転率)/Selectivity(他概念プローブ不変率)。→ 検証器は最後まで
+  プローブで、テキスト一致基準なし。**「最終トークンのみでないと出力
+  崩壊」の注記は固定クランプの脆さの著者自身による傍証 — 我々のsteer
+  壊れ文19%(04§9i)と同根として引用価値大**。
 
 ### 軸5のランドスケープ脚注(1文ずつで可)
 
