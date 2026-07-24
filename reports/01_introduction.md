@@ -7,8 +7,9 @@
 > のみ(README規則0'、oracle値は付録限定)。手法名は記述形
 > 「SAE-conditioned edit-flow intervention」(固有名不使用、規則📛)。
 > 方向用語は enhancement(足す)/ ablation(消す)(規則5')。
-> ✅ 数値は最終確定(2026-07-24、04§9u/9t/9r/9w): 主行=T2+⑦
-> (zero-shot)、適応行=WiSE-FT blend α=0.3。
+> ✅ 数値は最終確定(2026-07-25、04§10): 主行=Ours-ZS(zero-shot)、
+> 適応行=**Ours-AD=防御付き適応FT(p100)s8000**(STOP8000判定で凍結。
+> blend/v3d系は§10.7のラダー=付録行に降格)。
 
 ## 1. 論文の一文
 
@@ -53,22 +54,23 @@ AxBench準拠)に統一適用する。
 - 同一の同定プール・同一の復唱枠で、exact net(L12)は
   **本手法(zero-shot)0.142/0.140(abl/enh)** vs 較正steer 0.086 /
   AxBench準拠 0.054 / LinguaLens準拠 0.014 — **2.6〜10倍**。
-  train区画への軽い適応(WiSE-FT補間)で **0.194/0.172(+36%)**。
-- 特異性: 本手法はrandom spec指定でほぼ無編集(0.000/0.014)。
-  promptingはexact 0.180と強いがrandom指定でも0.088編集してしまう
-  (介入としての特異性を欠く)。
-- FIC: **ablation成分E_abl=0.994(L12、全腕最良)**(較正steer 0.763・
-  clamp 0.556)。※必ず脚注を付す: E_abl=(PT−PB)/PT=1−PB/PTは**比率
-  (特異性)**であり網羅率ではない — 本手法はPT 0.295/PB 0.006
-  (randomではほぼ起きないが、試行自体は保守的)。E_enh=(PT−PB)/(1−PB)
-  は絶対水準係留で保守性の罰を受ける — 両方向の定義非対称(LL App.E.2)。enhancement成分は主行0.270
-  で、統合FICはsteer(0.569)に及ばない(主行0.412/適応行0.477)。
-  **原因は保守性と正直に書く**: λゲートがenhancementの53%で棄権
-  (copy=因果的証拠を出さない)、試行時の成功率は70%と高い —
-  **高precision・低recall**の性格。steerは逆(低precision・高recall)で、
-  厳密なexactはprecisionに、顕著性ベースのFICはrecallに報いる —
-  **2指標の乖離が手法の性格を写す**、が正しい提示。適応行(blend)は
-  recallを買う操作(E_enh 0.370=steer超え、代償は床0.014→0.030)。
+  同定プール(train区画)への防御付き適応FTで **0.477/0.349** —
+  ベースライン最強のprompting(true 0.180/0.227)も**両方向でrawごと
+  超える**(true 0.479/0.351)。
+- 特異性: 本手法はrandom spec指定でほぼ無編集(ZS 0.000/0.014、
+  適応 0.002/0.002)。promptingはexact 0.180と強いがrandom指定でも
+  0.088編集してしまう(介入としての特異性を欠く)。
+- FIC: 適応行が**成分・統合とも全腕最良** — E_enh 0.544(steer 0.347/
+  prompting 0.487)、E_abl 0.987(ZS 0.994と同水準)、
+  **統合FIC 0.626**(steer 0.569/axb 0.577/prompting 0.410)。
+  ※E_ablには必ず脚注: E_abl=(PT−PB)/PT=1−PB/PTは**比率(特異性)**で
+  あり網羅率ではない(ZS: PT 0.295/PB 0.006)。E_enh=(PT−PB)/(1−PB)は
+  絶対水準係留 — 両方向の定義非対称(LL App.E.2)。
+- ZS単体の性格は precision/recall で正直に: λゲートがenhancementの
+  53%で棄権(copy)し統合FIC 0.412はsteer未達 — **高precision・
+  低recall**。適応FTは棄権を半減させ(copy 0.53→0.36)recallを買い、
+  床は逆に洗われる(0.014→0.002)— 「特異性と網羅性のトレードオフ」
+  自体を学習で改善できることの実証。
 - 同定の安定性: mean集約spec のsplit-half cos **0.833-0.838** vs
   LinguaLens top-1選択の half間一致 **36-43%** — 集約が選択不安定を解く。
 - 分類プロファイル: ablationはsyntax/semantics、enhancementは
@@ -79,17 +81,18 @@ AxBench準拠)に統一適用する。
 (i) **SAE-conditioned edit-flow intervention**: featureレベルSAE spec+
 入力文を読みΔhを凍結LMのresidual streamに注入する学習editor。トークンを
 出力しない(出力インターフェース=Δh)ので検証器は凍結LM自身=外生的。
-学習はDolma由来の合成破損ペアのみ(評価データにゼロショット)
-【T4採用時: zero-shot版/pool適応版の2行構成】。
+学習はDolma由来の合成破損ペアのみ(評価データにゼロショット)。
+**2行構成で確定**: zero-shot版(Ours-ZS)/同定プール適応版(Ours-AD=
+スクランブル負例+制約付き選択の防御付きFT。評価500ペアは不使用)。
 
 (ii) **同定/評価を分離した因果検証プロトコル**: 評価500/同定プール4,451
 を全アームに統一。復唱枠+greedy+true/random/empty統制で、最小対編集の
 成功を因果的証拠として測る(exact net・統合FIC)。
 
 (iii) **適用による発見**: (a) 同一同定情報でも介入の書き方で編集力が
-桁で変わる(0.016-0.086 vs 0.128)、(b) promptingは強いが特異性を欠き、
-統合FICでは学習介入が上回る、(c) mean集約specはtop-r選択の不安定性
-(36-43%)を解消する(0.83)。
+桁で変わる(0.014-0.086 vs 0.142、適応で0.477)、(b) promptingは強いが
+特異性を欠き(random 0.088)、適応学習介入はrawでも特異性でも上回る、
+(c) mean集約specはtop-r選択の不安定性(36-43%)を解消する(0.83)。
 
 (iv) **再現アンカーと批判の実測**: LinguaLens/AxBenchの介入を同一
 スタック(gemma-2-2b-it+Gemma Scope 16k)に忠実移植し、LinguaLensの
@@ -97,11 +100,13 @@ AxBench準拠)に統一適用する。
 
 ## 4. Introで引く数値(最小セット、L12・最終確定 04§9u/9t/9r)
 
-- exact net(abl/enh): 主行 **0.142/0.140**、適応行 **0.194/0.172**
-  vs 較正steer 0.086 / AxB準拠 0.054 / LL準拠 0.014(全て復唱枠統一)
-- 特異性: 主行random 0.000/0.014 vs prompting random 0.088
-- FIC成分: **E_abl 0.994**(steer 0.763/clamp 0.556)、
-  適応行E_enh 0.370>steer 0.347(統合値の腕間比較はAnalysis節送り)
+- exact net(abl/enh): 主行 **0.142/0.140**、適応行 **0.477/0.349**
+  vs 較正steer 0.086 / AxB準拠 0.054 / LL準拠 0.014 / prompting
+  0.092/0.164(全て復唱枠統一)
+- 特異性: 主行random 0.000/0.014・適応行 0.002/0.002 vs prompting
+  random 0.088
+- FIC: 適応行 **E_enh 0.544・E_abl 0.987・統合0.626**(steer 0.569/
+  axb 0.577/prompting 0.410/clamp 0.303)。ZSはE_abl 0.994/統合0.412
 - 安定性: spec split-half 0.833-0.838 vs top-1一致 36-43%
 - 層: L4 0.074/0.112、L12 0.142/0.140、L20 0.034/0.010(中間層が本拠地)
 
@@ -109,17 +114,17 @@ AxBench準拠)に統一適用する。
 
 - **oracle-spec値(0.3166、0.2485、0.1804等)を絶対に書かない**(規則0')。
 - 手法の固有名(SAE-EditFlow等)を本文に書かない — 記述形のみ(規則📛)。
-- **promptingとの関係は正確に**: raw exact(abl)では及ばない(0.142 vs
-  0.180)ことを正直に書き、特異性(random 0.014 vs 0.088)で明確に、
-  統合FICは**同水準**(0.412 vs 0.410)でE_abl成分(0.994 vs 0.419)で
-  大差、と成分で語る。「FICで上回る」という旧表現(0.463時代)は使わない
-  — **abstractの該当文は要修正**(E_ablを頭に出す形へ)。
-- **統合FICでsteerに及ばない点は「保守性(編集しなさすぎ)」と正直に
-  帰属する**(precision/recallの枠組み、04§9t改)。「破壊だから割引」
-  という特別扱いの議論はしない — 因果検証としては破壊的介入の得点も
-  正当。steerの編集の性状("He do do the issue"型の局所改変)は中立的
-  記述として付録に置く。文法性フィルタ版FICは作らない(LinguaLens
-  定義に忠実のまま)。
+- **promptingとの関係(07-25更新)**: ZS行はraw exact(abl)で及ばない
+  (0.142 vs 0.180)ことを正直に書く。**適応行はrawでも両方向で超える
+  (0.479/0.351 vs 0.180/0.227)**ので譲歩は不要になったが、ZS行の
+  記述に「promptingに勝つ」を書かない(行ごとに正確に)。特異性
+  (random 0.002-0.014 vs 0.088)は両行共通の強み。
+- **ZS単体の統合FICがsteerに及ばない点は「保守性(編集しなさすぎ)」と
+  正直に帰属する**(precision/recallの枠組み、04§9t改)。「破壊だから
+  割引」という特別扱いの議論はしない。適応行は統合FIC 0.626で全腕最良
+  なので、腕間比較の主役は適応行に置く。steerの編集の性状
+  ("He do do the issue"型の局所改変)は中立的記述として付録。
+  文法性フィルタ版FICは作らない(LinguaLens定義に忠実のまま)。
 - 「介入ベースSAE評価は初」等のR5禁止主張をしない(README規則4:
   CausalGym/SAEBench/RAVEL/ReFT系の先行を必ず踏む)。
 - 方向はenhancement/ablation(amp/supは本文禁止、規則5')。
