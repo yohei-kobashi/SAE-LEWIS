@@ -96,7 +96,9 @@ for a in ("0.2", "0.3", "0.4"):
         continue
     print(f"#  L{L} a={a}: net={net:.4f} rmax={rmax:.4f} "
           f"(T2 ref {ref:.4f}/{refr:.4f})", file=sys.stderr)
-    if rmax <= refr + 1e-9 and net > ref and (best is None or net > best[1]):
+    # +0.015 = 1 binomial SE at n=200 (dev floors differ by 1-3 trials;
+    # exact-threshold rejection is a coin flip — eval500 is the arbiter)
+    if rmax <= refr + 0.015 + 1e-9 and net > ref and (best is None or net > best[1]):
         best = (a, net)
 print(best[0] if best else "NONE")
 PY
