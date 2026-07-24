@@ -50,7 +50,9 @@ def main():
     feats = sorted(json.loads(Path(args.features).read_text()))
     out_path = Path(args.output)
     done = json.loads(out_path.read_text()) if out_path.exists() else {}
-    call = ApiEditor(args.model, max_tokens=512)
+    # reasoning models spend completion budget on thinking — 512 left
+    # 86/198 entries empty (observed 07-25); 4096 clears it
+    call = ApiEditor(args.model, max_tokens=4096)
 
     for i, feat in enumerate(feats):
         cur = done.setdefault(feat, {})

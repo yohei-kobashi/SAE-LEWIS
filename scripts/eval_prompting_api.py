@@ -102,7 +102,9 @@ def main():
             cache[(c["idx"], c["cond"])] = c["text"]
     cache_f = open(cache_path, "a")
 
-    call = ApiEditor(args.model, max_tokens=256)
+    # reasoning models think inside the completion budget — 256 gave
+    # ~2-4% empty outputs (07-25); 1024 clears it
+    call = ApiEditor(args.model, max_tokens=1024)
 
     def instr_for(feat, cond, idx):
         if cond == "random":
