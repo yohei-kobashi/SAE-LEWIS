@@ -71,6 +71,13 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--backbone-lr", type=float, default=1e-4)
     p.add_argument("--lora-r", type=int, default=32)
+    p.add_argument("--train-only-cond", action="store_true",
+                   help="v3d-cond (user 2026-07-24): freeze EVERYTHING "
+                        "except the spec-conditioning interface "
+                        "(proj_a_corr_A/B, type_emb, cond_scale, "
+                        "mag_proj) — the CTX-train LoRA and heads stay "
+                        "exactly at their init-ckpt values, so the "
+                        "zero-shot model is never overwritten.")
     p.add_argument("--max-steps", type=int, default=40000)
     p.add_argument("--warmup-steps", type=int, default=500)
     p.add_argument("--logging-steps", type=int, default=50)
@@ -638,6 +645,16 @@ def main():
     if args.frame == "repeat":
         print(f"[ef-lm] REPEAT frame: {REPEAT_PROMPT[:60]!r}...")
 
+    if args.train_only_cond:
+        COND = ("proj_a_corr_A", "proj_a_corr_B", "type_emb",
+                "cond_scale", "mag_proj")
+        n_frozen = 0
+        for n, p_ in model.named_parameters():
+            if p_.requires_grad and not any(c in n for c in COND):
+                p_.requires_grad_(False)
+                n_frozen += 1
+        print(f"[ef-lm] v3d-cond: froze {n_frozen} tensors; training "
+              f"only the conditioning interface")
     lora_params = [p for n, p in model.named_parameters()
                    if "lora_" in n and p.requires_grad]
     small_params = [p for n, p in model.named_parameters()
