@@ -71,6 +71,47 @@ Sparse autoencoders (SAEs) decompose the internal states of large language model
 6. Claim: causal verification of identified activations becomes
    practical only with a learned intervention generator.
 
+## 🏁 更新案(2026-07-25、Ours-AD凍結後 — full paper用)
+
+規則: 「net」「true−random」という語は使わず**生値+特異性の平文**
+(netは本文初出で1句定義してから使う)。方向はenhancement/ablation。
+
+**結果文の差し替え案(日本語)** — 旧「…promptingには一部を除き及ばな
+かったものの、layer 12でenhancementで0.148、ablationで0.128と…FICでは
+0.463とpromptingの0.410を上回る値…」を以下で置換:
+
+> 実験の結果、layer 12の完全一致評価でzero-shot版はablation 0.142/
+> enhancement 0.154と、LinguaLens準拠(0.014)やAxBench準拠(0.054)
+> などの既存介入手法を大きく超えた。さらに同定プール(評価ペア非接触)
+> への防御付き適応学習を加えた版は0.479/0.351に達し、最強ベースライン
+> であるprompting(0.180/0.227)を両方向で上回った。提案手法は無関係な
+> 特徴のspecを指定した場合ほぼ編集を行わず(0.002-0.014、prompting
+> 0.088)、介入としての特異性を保つ。因果効果を測るFeature
+> Intervention Confidence(FIC)でも0.626とprompting(0.410)・
+> steering(0.569)を超え、「同定された活性の因果検証」が学習された
+> 介入によって実用的な精度で可能になることを示した。
+
+**結果文の差し替え案(English)** — 旧 "In exact-match evaluation …
+falls short of prompting …" 以降を置換:
+
+> On layer 12, the zero-shot editor attains exact-match scores of 0.142
+> (ablation) / 0.154 (enhancement), far surpassing existing intervention
+> methods such as the LinguaLens-style clamp (0.014) and the
+> AxBench-style steering (0.054). With defended adaptation to the
+> identification pool (never touching the evaluation pairs), it reaches
+> 0.479 / 0.351, exceeding the strongest baseline, prompting
+> (0.180 / 0.227), in both directions. Crucially, when given the spec of
+> an unrelated feature, our editor makes almost no edits
+> (0.002–0.014, vs. 0.088 for prompting), preserving the specificity
+> required of an intervention. It also scores highest on Feature
+> Intervention Confidence (0.626, vs. 0.410 for prompting and 0.569 for
+> steering), demonstrating that causal verification of identified
+> activations becomes practical with a learned intervention.
+
+数値出典: 04§10.1/10.2/10.3/10.7(Ours-AD=p100 s8000、STOP8000凍結)。
+なお冒頭の学習記述(LLM2Vec/Edit Flows/Dolma 22万ペア/復唱評価/9:1
+分割)は現行と整合しており変更不要。「2段階学習」の記述もそのまま。
+
 ## 提出メモ
 
 - 数値アンカー(2026-07-22確定、L12ほか): exact sup 0.128(random
