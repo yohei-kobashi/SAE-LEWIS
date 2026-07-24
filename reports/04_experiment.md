@@ -1524,9 +1524,10 @@ editor側はk頑健、評価側の選択だけが問題):
 ## 10. 🏁 論文転記用の最終まとめ(Ours-ZS中心、2026-07-24)
 
 命名(README参照): **Ours-ZS** = CTX-train(文脈内キャッシュ学習の
-editor)+CTX-spec(文脈内構築のfeature spec)。**Ours-AD** = 適応行
-(中身は選定中: blend / v3d系)。全数値はfeature-specプロトコル
-(同定プール構築・評価500非接触・復唱枠・greedy・net=true−random)。
+editor)+CTX-spec(文脈内構築のfeature spec)。**Ours-AD** =
+防御付き適応FT p100 s8000(07-25凍結、§10.7。L4/L20の適応行はblendの
+参考値のまま)。全数値はfeature-specプロトコル(同定プール構築・
+評価500非接触・復唱枠・greedy・net=true−random)。
 
 ### 10.1 主表 — 層×方向(exact net)
 
@@ -1535,7 +1536,7 @@ editor)+CTX-spec(文脈内構築のfeature spec)。**Ours-AD** = 適応行
 | L4 | **Ours-ZS** | 0.074 | 0.112 | 0.000/0.022 |
 | L4 | +適応(blend α.3) | 0.100 | 0.160 | 0.000/0.032 |
 | **L12** | **Ours-ZS(主)** | **0.142** | **0.140** | 0.000/0.014 |
-| L12 | +適応(blend α.3) | 0.194 | 0.172 | 0.002/0.030 |
+| **L12** | **Ours-AD(適応FT s8000)** | **0.477** | **0.349** | 0.002/0.002 |
 | L20 | **Ours-ZS** | 0.034 | 0.010 | 0.004/0.060 |
 | L20 | +適応(blend α.2) | 0.036 | 0.018 | 0.018/0.056 |
 
@@ -1557,6 +1558,25 @@ editor)+CTX-spec(文脈内構築のfeature spec)。**Ours-AD** = 適応行
 random床は全SAE介入腕で≈0(復唱枠統一の成果、§9r)。promptingのみ
 床が高い(誤指定でも編集=特異性欠如)。L12 ablでOurs-ZSは固定介入の
 **2.6〜10倍**(較正steerには全層で優位、L4 ablのみ僅差劣後 .074 vs .108)。
+
+**参考上限: 最前線APIモデルによる直接編集(gpt-5.6-luna、07-25、
+介入でなくタスク上限の目安・本文は脚注/付録扱い)** — 同一の499ペア・
+同一のA3′指示文をlunaに与え、luna自身が書き換え(gemma不関与):
+
+| cond | abl exact | enh exact |
+|---|---|---|
+| true | 0.333 | 0.387 |
+| random | 0.074 | 0.024 |
+| net | 0.259 | 0.363 |
+
+- **Ours-AD(0.479/0.351)はablationで最前線モデルの直接編集
+  (0.333)をも超える**(enhは僅差劣後 0.351 vs 0.387)。gemma上の
+  prompting(0.180/0.227)→luna(0.333/0.387)で編集者の規模は効くが、
+  それでも最小対の厳密編集は最前線モデルにも自明でない。
+- lunaも誤指定下で編集してしまう(abl random 0.074、random時のcopy率
+  0.397=6割は何か編集)— 特異性はプロンプト系全般の弱点。
+- 出力先: scratchpad/api_prompting/api_prompting_l12{,_amp}
+  (scripts/eval_prompting_api.py、ローカル実行)。
 
 ### 10.3 FIC(LinguaLens App.E.2定義・gpt-4o・成分/統合)
 
