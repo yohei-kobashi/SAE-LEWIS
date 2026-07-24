@@ -71,6 +71,14 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--backbone-lr", type=float, default=1e-4)
     p.add_argument("--lora-r", type=int, default=32)
+    p.add_argument("--adapter2-r", type=int, default=0,
+                   help="v3d-enc: add a SECOND frozen-base adapter of "
+                        "this rank AFTER loading --init-ckpt (the "
+                        "original LoRA is preserved bit-exact)")
+    p.add_argument("--adapter2-alpha", type=float, default=16.0)
+    p.add_argument("--train-adapter2", action="store_true",
+                   help="freeze the ORIGINAL LoRA (zero-shot model); "
+                        "train adapter2 + conditioning interface + heads")
     p.add_argument("--train-only-cond", action="store_true",
                    help="v3d-cond (user 2026-07-24): freeze EVERYTHING "
                         "except the spec-conditioning interface "
@@ -609,6 +617,21 @@ def main():
                           weights_only=False)
         model.load_trainable_state_dict(blob["trainable"])
         print(f"[ef-lm] warm start from {args.init_ckpt}")
+    if args.adapter2_r > 0:
+        from lora import add_adapter2_everywhere
+        n2 = add_adapter2_everywhere(model.flow.encoder.backbone,
+                                     args.adapter2_r, args.adapter2_alpha)
+        model.to(args.device)
+        print(f"[ef-lm] adapter2 r={args.adapter2_r} added on {n2} "
+              f"modules (original LoRA preserved)")
+    if args.train_adapter2:
+        n_frz = 0
+        for n, p_ in model.named_parameters():
+            if (n.endswith("lora_A") or n.endswith("lora_B"))                     and p_.requires_grad:
+                p_.requires_grad_(False)
+                n_frz += 1
+        print(f"[ef-lm] v3d-enc: original LoRA frozen ({n_frz} tensors); "
+              f"training adapter2 + conditioning + heads")
 
     it_model = AutoModelForCausalLM.from_pretrained(
         args.it_model, torch_dtype=dtype,
@@ -712,6 +735,8 @@ def main():
     def save_ckpt(path: Path):
         torch.save({"trainable": model.trainable_state_dict(),
                     "config": {"llm2vec_dir": args.llm2vec_dir,
+                               "adapter2_r": args.adapter2_r,
+                               "adapter2_alpha": args.adapter2_alpha,
                                "d_sae": d_sae, "lora_r": args.lora_r,
                                "inject_layer": args.inject_layer,
                                "sae_path": args.sae_path,

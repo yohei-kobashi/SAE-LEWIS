@@ -69,12 +69,30 @@ class LoRALinear(nn.Module):
         # Standard LoRA init: A ~ Kaiming, B = 0 → identity at step 0.
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
+    def add_adapter2(self, r2: int, alpha2: float = 16.0):
+        """v3d-enc (2026-07-24): a SECOND, independent low-rank residual.
+        The original adapter (the zero-shot model's) stays frozen and
+        untouched; adapter2 starts at exact zero (B2 = 0) and carries a
+        runtime scale knob (adapter2_scale; 0.0 recovers zero-shot)."""
+        self.r2 = int(r2)
+        self.scaling2 = float(alpha2) / float(r2)
+        self.adapter2_scale = 1.0
+        self.lora_A2 = nn.Parameter(torch.empty(
+            r2, self.base.in_features, dtype=torch.float32))
+        self.lora_B2 = nn.Parameter(torch.zeros(
+            self.base.out_features, r2, dtype=torch.float32))
+        nn.init.kaiming_uniform_(self.lora_A2, a=math.sqrt(5))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.base(x)
         h = x.to(self.lora_A.dtype)
         if self.dropout_p > 0.0:
             h = F.dropout(h, p=self.dropout_p, training=self.training)
         delta = (h @ self.lora_A.t()) @ self.lora_B.t() * self.scaling
+        if getattr(self, "lora_A2", None) is not None:
+            d2 = ((h @ self.lora_A2.t()) @ self.lora_B2.t()
+                  * self.scaling2 * float(self.adapter2_scale))
+            delta = delta + d2
         return y + delta.to(y.dtype)
 
 
@@ -105,6 +123,24 @@ def apply_lora(
             f"apply_lora: no nn.Linear named {sorted(targets)} found under "
             f"{type(root).__name__} — wrong backbone class?")
     return len(to_wrap)
+
+
+def add_adapter2_everywhere(root: nn.Module, r2: int,
+                            alpha2: float = 16.0) -> int:
+    n = 0
+    for m in root.modules():
+        if isinstance(m, LoRALinear):
+            m.add_adapter2(r2, alpha2)
+            n += 1
+    if n == 0:
+        raise RuntimeError("add_adapter2_everywhere: no LoRALinear found")
+    return n
+
+
+def set_adapter2_scale(root: nn.Module, s: float) -> None:
+    for m in root.modules():
+        if isinstance(m, LoRALinear) and getattr(m, "lora_A2", None) is not None:
+            m.adapter2_scale = float(s)
 
 
 def lora_parameters(root: nn.Module):

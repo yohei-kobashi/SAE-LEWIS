@@ -186,6 +186,9 @@ def parse_args():
                         "9n: dev-selected grid)")
     p.add_argument("--axb-factor", type=float, default=1.0,
                    help="axbsteer steering factor (h ± f*act*W_dec)")
+    p.add_argument("--adapter2-scale", type=float, default=1.0,
+                   help="v3d-enc runtime scale on the second adapter "
+                        "(0 = exact zero-shot model)")
     p.add_argument("--pool-dev", default="",
                    help="eval_split.json path; sample pairs from the "
                         "identification POOL instead of the eval 500 — "
@@ -314,6 +317,20 @@ def main():
                               dtype=dtype, lora_r=int(cfg.get("lora_r", 32)),
                               w_dec=sae.W_dec.detach().float().cpu(),
                               ).to(args.device).eval()
+        _a2r = int(cfg.get("adapter2_r", 0) or 0)
+        if _a2r == 0 and any("lora_A2" in k for k in blob["trainable"]):
+            _k = next(k for k in blob["trainable"] if "lora_A2" in k)
+            _a2r = int(blob["trainable"][_k].shape[0])
+        if _a2r > 0:
+            from lora import add_adapter2_everywhere, set_adapter2_scale
+            add_adapter2_everywhere(
+                interv.flow.encoder.backbone, _a2r,
+                float(cfg.get("adapter2_alpha", 16.0)))
+            interv.to(args.device)
+            set_adapter2_scale(interv.flow.encoder.backbone,
+                               args.adapter2_scale)
+            print(f"[efbare] adapter2 r={_a2r} "
+                  f"scale={args.adapter2_scale}")
         interv.load_trainable_state_dict(blob["trainable"])
         print(f"[efbare] EF editor loaded from {args.ef_ckpt}")
 
