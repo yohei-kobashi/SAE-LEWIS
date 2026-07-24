@@ -1144,6 +1144,11 @@ eval500: **ablation net 0.194(random 0.002)/ enhancement net 0.172
   併記、0.030を許容するならblend主行で合算net+30%。
 - FIC(E_enh)judge実行中(fic_v3a_l12*)— steer 0.347超えの成否待ち。
 
+**v3a blend(α=0.3)のFIC(07-24)**: **E_enh 0.370 > steer 0.347**
+(ユーザー目標達成)、E_abl 0.964。exact(0.194/0.172)・E両成分の
+すべてで自前steerを上回り、随一の弱点はenh random 0.030のみ。
+→ 主行の選択(T2厳守 vs blend許容)の判断材料が出揃った。
+
 **E_enh分解(T2+⑦ enh、true 499試行)**: copy 266(SAME=0点)/
 編集233中 MORE 162(70%)・SAME 18・LESS 53 → PT 0.325。
 copy率をsteer並み(~0.35)へ下げられれば E_enh≈0.41>steer 0.347の計算。
