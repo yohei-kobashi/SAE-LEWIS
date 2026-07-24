@@ -24,7 +24,7 @@ EVC=(--frame repeat --feature-spec $FS/l12_specctx.json --fspec-scale 3.5
      --k-amp 64 --k-sup 64 --conditions true,random --device cuda)
 
 # ---- 1. s4000 ratio evals ------------------------------------------------
-for PMIX in p25 p50; do
+for PMIX in p25 p50 p100; do
     CK=$P/eflm_l12_mixft_$PMIX/eflm-step4000.pt
     [ -f "$CK" ] || { echo "missing $CK"; exit 1; }
     for DIRX in "" "_amp"; do
@@ -105,6 +105,6 @@ if [ "$SEL" != "STOP4000" ]; then
     done
 fi
 echo "==================== MIXFT5-DONE ===================="
-for d in $P/fs_mixp25s4k_l12* $P/fs_mixp50s4k_l12* $P/fs_mixft5_l12*; do
+for d in $P/fs_mixp25s4k_l12* $P/fs_mixp50s4k_l12* $P/fs_mixp100s4k_l12* $P/fs_mixft5_l12*; do
     [ -f "$d/report.md" ] && { echo "--- $d"; grep -E "^\| (true|random) \| ef" $d/report.md; }
 done
