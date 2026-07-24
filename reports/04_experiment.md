@@ -1130,7 +1130,15 @@ steer=較正済(従来)、prompting=従来。runs/tables/fic_fs_integrated.md:
 | steer(較正) | 0.300 | **0.569** | 0.307 | 0.347/0.763 |
 | axbench準拠 | 0.582 | **0.577** | 0.383 | 0.126/0.945 |
 
-**⚠️ 読み方の要点(本文の書き方に直結)**:
+**⚠️ 読み方の要点(2026-07-24改・ユーザー決定: 「破壊割引」論は撤回し
+precision/recall枠組みで提示)**:
+0. **統合FICの腕間差の正しい帰属**: 本手法がsteerに及ばないのは
+   enhancementの**保守性**(copy 53%=棄権、試行時成功率70%)による
+   低recall。steerは低precision・高recall。**exact=precision指向/
+   FIC=recall寛容**の2指標並置が手法の性格差をそのまま写す — これが
+   本文の提示枠。文法性はFICの定義に含まれず(LinguaLens準拠)、
+   破壊的介入の因果的得点も正当として扱う。steerの編集性状(局所改変
+   の実例)は中立的記述として付録。
 1. **efのE_abl 0.994はほぼ完全な因果的ablation検証**(98 featureで
    PT−PBがPTに拉致)。一方E_enhは0.270で、統合FICは0.412=
    **promptingと同水準**(旧チャンピオンの0.463からは低下 — T2は

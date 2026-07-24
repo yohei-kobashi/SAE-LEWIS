@@ -58,13 +58,14 @@ AxBench準拠)に統一適用する。
   promptingはexact 0.180と強いがrandom指定でも0.088編集してしまう
   (介入としての特異性を欠く)。
 - FIC: **ablation成分E_abl=0.994(L12)— ほぼ完全な因果的ablation検証**
-  (較正steer 0.763・clamp 0.556、全腕最良)。enhancement成分も適応行で
-  E_enh 0.370と較正steer(0.347)超え。
-  ※統合FIC(単一スカラー)の腕間比較はIntroでは出さない —
-  固定介入は特徴標識の**局所破壊**でE_ablを稼げるため統合値が膨らむ
-  (exactはefの1/2.6)。この「破壊 vs 編集」の分析と
-  **「FICは編集実行(exact)との並置で初めて因果検証になる」**という
-  方法論的主張はAnalysis節で展開する(04§9t)。
+  (較正steer 0.763・clamp 0.556、全腕最良)。enhancement成分は主行0.270
+  で、統合FICはsteer(0.569)に及ばない(主行0.412/適応行0.477)。
+  **原因は保守性と正直に書く**: λゲートがenhancementの53%で棄権
+  (copy=因果的証拠を出さない)、試行時の成功率は70%と高い —
+  **高precision・低recall**の性格。steerは逆(低precision・高recall)で、
+  厳密なexactはprecisionに、顕著性ベースのFICはrecallに報いる —
+  **2指標の乖離が手法の性格を写す**、が正しい提示。適応行(blend)は
+  recallを買う操作(E_enh 0.370=steer超え、代償は床0.014→0.030)。
 - 同定の安定性: mean集約spec のsplit-half cos **0.833-0.838** vs
   LinguaLens top-1選択の half間一致 **36-43%** — 集約が選択不安定を解く。
 - 分類プロファイル: ablationはsyntax/semantics、enhancementは
@@ -110,9 +111,12 @@ AxBench準拠)に統一適用する。
   統合FICは**同水準**(0.412 vs 0.410)でE_abl成分(0.994 vs 0.419)で
   大差、と成分で語る。「FICで上回る」という旧表現(0.463時代)は使わない
   — **abstractの該当文は要修正**(E_ablを頭に出す形へ)。
-- **axbench/steerの統合FICが本手法を上回る点は隠さず先回り**: 局所破壊
-  ("He do do the issue")の実例と「exactとの並置が破壊と編集を区別する」
-  の方法論的主張で転化する(04§9t)。
+- **統合FICでsteerに及ばない点は「保守性(編集しなさすぎ)」と正直に
+  帰属する**(precision/recallの枠組み、04§9t改)。「破壊だから割引」
+  という特別扱いの議論はしない — 因果検証としては破壊的介入の得点も
+  正当。steerの編集の性状("He do do the issue"型の局所改変)は中立的
+  記述として付録に置く。文法性フィルタ版FICは作らない(LinguaLens
+  定義に忠実のまま)。
 - 「介入ベースSAE評価は初」等のR5禁止主張をしない(README規則4:
   CausalGym/SAEBench/RAVEL/ReFT系の先行を必ず踏む)。
 - 方向はenhancement/ablation(amp/supは本文禁止、規則5')。
