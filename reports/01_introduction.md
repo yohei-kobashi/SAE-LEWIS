@@ -58,11 +58,13 @@ AxBench準拠)に統一適用する。
   promptingはexact 0.180と強いがrandom指定でも0.088編集してしまう
   (介入としての特異性を欠く)。
 - FIC: **ablation成分E_abl=0.994(L12)— ほぼ完全な因果的ablation検証**
-  (較正steer 0.763・clamp 0.556)。統合FICは0.412でprompting 0.410と
-  同水準、適応行はE_enh 0.370で較正steer(0.347)も超える。
-  axbench準拠/steerの統合FIC(0.577/0.569)は特徴標識の**局所破壊**由来
-  (exactはefの1/2.6)— **「FIC単独では破壊と編集を区別できない。
-  編集実行(exact)との並置で初めて因果検証になる」**が方法論的主張。
+  (較正steer 0.763・clamp 0.556、全腕最良)。enhancement成分も適応行で
+  E_enh 0.370と較正steer(0.347)超え。
+  ※統合FIC(単一スカラー)の腕間比較はIntroでは出さない —
+  固定介入は特徴標識の**局所破壊**でE_ablを稼げるため統合値が膨らむ
+  (exactはefの1/2.6)。この「破壊 vs 編集」の分析と
+  **「FICは編集実行(exact)との並置で初めて因果検証になる」**という
+  方法論的主張はAnalysis節で展開する(04§9t)。
 - 同定の安定性: mean集約spec のsplit-half cos **0.833-0.838** vs
   LinguaLens top-1選択の half間一致 **36-43%** — 集約が選択不安定を解く。
 - 分類プロファイル: ablationはsyntax/semantics、enhancementは
@@ -94,8 +96,8 @@ AxBench準拠)に統一適用する。
 - exact net(abl/enh): 主行 **0.142/0.140**、適応行 **0.194/0.172**
   vs 較正steer 0.086 / AxB準拠 0.054 / LL準拠 0.014(全て復唱枠統一)
 - 特異性: 主行random 0.000/0.014 vs prompting random 0.088
-- FIC: **E_abl 0.994**(steer 0.763/clamp 0.556)、統合 0.412 ≈
-  prompting 0.410、適応行E_enh 0.370>steer 0.347
+- FIC成分: **E_abl 0.994**(steer 0.763/clamp 0.556)、
+  適応行E_enh 0.370>steer 0.347(統合値の腕間比較はAnalysis節送り)
 - 安定性: spec split-half 0.833-0.838 vs top-1一致 36-43%
 - 層: L4 0.074/0.112、L12 0.142/0.140、L20 0.034/0.010(中間層が本拠地)
 
