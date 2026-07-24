@@ -7,7 +7,7 @@ git pull || true
 [ -n "$OPENAI_API_KEY" ] || { [ -f .openai_key ] && export OPENAI_API_KEY=$(cat .openai_key); }
 P=runs/prod_gemma_v6
 for SUF in "" "_amp"; do
-    for TAG in mixft mixft2; do
+    for TAG in mixft mixft2 mixft3; do
         SRC=$P/fs_${TAG}_l12$SUF/records.jsonl
         OUT=$P/fic_${TAG}_l12$SUF
         [ -f "$SRC" ] || continue
