@@ -1059,6 +1059,35 @@ L4=2.5、L20=2.5(L12=3.5)。
 - dev選択の1SEマージン(n=200二項SE=±0.015)の正当化は§9q参照。
   最終判定は全てeval500。
 
+### 9w. 4分類別の最終評価(2026-07-24、runs/tables/cat_breakdown_final.md)
+
+feature→分類は第1分類割当(feature_categories_en.json、99対応)。
+
+**exact(L12、net)**:
+
+| 分類 | n/方向 | 主行 abl | 主行 enh | blend abl | blend enh |
+|---|---|---|---|---|---|
+| morphology | 104 | 0.096 | **0.375** | 0.154 | 0.375 |
+| syntax | 197 | **0.193** | 0.081 | **0.234** | 0.147 |
+| semantics | 136 | 0.147 | 0.110 | 0.235 | 0.132 |
+| pragmatics | 62 | 0.048 | 0.000 | 0.048 | 0.000 |
+
+**FIC(主行)**: morphology E_enh 0.497/統合0.481 > syntax 0.440 >
+semantics 0.426 ≫ pragmatics 0.218(E_ablは全分類≈1.0)。
+
+- **方向×分類の構造が明瞭**: ablationはsyntax/semanticsが本拠地、
+  enhancementはmorphologyが圧倒(0.375 — 形態標識の挿入が最も学習介入
+  に馴染む)。pragmaticsは両方向とも困難(先行知見と整合)。
+- **enh random床はmorphologyに全集中**: 主行0.067/blend 0.144(他分類
+  ≈0)。blendの全体床0.030の実体は「morphologyのprior押し」(§9dの
+  文法修復機序・§9sの層差機序と同根)— 本文でこの局在を明示すると
+  床の解釈が締まる。
+- blend利得の分布: ablationはsemantics +60%/syntax +21%/morphology
+  +60%。pragmaticsは適応でも動かず。
+- 注: 旧プロトコル(§5f、oracle時代)の「morphology全層最弱」から
+  プロファイルが変化(feature-spec+enh方向での形態の強さ)—
+  プロトコル差として注記し、比較主張には使わない。
+
 ### 9t. 最終プロトコルの統合FIC(2026-07-24、全セルjudge完了)
 
 ソース: ef=採用T2+⑦、clamp/axbench=復唱枠devベースライン(§9r)、
